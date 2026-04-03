@@ -447,22 +447,31 @@ async function fetchSlate(){
     }
 
     players = enrich(parse(json.players));
-    // Also fetch live injuries to supplement DK status data
+    // Fetch ESPN injuries to supplement DK status
     fetchESPNInjuries(sport).then(injuryMap => {
-      if (Object.keys(injuryMap).length) {
-        players = players.map(p => {
-          const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
-          if (!espnStatus) return p;
-          const isOut = p.isOut || ['out','ir','injured reserve'].includes(espnStatus.toLowerCase());
-          return { ...p, status: espnStatus || p.status, isOut, edgeScore: isOut ? 0 : p.edgeScore };
-        });
-        lineup = optimize(players, sport);
-        renderLineup(calcEntropyScore(lineup, nashData));
-      }
+      if (!Object.keys(injuryMap).length) return;
+      let changed = false;
+      players = players.map(p => {
+        const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
+        if (!espnStatus) return p;
+        const isOut = p.isOut || ['out','ir','injured reserve'].includes(espnStatus.toLowerCase());
+        if (isOut !== p.isOut) changed = true;
+        return { ...p, status: espnStatus||p.status, isOut, edgeScore: isOut ? 0 : p.edgeScore };
+      });
+      if (changed) { lineup = optimize(players, sport); renderLineup(calcEntropyScore(lineup, nashData)); }
     }).catch(()=>{});
+
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
     buildAndRender();
     startAutoRefresh();
+
+    const ds = json.dataSources || {};
+    const sourceList = [
+      ds.vegas ? `${ds.gamesWithOdds} games w/ Vegas` : null,
+      ds.sleeperProjections ? `${ds.playersWithProj} Sleeper projections` : null,
+      ds.ownership ? `${ds.playersWithOwn} real ownership (${ds.ownershipSources?.split('+').length||1} sources)` : 'ownership estimated',
+    ].filter(Boolean).join(' · ');
+    setStatus(`${players.length} players · ${sourceList} · auto-updating`,'var(--green)');
     const ds = json.dataSources || {};
     const sources = [
       ds.vegas ? `${ds.gamesWithOdds} games w/ Vegas` : null,
@@ -513,29 +522,94 @@ async function handleCsv(input){
   const file=input.files[0]; if(!file) return;
   setStatus('Reading CSV...','var(--amber)');
   setDot('loading');
+
   const reader=new FileReader();
   reader.onload= async e=>{
     const raw=parseCsv(e.target.result);
-    if(!raw.length){ setStatus('Could not read CSV','var(--red)'); setDot('error'); return; }
+    if(!raw.length){ setStatus('Could not read CSV — try re-downloading from DraftKings','var(--red)'); setDot('error'); return; }
 
-    setStatus('Fetching live injury status...','var(--amber)');
-    // Get real injury data from ESPN free API
-    const injuryMap = await fetchESPNInjuries(sport);
+    setStatus(`${raw.length} players found · fetching live data...`,'var(--amber)');
 
-    // Apply injury status to each player
-    const withStatus = raw.map(p => {
-      const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
+    // Fetch all live data in parallel
+    const [injuryMap, ownershipData, vegasData] = await Promise.all([
+      fetchESPNInjuries(sport),
+      fetchOwnershipFromProxy(sport),
+      fetchVegasFromProxy(sport),
+    ]);
+
+    // Apply all data to players
+    const withData = raw.map(p => {
+      // Injury status from ESPN
+      const espnStatus = injuryMap[p.name.toLowerCase()] ||
+                         injuryMap[p.name.toLowerCase().split(' ').pop()];
       const isOut = p.isOut || (espnStatus && ['out','ir','injured reserve','did not play'].includes(espnStatus.toLowerCase()));
-      return { ...p, status: espnStatus || p.status || '', isOut };
+
+      // Real ownership from scraped sources
+      const fpOwnership = fuzzyMatchOwnership(p.name, ownershipData);
+
+      // Vegas data
+      const team = p.team || '';
+      const teamVegas = Object.entries(vegasData).find(([k]) =>
+        k.toLowerCase().includes(team.toLowerCase()) ||
+        team.toLowerCase().includes(k.toLowerCase().split(' ').pop())
+      );
+      const vegasImplied = teamVegas ? teamVegas[1] : null;
+      const gameTotal    = teamVegas ? vegasData[`${teamVegas[0]}_total`] : null;
+
+      return { ...p, status: espnStatus||p.status||'', isOut, fpOwnership, vegasImplied, gameTotal };
     });
 
-    const outCount = withStatus.filter(p=>p.isOut).length;
-    players = enrich(withStatus);
+    const outCount  = withData.filter(p=>p.isOut).length;
+    const ownCount  = withData.filter(p=>p.fpOwnership!=null).length;
+    const vegasCount= withData.filter(p=>p.vegasImplied!=null).length;
+
+    players = enrich(withData);
     buildAndRender();
-    setStatus(`${players.length} players loaded · ${outCount} OUT filtered · CSV`,'var(--green)');
+
+    const sources = [
+      `${outCount} OUT filtered`,
+      ownCount > 0 ? `${ownCount} real ownership%` : 'ownership estimated',
+      vegasCount > 0 ? `${vegasCount} Vegas lines` : null,
+    ].filter(Boolean).join(' · ');
+
+    setStatus(`${players.length} players · ${sources}`,'var(--green)');
     setDot('');
   };
   reader.readAsText(file);
+}
+
+// Fetch ownership from our proxy (hits 4 sources in parallel)
+async function fetchOwnershipFromProxy(sp) {
+  try {
+    const r = await fetch(`/api/proxy?action=ownership&sport=${sp}`, { signal: AbortSignal.timeout(20000) });
+    if (!r.ok) return {};
+    const data = await r.json();
+    return data.ownership || {};
+  } catch(e) { return {}; }
+}
+
+// Fetch Vegas odds from proxy
+async function fetchVegasFromProxy(sp) {
+  try {
+    const r = await fetch(`/api/proxy?dgId=0&sport=${sp}&action=vegas`, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return {};
+    const data = await r.json();
+    return data.odds || {};
+  } catch(e) { return {}; }
+}
+
+// Fuzzy match player name to ownership map
+function fuzzyMatchOwnership(name, ownershipMap) {
+  if (!name || !ownershipMap || !Object.keys(ownershipMap).length) return null;
+  const clean = n => n.toLowerCase().replace(/[^a-z ]/g,'').trim();
+  const dk = clean(name);
+  if (ownershipMap[dk] !== undefined) return ownershipMap[dk];
+  const last = dk.split(' ').pop();
+  if (last.length > 3) {
+    const key = Object.keys(ownershipMap).find(k => k.endsWith(last));
+    if (key) return ownershipMap[key];
+  }
+  return null;
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
