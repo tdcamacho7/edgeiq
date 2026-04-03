@@ -472,13 +472,6 @@ async function fetchSlate(){
       ds.ownership ? `${ds.playersWithOwn} real ownership (${ds.ownershipSources?.split('+').length||1} sources)` : 'ownership estimated',
     ].filter(Boolean).join(' · ');
     setStatus(`${players.length} players · ${sourceList} · auto-updating`,'var(--green)');
-    const ds = json.dataSources || {};
-    const sources = [
-      ds.vegas ? `${ds.gamesWithOdds} games w/ Vegas` : null,
-      ds.sleeperProjections ? `${ds.playersWithProjections} real projections` : null,
-      ds.fantasyProsOwnership ? `${ds.playersWithOwnership} ownership %` : null,
-    ].filter(Boolean).join(' · ');
-    setStatus(`${players.length} players · ${sources || 'estimated data'} · auto-updating`,'var(--green)');
     setDot('');
 
   } catch(e) {
