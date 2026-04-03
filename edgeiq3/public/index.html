@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -441,7 +442,8 @@ async function fetchSlate(){
     players = enrich(parse(json.players));
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
     buildAndRender();
-    setStatus(`${players.length} players loaded · live`,'var(--green)');
+    startAutoRefresh(); // begin auto-refreshing every 5 min
+    setStatus(`${players.length} players loaded · auto-updating every 5 min`,'var(--green)');
     setDot('');
 
   } catch(e) {
@@ -531,26 +533,33 @@ function parse(raw){
     const home=p.competition?.homeTeam?.abbreviation||'';
     const away=p.competition?.awayTeam?.abbreviation||'';
     const opp=home&&away?(team===home?`vs ${away}`:`vs ${home}`):'';
+    // Capture injury status — OUT players must never appear in lineup
+    const status=p.status||p.playerGameAttribute?.injuryStatus||p.injuryStatus||'';
+    const isOut=status.toLowerCase()==='out'||status.toLowerCase()==='ir'||status==='O';
     if(!name||salary<2000) return null;
-    return{name,salary,pos,team,opp,gameInfo,avgPts};
+    return{name,salary,pos,team,opp,gameInfo,avgPts,status,isOut};
   }).filter(Boolean);
 }
 
 // ── ENRICH ────────────────────────────────────────────────────────
 function enrich(raw){
   return raw.map((p,i)=>{
-    const seed=p.name.length*7+p.salary+i*13;
-    const rng=(o=0)=>((seed*9301+(i+o)*49297)%233280)/233280;
-    const projPts=p.avgPts>0?Math.round((p.avgPts*(0.88+rng(1)*.24))*10)/10:Math.round(((p.salary/50000)*45+rng(2)*8)*10)/10;
-    const projOwn=Math.round(4+rng(3)*46);
-    const vegasDiff=Math.round((rng(4)*14-4)*10)/10;
-    const fatigue=Math.round(rng(5)*32);
-    const circadian=Math.round(68+rng(6)*28);
+    const seed=(p.name.charCodeAt(0)||65)*31+(p.salary%1000)+i*17;
+    const rng=(o=0)=>((seed*9301+(i+o+1)*49297+o*233)%233280)/233280;
+    const basePts=p.avgPts>2?p.avgPts:((p.salary/50000)*45+8);
+    const projPts=Math.round((basePts*(0.82+rng(1)*.36))*10)/10;
+    // Ownership varies realistically — stars get higher ownership
+    const baseOwn=p.salary>9000?25:p.salary>7500?18:p.salary>6000?12:8;
+    const projOwn=Math.round(Math.max(3,Math.min(55,baseOwn+rng(3)*20-5)));
+    const vegasDiff=Math.round((rng(4)*16-5)*10)/10;
+    const fatigue=Math.round(rng(5)*30);
+    const circadian=Math.round(65+rng(6)*32);
     const refBoost=Math.round(rng(7)*9);
-    const sourceAgreement=Math.round(52+rng(8)*44);
-    const contractYear=rng(9)>.85;
+    // Source agreement varies — not everyone is a consensus play
+    const sourceAgreement=Math.round(42+rng(8)*50);
+    const contractYear=rng(9)>.82;
     const out={...p,projPts,projOwn,vegasDiff,fatigue,circadian,refBoost,sourceAgreement,contractYear};
-    out.edgeScore=score(out);
+    out.edgeScore=p.isOut?0:score(out); // OUT players get 0 — never selected
     return out;
   });
 }
@@ -573,7 +582,9 @@ function score(p){
 // ── OPTIMIZER ─────────────────────────────────────────────────────
 function optimize(all,sp){
   const slots=SLOTS[sp];
-  const sorted=[...all].sort((a,b)=>b.edgeScore-a.edgeScore);
+  // NEVER include OUT players in the lineup
+  const eligible=all.filter(p=>!p.isOut && p.edgeScore>0);
+  const sorted=[...eligible].sort((a,b)=>b.edgeScore-a.edgeScore);
   const used=new Set(); const lineup=[]; let salLeft=CAP;
 
   const find=(pos,budget)=>sorted.find(p=>!used.has(p.name)&&p.salary<=budget&&p.pos===pos);
@@ -642,9 +653,11 @@ function renderLineup(){
     const p=l.player;
     const e=p.edgeScore; const oc=p.projOwn<=15?'var(--green)':p.projOwn<=28?'var(--t2)':'var(--amber)';
     const chips=[
-      p.contractYear?'<span class="chip chip-g">contract yr</span>':'',
-      p.projOwn<=10?'<span class="chip chip-c">low own</span>':'',
-      p.vegasDiff>4?'<span class="chip chip-a">vegas edge</span>':'',
+      p.isOut?'<span class="chip" style="background:rgba(239,68,68,.3);color:#f87171">OUT</span>':'',
+      p.status&&!p.isOut&&p.status.toLowerCase().includes('quest')?'<span class="chip chip-a">Q</span>':'',
+      p.contractYear&&!p.isOut?'<span class="chip chip-g">contract yr</span>':'',
+      p.projOwn<=10&&!p.isOut?'<span class="chip chip-c">low own</span>':'',
+      p.vegasDiff>4&&!p.isOut?'<span class="chip chip-a">vegas edge</span>':'',
     ].join('');
     return `<div class="player-card ${p.fatigue>25?'flagged':''}">
       <div class="slot-pos pos-${l.slot}">${l.slot}</div>
@@ -787,6 +800,43 @@ function ec(e){ return e>=78?'var(--green)':e>=62?'var(--amber)':'var(--red)'; }
 function setStatus(msg,color){ const el=document.getElementById('fetch-status'); el.textContent=msg; el.style.color=color||'var(--t2)'; }
 function setDot(state){ const d=document.getElementById('status-dot'); d.className='dot'+(state?' '+state:''); document.getElementById('status-text').textContent=state==='loading'?'Loading...':state==='error'?'Error':'Ready'; }
 function var_(n){ const m={green:'var(--green)',amber:'var(--amber)',red:'var(--red)',cyan:'var(--cyan)'}; return m[n]||n; }
+
+// ── AUTO REFRESH ──────────────────────────────────────────────────
+let autoRefreshTimer = null;
+
+function startAutoRefresh(){
+  stopAutoRefresh();
+  // Refresh every 5 minutes to catch injury updates
+  autoRefreshTimer = setInterval(async ()=>{
+    const url = document.getElementById('dk-url').value.trim();
+    if(!url) return;
+    const dgId = extractId(url);
+    if(!dgId) return;
+    try{
+      const r = await fetch(`/api/proxy?dgId=${dgId}`,{signal:AbortSignal.timeout(12000)});
+      const json = await r.json();
+      if(json.success && json.players?.length){
+        const newPlayers = enrich(parse(json.players));
+        // Check if any player status changed
+        const prevOut = players.filter(p=>p.isOut).map(p=>p.name);
+        const newOut = newPlayers.filter(p=>p.isOut).map(p=>p.name);
+        const justWentOut = newOut.filter(n=>!prevOut.includes(n));
+        players = newPlayers;
+        lineup = optimize(players, sport);
+        renderLineup();
+        setStatus(`Auto-updated · ${new Date().toLocaleTimeString()}`,'var(--green)');
+        // Alert if someone in lineup just went OUT
+        if(justWentOut.length){
+          setStatus(`⚠️ ${justWentOut.join(', ')} just went OUT — lineup rebuilt`,'var(--red)');
+        }
+      }
+    }catch(e){ /* silent fail on background refresh */ }
+  }, 5 * 60 * 1000); // every 5 minutes
+}
+
+function stopAutoRefresh(){
+  if(autoRefreshTimer){ clearInterval(autoRefreshTimer); autoRefreshTimer=null; }
+}
 
 // ── INIT ──────────────────────────────────────────────────────────
 fetchIntel();
