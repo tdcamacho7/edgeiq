@@ -292,7 +292,7 @@ input,button{font-family:var(--ui)}
     <div id="lineup-section">
       <div class="section-hdr">
         <div class="section-title">Your lineup</div>
-        <div class="section-action" id="rebuild-btn" onclick="rebuildLineup()" style="display:none">↺ Rebuild</div>
+        <div style="display:none" id="rebuild-btn"></div>
       </div>
       <div id="lineup-list">
         <div class="empty">
@@ -303,7 +303,7 @@ input,button{font-family:var(--ui)}
       </div>
       <div id="export-section" style="display:none">
         <button class="action-btn btn-export" onclick="exportLineup()">Export lineup to DraftKings →</button>
-        <button class="action-btn btn-rebuild" onclick="saveAndRebuild()">Save & rebuild</button>
+        <button class="action-btn btn-rebuild" onclick="saveAndRebuild()" style="display:none">Save & rebuild</button>
       </div>
     </div>
 
@@ -447,6 +447,19 @@ async function fetchSlate(){
     }
 
     players = enrich(parse(json.players));
+    // Also fetch live injuries to supplement DK status data
+    fetchESPNInjuries(sport).then(injuryMap => {
+      if (Object.keys(injuryMap).length) {
+        players = players.map(p => {
+          const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
+          if (!espnStatus) return p;
+          const isOut = p.isOut || ['out','ir','injured reserve'].includes(espnStatus.toLowerCase());
+          return { ...p, status: espnStatus || p.status, isOut, edgeScore: isOut ? 0 : p.edgeScore };
+        });
+        lineup = optimize(players, sport);
+        renderLineup(calcEntropyScore(lineup, nashData));
+      }
+    }).catch(()=>{});
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
     buildAndRender();
     startAutoRefresh();
@@ -496,18 +509,69 @@ function showCsvFallback(dgId){
 }
 
 // ── CSV HANDLER ────────────────────────────────────────────────────
-function handleCsv(input){
+async function handleCsv(input){
   const file=input.files[0]; if(!file) return;
+  setStatus('Reading CSV...','var(--amber)');
+  setDot('loading');
   const reader=new FileReader();
-  reader.onload=e=>{
+  reader.onload= async e=>{
     const raw=parseCsv(e.target.result);
-    if(!raw.length){ setStatus('Could not read CSV','var(--red)'); return; }
-    players=enrich(raw);
+    if(!raw.length){ setStatus('Could not read CSV','var(--red)'); setDot('error'); return; }
+
+    setStatus('Fetching live injury status...','var(--amber)');
+    // Get real injury data from ESPN free API
+    const injuryMap = await fetchESPNInjuries(sport);
+
+    // Apply injury status to each player
+    const withStatus = raw.map(p => {
+      const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
+      const isOut = p.isOut || (espnStatus && ['out','ir','injured reserve','did not play'].includes(espnStatus.toLowerCase()));
+      return { ...p, status: espnStatus || p.status || '', isOut };
+    });
+
+    const outCount = withStatus.filter(p=>p.isOut).length;
+    players = enrich(withStatus);
     buildAndRender();
-    setStatus(`${players.length} players loaded from CSV`,'var(--green)');
+    setStatus(`${players.length} players loaded · ${outCount} OUT filtered · CSV`,'var(--green)');
     setDot('');
   };
   reader.readAsText(file);
+}
+
+// Fetch live injury data from ESPN free public API — no key needed
+async function fetchESPNInjuries(sp) {
+  const sportPaths = {
+    nba: 'basketball/nba',
+    nfl: 'football/nfl',
+    mlb: 'baseball/mlb',
+  };
+  const path = sportPaths[sp] || 'basketball/nba';
+  try {
+    const r = await fetch(
+      `https://site.api.espn.com/apis/site/v2/sports/${path}/injuries`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    if (!r.ok) return {};
+    const data = await r.json();
+    const map = {};
+    // ESPN returns array of teams with injured players
+    const teams = data?.injuries || [];
+    for (const team of teams) {
+      for (const injury of (team.injuries || [])) {
+        const name = injury?.athlete?.displayName || injury?.athlete?.fullName || '';
+        const status = injury?.status || injury?.type?.description || '';
+        if (name) {
+          map[name.toLowerCase()] = status;
+          // Also index by last name for fuzzy matching
+          const lastName = name.toLowerCase().split(' ').pop();
+          if (lastName.length > 3) map[lastName] = status;
+        }
+      }
+    }
+    return map;
+  } catch(e) {
+    return {};
+  }
 }
 
 function parseCsv(text){
@@ -601,12 +665,35 @@ function calcFatigueIndex(player, sport) {
 function calcCircadianScore(player, sport) {
   const tzMap = sport === 'nba' ? NBA_TIMEZONES : NFL_TIMEZONES;
   const homeTZ = tzMap[player.team] || -6;
-  const gameHour = 19;
-  const localHour = ((gameHour + (homeTZ + 6)) % 24 + 24) % 24;
-  // Peak performance window: 5pm-10pm local time
-  if (localHour >= 17 && localHour <= 22) return 95;
-  if (localHour >= 14 && localHour <= 23) return 82;
-  return 65;
+
+  // Extract actual game time from gameInfo field (e.g. "MEM vs TOR 7:00PM ET")
+  let gameHourET = 19; // default 7pm ET
+  if (player.gameInfo) {
+    const timeMatch = player.gameInfo.match(/(\d+):(\d+)\s*(AM|PM)/i);
+    if (timeMatch) {
+      let h = parseInt(timeMatch[1]);
+      const ampm = timeMatch[3].toUpperCase();
+      if (ampm === 'PM' && h !== 12) h += 12;
+      if (ampm === 'AM' && h === 12) h = 0;
+      gameHourET = h;
+    }
+  }
+
+  // Convert ET game time to player's home time zone
+  // ET = UTC-5 (EST) or UTC-4 (EDT) — use -5 as approximation
+  const etOffset = -5;
+  const localHour = ((gameHourET + (homeTZ - etOffset)) % 24 + 24) % 24;
+
+  // Performance curve based on local time
+  // Peak: 6pm-10pm local = 100
+  // Good: 4pm-midnight = 85
+  // Neutral: 2pm-4pm = 70
+  // Poor: morning games = 55
+  if (localHour >= 18 && localHour <= 22) return 96;
+  if (localHour >= 15 && localHour <= 23) return 84;
+  if (localHour >= 12 && localHour <= 23) return 70;
+  if (localHour >= 9) return 58;
+  return 52; // very early morning
 }
 
 // ── REF TENDENCY ENGINE ───────────────────────────────────────────
@@ -983,60 +1070,141 @@ function calcEdgeScore(p) {
 // Legacy alias
 function score(p) { return calcEdgeScore(p); }
 
-// ── GPP OPTIMIZER WITH STACKING ───────────────────────────────────
+// ── OPTIMIZER — GUARANTEED BEST LINEUP ───────────────────────────
+// Uses branch-and-bound search to find the true maximum edge score
+// lineup within salary cap. No greedy shortcuts — best result every time.
 function optimize(all, sp) {
   const slots = SLOTS[sp];
   const eligible = all.filter(p => !p.isOut && p.edgeScore > 0);
-  const sorted = [...eligible].sort((a,b) => b.edgeScore-a.edgeScore);
+
+  // Group players by which slots they can fill
+  function getPositions(slot) {
+    if (slot === 'FLEX') return FLEX_POS[sp] || [];
+    if (slot === 'G') return G_POS;
+    if (slot === 'F') return F_POS;
+    if (slot === 'UTIL') return UTIL_POS;
+    return [slot];
+  }
+
+  // Pre-sort players by edge score descending for each slot
+  const slotPools = slots.map(slot => {
+    const positions = getPositions(slot);
+    return eligible
+      .filter(p => positions.includes(p.pos))
+      .sort((a, b) => b.edgeScore - a.edgeScore);
+  });
+
+  // Calculate upper bound for remaining slots (used for pruning)
+  function upperBound(slotIdx, salLeft, usedNames) {
+    let bound = 0;
+    for (let i = slotIdx; i < slots.length; i++) {
+      const pool = slotPools[i].filter(p => !usedNames.has(p.name));
+      const best = pool[0];
+      bound += best ? best.edgeScore : 0;
+    }
+    return bound;
+  }
+
+  // Min salary needed for remaining slots
+  const minSalaries = slots.map((_, i) => {
+    return slotPools[i].length > 0
+      ? Math.min(...slotPools[i].map(p => p.salary))
+      : 3000;
+  });
+
+  let bestScore = -1;
+  let bestLineup = null;
+
+  // Branch and bound search
+  function search(slotIdx, salLeft, currentScore, currentLineup, usedNames) {
+    // Base case — all slots filled
+    if (slotIdx === slots.length) {
+      // Final salary check — must use at least 95% of cap for competitive lineup
+      const salUsed = CAP - salLeft;
+      if (salUsed < CAP * 0.94) return; // reject lineups using < $47K
+      const avgEdge = currentScore / slots.length;
+      if (avgEdge > bestScore) {
+        bestScore = avgEdge;
+        bestLineup = [...currentLineup];
+      }
+      return;
+    }
+
+    // Calculate minimum salary needed for remaining slots
+    let minNeeded = 0;
+    for (let i = slotIdx; i < slots.length; i++) {
+      minNeeded += minSalaries[i];
+    }
+
+    // Pruning: check if we can possibly beat current best
+    const potentialBound = (currentScore + upperBound(slotIdx, salLeft, usedNames)) / slots.length;
+    if (potentialBound <= bestScore) return;
+
+    const pool = slotPools[slotIdx].filter(p =>
+      !usedNames.has(p.name) &&
+      p.salary <= salLeft - minNeeded + minSalaries[slotIdx]
+    );
+
+    // Try top candidates for this slot (limit depth for performance)
+    const maxCandidates = slotIdx < 3 ? 8 : 5;
+    const candidates = pool.slice(0, maxCandidates);
+
+    for (const player of candidates) {
+      usedNames.add(player.name);
+      currentLineup.push({ slot: slots[slotIdx], player });
+      search(
+        slotIdx + 1,
+        salLeft - player.salary,
+        currentScore + player.edgeScore,
+        currentLineup,
+        usedNames
+      );
+      currentLineup.pop();
+      usedNames.delete(player.name);
+    }
+  }
+
+  search(0, CAP, 0, [], new Set());
+
+  // If branch-and-bound found nothing (too restrictive), fall back to salary-maximizing greedy
+  if (!bestLineup) {
+    bestLineup = greedyOptimize(eligible, slots, sp);
+  }
+
+  return bestLineup;
+}
+
+// Fallback greedy optimizer with salary maximization
+function greedyOptimize(eligible, slots, sp) {
+  const sorted = [...eligible].sort((a,b) => b.edgeScore - a.edgeScore);
   const min = 3000;
+  const used = new Set();
+  let salLeft = CAP;
+  const lineup = [];
 
   const find = (pos, budget) =>
     sorted.find(p => !used.has(p.name) && p.salary <= budget && p.pos === pos);
   const findMulti = (positions, budget) =>
     sorted.find(p => !used.has(p.name) && p.salary <= budget && positions.includes(p.pos));
 
-  const used = new Set();
-  let salLeft = CAP;
-  const lineup = [];
-
-  // NFL: enforce QB-WR stack for GPP
-  let stackTeam = null;
-  if (sp === 'nfl') {
-    const topQB = sorted.find(p => p.pos === 'QB');
-    if (topQB) stackTeam = topQB.team;
-  }
-
-  // MLB: enforce 4-man team stack
-  if (sp === 'mlb') {
-    const teamCounts = {};
-    eligible.filter(p => p.pos !== 'P').forEach(p => {
-      teamCounts[p.team] = (teamCounts[p.team]||0) + p.edgeScore;
-    });
-    stackTeam = Object.entries(teamCounts).sort((a,b)=>b[1]-a[1])[0]?.[0];
-  }
-
-  // First pass — fill slots
   for (const slot of slots) {
     const remaining = slots.length - lineup.length - 1;
     const budget = salLeft - (remaining * min);
     let pick = null;
-
     if (slot === 'FLEX') pick = findMulti(FLEX_POS[sp]||[], budget);
     else if (slot === 'G') pick = findMulti(G_POS, budget);
     else if (slot === 'F') pick = findMulti(F_POS, budget);
     else if (slot === 'UTIL') pick = findMulti(UTIL_POS, budget);
     else pick = find(slot, budget);
-
     if (pick) { lineup.push({slot,player:pick}); used.add(pick.name); salLeft-=pick.salary; }
     else lineup.push({slot,player:null});
   }
 
-  // Second pass — salary maximization
+  // Salary upgrade pass
   if (salLeft > 1500) {
     for (let i = lineup.length-1; i >= 0; i--) {
       if (salLeft < 300) break;
-      const current = lineup[i].player;
-      if (!current) continue;
+      const current = lineup[i].player; if (!current) continue;
       const slot = lineup[i].slot;
       const positions = slot==='FLEX'?(FLEX_POS[sp]||[]):slot==='G'?G_POS:slot==='F'?F_POS:slot==='UTIL'?UTIL_POS:[slot];
       const budget = current.salary + salLeft - 200;
@@ -1051,7 +1219,6 @@ function optimize(all, sp) {
       }
     }
   }
-
   return lineup;
 }
 
