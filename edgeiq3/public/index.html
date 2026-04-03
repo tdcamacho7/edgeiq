@@ -432,7 +432,7 @@ async function fetchSlate(){
 
   try{
     // Call our own server-side proxy — bypasses DraftKings CORS block entirely
-    const r = await fetch(`/api/proxy?dgId=${dgId}`, { signal: AbortSignal.timeout(12000) });
+    const r = await fetch(`/api/proxy?dgId=${dgId}&sport=${sport}`, { signal: AbortSignal.timeout(25000) });
     const json = await r.json();
 
     if(!r.ok || !json.success || !json.players?.length){
@@ -442,8 +442,9 @@ async function fetchSlate(){
     players = enrich(parse(json.players));
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
     buildAndRender();
-    startAutoRefresh(); // begin auto-refreshing every 5 min
-    setStatus(`${players.length} players loaded · auto-updating every 5 min`,'var(--green)');
+    startAutoRefresh();
+    const oddsMsg = json.oddsAvailable ? ` · ${json.gamesWithOdds} games with live Vegas lines` : ' · Vegas lines unavailable';
+    setStatus(`${players.length} players loaded · auto-updating every 5 min${oddsMsg}`,'var(--green)');
     setDot('');
 
   } catch(e) {
@@ -548,32 +549,47 @@ function enrich(raw){
     const rng=(o=0)=>((seed*9301+(i+o+1)*49297+o*233)%233280)/233280;
     const basePts=p.avgPts>2?p.avgPts:((p.salary/50000)*45+8);
     const projPts=Math.round((basePts*(0.82+rng(1)*.36))*10)/10;
-    // Ownership varies realistically — stars get higher ownership
     const baseOwn=p.salary>9000?25:p.salary>7500?18:p.salary>6000?12:8;
     const projOwn=Math.round(Math.max(3,Math.min(55,baseOwn+rng(3)*20-5)));
-    const vegasDiff=Math.round((rng(4)*16-5)*10)/10;
+
+    // Use REAL Vegas data if available, otherwise estimate
+    let vegasDiff;
+    if(p.vegasImplied && p.avgPts > 0){
+      // Real divergence: how much Vegas implied total differs from DK avg pts
+      vegasDiff = Math.round((p.vegasImplied - p.avgPts) * 10) / 10;
+    } else {
+      vegasDiff = Math.round((rng(4)*16-5)*10)/10;
+    }
+
+    // Game total signal — high totals mean more scoring opportunities
+    const gameTotalBoost = p.gameTotal
+      ? Math.round((p.gameTotal - 220) / 10) // above 220 pts total = positive signal for NBA
+      : 0;
+
     const fatigue=Math.round(rng(5)*30);
     const circadian=Math.round(65+rng(6)*32);
     const refBoost=Math.round(rng(7)*9);
-    // Source agreement varies — not everyone is a consensus play
     const sourceAgreement=Math.round(42+rng(8)*50);
     const contractYear=rng(9)>.82;
-    const out={...p,projPts,projOwn,vegasDiff,fatigue,circadian,refBoost,sourceAgreement,contractYear};
-    out.edgeScore=p.isOut?0:score(out); // OUT players get 0 — never selected
+    const out={...p,projPts,projOwn,vegasDiff,gameTotalBoost,fatigue,circadian,refBoost,sourceAgreement,contractYear};
+    out.edgeScore=p.isOut?0:score(out);
     return out;
   });
 }
 
 function score(p){
-  const w={consensus:30,field:28,fatigue:12,circadian:10,ref:10,vegas:10};
+  const w={consensus:25,field:25,fatigue:12,circadian:10,ref:8,vegas:15,gameTotal:5};
   const c=(p.sourceAgreement||70);
   const f=Math.max(0,100-(p.projOwn||20));
   const fa=100-(p.fatigue||0);
   const ci=p.circadian||80;
   const r=(p.refBoost||5)*10;
+  // Vegas divergence — real signal when available
   const vd=Math.min(100,Math.max(0,50+(p.vegasDiff||0)*5));
+  // Game total — high-total games = more scoring chances
+  const gt=Math.min(100,Math.max(0,50+(p.gameTotalBoost||0)*10));
   const total=Object.values(w).reduce((a,b)=>a+b,0);
-  let s=(w.consensus*c/100+w.field*f/100+w.fatigue*fa/100+w.circadian*ci/100+w.ref*r/100+w.vegas*vd/100)/total*100;
+  let s=(w.consensus*c/100+w.field*f/100+w.fatigue*fa/100+w.circadian*ci/100+w.ref*r/100+w.vegas*vd/100+w.gameTotal*gt/100)/total*100;
   if(p.contractYear) s=Math.min(100,s+4);
   if((p.projOwn||20)<9) s=Math.min(100,s+3);
   return Math.round(s);
@@ -813,7 +829,7 @@ function startAutoRefresh(){
     const dgId = extractId(url);
     if(!dgId) return;
     try{
-      const r = await fetch(`/api/proxy?dgId=${dgId}`,{signal:AbortSignal.timeout(12000)});
+      const r = await fetch(`/api/proxy?dgId=${dgId}&sport=${sport}`,{signal:AbortSignal.timeout(25000)});
       const json = await r.json();
       if(json.success && json.players?.length){
         const newPlayers = enrich(parse(json.players));
