@@ -328,6 +328,21 @@ input,button{font-family:var(--ui)}
   </div>
 
   <!-- patterns screen -->
+  <!-- SIGNAL QUALITY DASHBOARD -->
+  <div id="screen-signals" style="display:none">
+    <div class="section-hdr" style="margin-bottom:8px">
+      <div class="section-title">Signal quality</div>
+      <div style="font-size:11px;color:var(--t3)" id="signal-updated">Build a lineup to see signal quality</div>
+    </div>
+    <div id="signal-dashboard">
+      <div class="empty">
+        <div class="empty-icon">📡</div>
+        <div class="empty-title">No data yet</div>
+        <div class="empty-desc">Build a lineup first. This shows which signals are real vs estimated.</div>
+      </div>
+    </div>
+  </div>
+
   <div id="screen-patterns" style="display:none">
     <div class="section-hdr" style="margin-bottom:14px">
       <div class="section-title">Your patterns</div>
@@ -443,6 +458,10 @@ input,button{font-family:var(--ui)}
   <div class="nav-item" id="nav-stacks" onclick="showScreen('stacks')">
     <div class="nav-icon">🔗</div>
     <div class="nav-label">Stacks</div>
+  </div>
+  <div class="nav-item" id="nav-signals" onclick="showScreen('signals')">
+    <div class="nav-icon">📡</div>
+    <div class="nav-label">Signals</div>
   </div>
   <div class="nav-item" id="nav-patterns" onclick="showScreen('patterns')">
     <div class="nav-icon">👤</div>
@@ -2490,6 +2509,7 @@ function buildAndRender() {
   renderLineup(entropyScore, kelly, dna, contest);
   renderStacks();
   renderIntelLive();
+  if (currentScreen === 'signals') renderSignalDashboard();
 }
 
 function rebuildLineup() {
@@ -3440,18 +3460,22 @@ function exportAllLineups() {
 
 // ── UPDATE showScreen TO INCLUDE MULTI ───────────────────────────
 function showScreen(s) {
-  ['lineup','intel','multi','swap','stacks','patterns'].forEach(sc => {
+  ['lineup','intel','multi','swap','stacks','signals','patterns'].forEach(sc => {
     const el = document.getElementById(`screen-${sc}`);
     if (el) el.style.display = sc===s?'block':'none';
     const nav = document.getElementById(`nav-${sc}`);
     if (nav) nav.classList.toggle('active', sc===s);
   });
   currentScreen = s;
-  // Auto-populate lineup text area if we have a lineup built
   if (s === 'swap' && lineup.length && !trackedLineup.length) {
     const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
     document.getElementById('lineup-entry').value = names;
   }
+  if (s === 'multi') {
+    document.getElementById('multi-status').textContent =
+      players.length ? `Ready · ${players.filter(p=>!p.isOut).length} eligible players` : 'Build a lineup first';
+  }
+  if (s === 'signals') renderSignalDashboard();
 }
 
 // ── RESULT LOGGER ─────────────────────────────────────────────────
