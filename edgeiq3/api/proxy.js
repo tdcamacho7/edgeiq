@@ -423,11 +423,21 @@ export default async function handler(req, res) {
 
   let draftGroupId = dgId;
   try {
+    // Try contest API first (for contest URLs like /draft/contest/12345)
     const r = await fetchScraper(`https://api.draftkings.com/contests/v1/contests/${dgId}?format=json`);
     if (r.ok) {
       const data = await r.json();
       const resolved = data?.contest?.draftGroupId || data?.data?.contest?.draftGroupId;
-      if (resolved) draftGroupId = String(resolved);
+      if (resolved) { draftGroupId = String(resolved); }
+    } else {
+      // Fall back to lineups API (for entry URLs like /draft/entry/12345)
+      const r2 = await fetchScraper(`https://api.draftkings.com/lineups/v1/lineups/${dgId}?include_draft_group=true`);
+      if (r2.ok) {
+        const data2 = await r2.json();
+        const dg = data2?.draftGroup?.draftGroupId || data2?.lineup?.draftGroupId
+          || data2?.payload?.draftGroup?.draftGroupId;
+        if (dg) { draftGroupId = String(dg); }
+      }
     }
   } catch(e) {}
 
