@@ -514,8 +514,12 @@ function setSport(s,el){
 function onUrlInput(val){
   const id = extractId(val);
   const btn = document.getElementById('fetch-btn');
-  if(id){ btn.disabled=false; setStatus(`Contest detected — tap Build`,'var(--green)'); }
-  else if(val.length>10){ btn.disabled=true; setStatus('Use the contest URL — copy from DraftKings lobby, not from inside a lineup','var(--amber)'); }
+  const isEntry = val.includes('/entry/');
+  const isContest = val.includes('/contest/');
+  if(id && isContest){ btn.disabled=false; setStatus('Contest detected — tap Build ✓','var(--green)'); }
+  else if(id && isEntry){ btn.disabled=false; setStatus('Entry URL detected — tapping Build, may need CSV fallback','var(--amber)'); }
+  else if(id){ btn.disabled=false; setStatus('ID detected — tap Build','var(--green)'); }
+  else if(val.length>10){ btn.disabled=true; setStatus('Paste the contest link from the DraftKings lobby (not from inside a lineup)','var(--amber)'); }
   else{ btn.disabled=true; setStatus('',''); }
 }
 
@@ -549,7 +553,8 @@ async function fetchSlate(){
     const json = await r.json();
 
     if(!r.ok || !json.success || !json.players?.length){
-      throw new Error(json.error || 'No players returned');
+      const hint = json.error?.includes('entry') ? ' — Entry URLs need CSV. Go to lobby → Export to CSV' : '';
+      throw new Error((json.error || 'No players returned') + hint);
     }
 
     players = enrich(parse(json.players));
