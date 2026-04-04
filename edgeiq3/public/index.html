@@ -650,13 +650,15 @@ async function handleCsv(input){
     ]);
 
     // For MLB: fetch official active rosters to catch IL players missed by CSV/ESPN
+    // Hard 3s timeout — if API is slow or CORS-blocked, skip gracefully
     let mlbActiveRosters = null;
     if (sport === 'mlb') {
       const teams = [...new Set(raw.map(p => p.teamAbbrev || p.team).filter(Boolean))];
-      mlbActiveRosters = await fetchMLBActiveRosters(teams).catch(() => null);
-      if (mlbActiveRosters) {
-        setStatus(`${raw.length} players found · checking active rosters...`, 'var(--amber)');
-      }
+      setStatus(`${raw.length} players found · checking rosters...`, 'var(--amber)');
+      mlbActiveRosters = await Promise.race([
+        fetchMLBActiveRosters(teams),
+        new Promise(res => setTimeout(() => res(null), 3000)) // 3s max total
+      ]).catch(() => null);
     }
 
     // Apply all data to players
@@ -734,45 +736,29 @@ function fuzzyMatchOwnership(name, ownershipMap) {
   return null;
 }
 
-// Fetch MLB active rosters from the official MLB Stats API (free, no key needed)
+// Fetch MLB active rosters via our proxy (avoids CORS restrictions)
 // Players NOT on active roster = on IL, suspended, or otherwise unavailable
 async function fetchMLBActiveRosters(teamAbbrevs) {
-  const MLB_TEAM_IDS = {
-    NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
-    MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
-    STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
-    TOR:141,LAD:119,CWS:145
-  };
-  const teams = [...new Set(teamAbbrevs)];
-  const season = new Date().getFullYear();
-  const results = await Promise.all(
-    teams.map(abbr => {
-      const id = MLB_TEAM_IDS[abbr]; if (!id) return null;
-      return fetch(`https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
-        { signal: AbortSignal.timeout(5000) })
-        .then(r => r.ok ? r.json() : null).catch(() => null);
-    })
-  );
-  const active = new Set();
-  let teamsFound = 0;
-  for (const r of results) {
-    if (!r?.roster) continue;
-    teamsFound++;
-    for (const p of r.roster) {
-      const name = (p.person?.fullName || '').toLowerCase();
-      if (name) {
-        active.add(name);
-        // Also index by "F. Lastname" format DK uses
-        const parts = name.split(' ');
-        if (parts.length >= 2) {
-          active.add(`${parts[0][0]}. ${parts.slice(1).join(' ')}`);
-          active.add(parts[parts.length - 1]); // last name only fallback
-        }
+  const teams = [...new Set(teamAbbrevs)].join(',');
+  try {
+    const r = await fetch(`/api/proxy?action=mlb_rosters&teams=${encodeURIComponent(teams)}`,
+      { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!data.success || !data.activeNames?.length) return null;
+    const active = new Set();
+    for (const name of data.activeNames) {
+      active.add(name);
+      const parts = name.split(' ');
+      if (parts.length >= 2) {
+        active.add(`${parts[0][0]}. ${parts.slice(1).join(' ')}`);
+        active.add(parts[parts.length - 1]);
       }
     }
+    return data.teamCount >= 2 ? active : null;
+  } catch(e) {
+    return null;
   }
-  // Only return if we got data for at least 2 teams (sanity check)
-  return teamsFound >= 2 ? active : null;
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
