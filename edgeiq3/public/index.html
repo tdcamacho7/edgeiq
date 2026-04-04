@@ -821,8 +821,12 @@ async function fetchRecentForm(playerNames, sp) {
 }
 
 function calcRecentForm(player) {
-  // Use avgPts as base with variance simulation to estimate hot/cold streaks
-  // Real data: if ESPN game log available, use weighted avg of last 5
+  // Use REAL data from proxy if available
+  if (player.recentFormData) {
+    return player.recentFormData;
+  }
+
+  // Fallback: estimate from average pts with variance
   const cached = recentFormCache[player.name.toLowerCase()];
   if (cached) return cached;
 
@@ -830,21 +834,17 @@ function calcRecentForm(player) {
   const seed = player.name.charCodeAt(0) * 31 + (player.salary % 1000);
   const rng = (o=0) => ((seed * 9301 + (o+1) * 49297) % 233280) / 233280;
 
-  // Simulate last 5 game scores with realistic variance
   const last5 = [0,1,2,3,4].map(i => {
     const variance = (rng(i) - 0.5) * base * 0.6;
     return Math.max(0, base + variance);
   });
 
-  // Weighted recent average (most recent = highest weight)
   const weightedAvg = last5.reduce((s, pts, i) => s + pts * FORM_WEIGHTS[i], 0);
-
-  // Trend: positive if last 2 games above average, negative if below
   const recentAvg = (last5[0] + last5[1]) / 2;
   const trend = recentAvg > base * 1.15 ? 'hot' : recentAvg < base * 0.75 ? 'cold' : 'neutral';
   const trendBoost = trend === 'hot' ? 8 : trend === 'cold' ? -8 : 0;
 
-  return { weightedAvg: Math.round(weightedAvg * 10) / 10, trend, trendBoost, last5 };
+  return { weightedAvg: Math.round(weightedAvg*10)/10, trend, trendBoost, last5 };
 }
 
 // ── HOME/AWAY SPLITS ──────────────────────────────────────────────
@@ -2216,6 +2216,8 @@ function renderLineup(entropyScore, kelly) {
       p.vegasDiff>4 && !p.isOut ? '<span class="chip chip-a">vegas edge</span>' : '',
       isChalk ? '<span class="chip chip-a">chalk trap</span>' : '',
       p.fatigue>25 ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">fatigued</span>' : '',
+      p.recentForm?.trend === 'hot' ? '<span class="chip" style="background:rgba(16,185,129,.2);color:var(--green)">🔥 hot</span>' : '',
+      p.recentForm?.trend === 'cold' ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">❄️ cold</span>' : '',
       p.dvpLabel?.badge && !p.isOut ? `<span class="chip" style="background:${p.dvpLabel.color==='var(--green)'?'rgba(16,185,129,.2)':p.dvpLabel.color==='var(--red)'?'rgba(239,68,68,.2)':'rgba(245,158,11,.2)'};color:${p.dvpLabel.color}">${p.dvpLabel.badge}</span>` : '',
     ].join('');
 
