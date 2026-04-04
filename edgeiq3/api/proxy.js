@@ -235,6 +235,76 @@ export default async function handler(req, res) {
   }
 
   // ── VEGAS ODDS ────────────────────────────────────────────────────
+  // ── RECENT FORM — REAL LAST 5 GAME SCORES ────────────────────────
+  async function fetchRecentFormData(sp) {
+    const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
+    try {
+      // ESPN athletes stats endpoint — returns recent game logs
+      const r = await fetchDirect(
+        `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard?limit=10`,
+        8000
+      );
+      if (!r.ok) return {};
+      const data = await r.json();
+      const formMap = {};
+
+      // Extract player stats from completed games
+      const events = data?.events || [];
+      for (const event of events) {
+        if (event.status?.type?.state !== 'post') continue;
+        const competitors = event.competitions?.[0]?.competitors || [];
+        for (const team of competitors) {
+          const roster = team.roster || team.athletes || [];
+          for (const athlete of roster) {
+            const name = (athlete.athlete?.displayName || athlete.displayName || '').toLowerCase();
+            if (!name) continue;
+            const stats = athlete.statistics || athlete.stats || [];
+
+            let pts = 0;
+            if (sp === 'nba') {
+              pts = parseFloat(stats.find?.(s => s.name === 'points')?.displayValue || 0);
+            } else if (sp === 'nfl') {
+              const passTD = parseFloat(stats.find?.(s => s.name === 'passingTouchdowns')?.displayValue || 0);
+              const passYd = parseFloat(stats.find?.(s => s.name === 'passingYards')?.displayValue || 0);
+              const rushTD = parseFloat(stats.find?.(s => s.name === 'rushingTouchdowns')?.displayValue || 0);
+              const rushYd = parseFloat(stats.find?.(s => s.name === 'rushingYards')?.displayValue || 0);
+              const recTD  = parseFloat(stats.find?.(s => s.name === 'receivingTouchdowns')?.displayValue || 0);
+              const recYd  = parseFloat(stats.find?.(s => s.name === 'receivingYards')?.displayValue || 0);
+              const rec    = parseFloat(stats.find?.(s => s.name === 'receptions')?.displayValue || 0);
+              pts = passTD*4 + passYd*0.04 + rushTD*6 + rushYd*0.1 + recTD*6 + recYd*0.1 + rec*1;
+            } else if (sp === 'mlb') {
+              const hits = parseFloat(stats.find?.(s => s.name === 'hits')?.displayValue || 0);
+              const hr   = parseFloat(stats.find?.(s => s.name === 'homeRuns')?.displayValue || 0);
+              const rbi  = parseFloat(stats.find?.(s => s.name === 'rbi')?.displayValue || 0);
+              const runs = parseFloat(stats.find?.(s => s.name === 'runs')?.displayValue || 0);
+              const sb   = parseFloat(stats.find?.(s => s.name === 'stolenBases')?.displayValue || 0);
+              pts = hits*3 + hr*10 + rbi*2 + runs*2 + sb*6;
+            }
+
+            if (name && pts > 0) {
+              if (!formMap[name]) formMap[name] = [];
+              formMap[name].push(pts);
+            }
+          }
+        }
+      }
+
+      // Calculate weighted recent form for each player
+      const WEIGHTS = [0.35, 0.25, 0.20, 0.12, 0.08];
+      const formScores = {};
+      for (const [name, games] of Object.entries(formMap)) {
+        const last5 = games.slice(-5).reverse(); // most recent first
+        const weighted = last5.reduce((s, pts, i) => s + pts * (WEIGHTS[i] || 0.05), 0);
+        const avg = last5.reduce((s,p) => s+p, 0) / last5.length;
+        const trend = last5.length >= 2 && last5[0] > avg * 1.15 ? 'hot'
+                    : last5.length >= 2 && last5[0] < avg * 0.75 ? 'cold'
+                    : 'neutral';
+        formScores[name] = { weightedAvg: Math.round(weighted*10)/10, trend, last5 };
+      }
+      return formScores;
+    } catch(e) { return {}; }
+  }
+
   async function fetchVegasOdds(sp) {
     if (!oddsKey) return {};
     try {
@@ -299,15 +369,17 @@ export default async function handler(req, res) {
   const sp = sport || 'nba';
 
   // ── FETCH ALL DATA IN PARALLEL ────────────────────────────────────
-  const [oddsRes, sleeperRes, ownershipRes] = await Promise.allSettled([
+  const [oddsRes, sleeperRes, ownershipRes, recentFormRes] = await Promise.allSettled([
     fetchVegasOdds(sp),
     fetchSleeperProjections(sp),
     fetchAllOwnership(sp),
+    fetchRecentFormData(sp),
   ]);
 
-  const odds       = oddsRes.status       === 'fulfilled' ? oddsRes.value       : {};
-  const projections = sleeperRes.status   === 'fulfilled' ? sleeperRes.value    : {};
-  const ownership  = ownershipRes.status  === 'fulfilled' ? ownershipRes.value  : {};
+  const odds        = oddsRes.status       === 'fulfilled' ? oddsRes.value       : {};
+  const projections = sleeperRes.status    === 'fulfilled' ? sleeperRes.value    : {};
+  const ownership   = ownershipRes.status  === 'fulfilled' ? ownershipRes.value  : {};
+  const recentForm  = recentFormRes.status === 'fulfilled' ? recentFormRes.value : {};
 
   // ── FETCH DRAFTKINGS PLAYERS ──────────────────────────────────────
   const endpoints = [
@@ -345,6 +417,15 @@ export default async function handler(req, res) {
         // Real ownership from scraped sources
         const fpOwnership  = fuzzyMatch(name, ownership);
 
+        // Real recent form from ESPN game logs
+        const nameLower = name.toLowerCase();
+        const formKey = Object.keys(recentForm).find(k =>
+          k === nameLower ||
+          k.includes(nameLower.split(' ').pop()) ||
+          nameLower.includes(k.split(' ').pop())
+        );
+        const recentFormData = formKey ? recentForm[formKey] : null;
+
         // Injury status
         const status = p.status || p.playerGameAttribute?.injuryStatus || '';
         const isOut  = ['out','ir','o','injured reserve'].includes(status.toLowerCase());
@@ -355,6 +436,7 @@ export default async function handler(req, res) {
           gameTotal,
           realProjection: sleeperProj,
           fpOwnership,
+          recentFormData,  // { weightedAvg, trend, last5 }
           status,
           isOut,
         };
