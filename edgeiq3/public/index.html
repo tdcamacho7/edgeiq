@@ -630,13 +630,17 @@ async function handleCsv(input){
 
     // Fetch live data with hard 6-second timeout
     // If any source hangs, we continue without it — never block lineup generation
-    const timeout = ms => new Promise(resolve => setTimeout(() => resolve(null), ms));
-    const safe = fn => Promise.race([fn(), timeout(6000)]);
+    // Safe fetch: caps at 6s timeout AND swallows rejections → always resolves to {} on failure
+    const safeTimeout = ms => new Promise(res => setTimeout(() => res(null), ms));
+    const safeFetch = fn => Promise.race([
+      fn().catch(() => null),   // catch rejections → null
+      safeTimeout(6000)         // cap at 6 seconds
+    ]).then(r => r || {});
 
     const [injuryMap, ownershipData, vegasData] = await Promise.all([
-      safe(() => fetchESPNInjuries(sport)).then(r => r || {}),
-      safe(() => fetchOwnershipFromProxy(sport)).then(r => r || {}),
-      safe(() => fetchVegasFromProxy(sport)).then(r => r || {}),
+      safeFetch(() => fetchESPNInjuries(sport)),
+      safeFetch(() => fetchOwnershipFromProxy(sport)),
+      safeFetch(() => fetchVegasFromProxy(sport)),
     ]);
 
     // Apply all data to players
@@ -3169,67 +3173,77 @@ function optimize(all, sp) {
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
 function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
-  // Sort by edge score descending
   const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
   const used   = new Set();
   let salLeft  = budget;
   const lineup = [];
-  const MIN_PER_SLOT = 2500;
+  const MIN    = 2500;
 
-  // MLB: identify the best stack team first
-  // Pick the team whose top hitters have highest combined edge scores
-  let stackTeam = null;
-  if (sp === 'mlb') {
-    if (presetStackTeam) {
-      // Use the stack team identified by the MLB two-phase optimizer
-      stackTeam = presetStackTeam;
-    } else {
-      // Fallback: identify stack team from the pool
-      const teamMap = {};
-      sorted.filter(p => p.pos !== 'P').forEach(p => {
-        if (!teamMap[p.team]) teamMap[p.team] = [];
-        teamMap[p.team].push(p.edgeScore);
+  // ── MLB: PRE-SELECT 4-MAN STACK FIRST ────────────────────────────
+  // Pre-select the 4 best stack team players at DIFFERENT positions
+  // before filling other slots. This guarantees the stack is built
+  // when the team has viable players at multiple positions.
+  const stackPicks = []; // pre-selected stack players
+  if (sp === 'mlb' && presetStackTeam) {
+    const stackPlayers = sorted
+      .filter(p => p.team === presetStackTeam && p.pos !== 'P');
+
+    const usedStackPos = new Set();
+    for (const p of stackPlayers) {
+      if (stackPicks.length >= 4) break;
+      // Only pick one player per position (avoid 2 OFs if only need 1)
+      // But allow up to 3 OF picks since we have 3 OF slots
+      const posCount = stackPicks.filter(sp2 => sp2.pos === p.pos).length;
+      const posMax   = p.pos === 'OF' ? 3 : 1;
+      if (posCount >= posMax) continue;
+      // Verify this slot type exists in the remaining hitter slots
+      const slotNeeded = p.pos === 'OF' ? 'OF'
+        : p.pos === 'SS' ? 'SS'
+        : p.pos;
+      const slotsForPos = slots.filter(s => {
+        if (s === slotNeeded) return true;
+        if (s === 'FLEX' && (FLEX_POS[sp]||[]).includes(p.pos)) return true;
+        return false;
       });
-      const teamStackScores = Object.entries(teamMap)
-        .filter(([, scores]) => scores.length >= 2)
-        .map(([team, scores]) => {
-          const top4 = [...scores].sort((a,b)=>b-a).slice(0,4);
-          return [team, top4.reduce((a,b)=>a+b,0) / top4.length];
-        });
-      stackTeam = teamStackScores.sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+      if (slotsForPos.length <= stackPicks.filter(sp2 => sp2.pos === p.pos).length) continue;
+      stackPicks.push(p);
+      used.add(p.name);
+      salLeft -= p.salary;
+    }
+    // If we couldn't get 4, release the partial stack (not worth forcing)
+    if (stackPicks.length < 3) {
+      stackPicks.forEach(p => used.delete(p.name));
+      stackPicks.length = 0;
+      salLeft = budget;
     }
   }
 
+  // ── FILL ALL SLOTS ────────────────────────────────────────────────
+  // Build a map of which slots the pre-selected stack covers
+  const stackSlotMap = [...stackPicks]; // consume stack picks in order
+
   for (const slot of slots) {
     const remaining = slots.length - lineup.length - 1;
-    const maxBudget = salLeft - (remaining * MIN_PER_SLOT);
+    const maxBudget = salLeft - (remaining * MIN);
 
     const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
-      : slot === 'G' ? G_POS : slot === 'F' ? F_POS
-      : slot === 'UTIL' ? UTIL_POS : [slot];
+      : slot === 'G'    ? G_POS
+      : slot === 'F'    ? F_POS
+      : slot === 'UTIL' ? UTIL_POS
+      : [slot];
 
-      // For MLB hitter slots: force 4 stack team players
+    // Check if a pre-selected stack player fits this slot
     let pick = null;
-    const stackCount = lineup.filter(l => l.player?.team === stackTeam && l.slot !== 'P').length;
-    const hitterSlotsLeft = slots.slice(lineup.length).filter(s => s !== 'P').length;
-    const needStack = sp === 'mlb' && slot !== 'P' && stackTeam;
-    const mustStack = needStack && stackCount < 4 && hitterSlotsLeft <= (4 - stackCount);
-
-    if (mustStack) {
-      // MUST pick from stack team — not enough slots left to reach 4 otherwise
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget &&
-        positions.includes(p.pos) && p.team === stackTeam
+    if (stackSlotMap.length > 0 && slot !== 'P') {
+      const stackIdx = stackSlotMap.findIndex(p =>
+        positions.includes(p.pos) && p.salary <= maxBudget
       );
-    } else if (needStack && stackCount < 4) {
-      // Prefer stack team player, but can fall back if none fit
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget &&
-        positions.includes(p.pos) && p.team === stackTeam
-      );
+      if (stackIdx >= 0) {
+        pick = stackSlotMap.splice(stackIdx, 1)[0];
+      }
     }
 
-    // Fall back to best available if no stack player fits
+    // Fall back to best available by edge score
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -3245,7 +3259,7 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
     }
   }
 
-  // Salary upgrade pass — use remaining budget on better players
+  // ── SALARY UPGRADE PASS ───────────────────────────────────────────
   for (let i = lineup.length-1; i >= 0; i--) {
     if (salLeft < 300) break;
     const cur  = lineup[i].player; if (!cur) continue;
@@ -3254,88 +3268,84 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
       : slot === 'G' ? G_POS : slot === 'F' ? F_POS
       : slot === 'UTIL' ? UTIL_POS : [slot];
     const upgrade = sorted.find(p =>
-      !used.has(p.name) && p.salary > cur.salary &&
+      !used.has(p.name) &&
+      p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
-      positions.includes(p.pos) && p.edgeScore >= cur.edgeScore - 8
+      positions.includes(p.pos) &&
+      p.edgeScore >= cur.edgeScore - 8
     );
     if (upgrade) {
-      salLeft = salLeft + cur.salary - upgrade.salary;
+      salLeft += cur.salary - upgrade.salary;
       used.delete(cur.name); used.add(upgrade.name);
       lineup[i] = { slot, player: upgrade };
     }
   }
+
   return lineup;
 }
 
-
-// Slate-relative position ceiling maxima — set during buildAndRender
-// Normalizes each player against the BEST ceiling on THIS slate for their position
-// Prevents MLB hitters from always scoring low due to fixed absolute maximums
+// Slate-relative position ceiling maxima — set each build
 let slatePosCeilMax = {};
 
 async function buildAndRender() {
   setStatus('Building lineup...', 'var(--amber)');
-
-  // Yield to UI so status message renders before computation starts
   await new Promise(r => setTimeout(r, 30));
 
-  // Nash simulation — capped at 120 players and 150 iterations for speed
-  nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
+  try {
+    // Nash simulation — quick pass on top players
+    nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
 
-  // Monte Carlo — top 80 players only, 300 iterations max
-  const eligibleForMC = players
-    .filter(p => !p.isOut && p.projPts > 0)
-    .sort((a, b) => b.edgeScore - a.edgeScore)
-    .slice(0, 80);
-  const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
+    // Monte Carlo — top 80 players only, 300 iterations
+    const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
+      .sort((a, b) => b.edgeScore - a.edgeScore).slice(0, 80);
+    const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
 
-  // Pass 1: compute ceilings for all players with Gumbel stack boosts
-  players = players.map(p => {
-    p._mcFirstPlaceProb = mcProbs[p.name] || 0;
-    const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-    p._ceiling = calcPlayerCeiling(p, teammates);
-    return p;
-  });
+    // Pass 1: compute ceilings (with stack boosts via Gumbel copula)
+    players = players.map(p => {
+      p._mcFirstPlaceProb = mcProbs[p.name] || 0;
+      const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
+      p._ceiling = calcPlayerCeiling(p, teammates);
+      return p;
+    });
 
-  // Build SLATE-RELATIVE position maxima
-  // Each position's max = the highest ceiling on THIS slate at that position
-  // This ensures top player at each position always scores near 99
-  slatePosCeilMax = {};
-  players.filter(p => !p.isOut && p._ceiling > 0).forEach(p => {
-    const pos = p.pos || 'FLEX';
-    if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) {
-      slatePosCeilMax[pos] = p._ceiling;
-    }
-  });
+    // Build slate-relative position maxima
+    slatePosCeilMax = {};
+    players.filter(p => !p.isOut && p._ceiling > 0).forEach(p => {
+      const pos = p.pos || 'FLEX';
+      if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) {
+        slatePosCeilMax[pos] = p._ceiling;
+      }
+    });
 
-  // Pass 2: re-score using slate-relative normalization
-  players = players.map(p => {
-    p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
-    return p;
-  });
+    // Pass 2: re-score with slate-relative normalization
+    players = players.map(p => {
+      p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
+      return p;
+    });
 
-  lineup = optimize(players, sport);
+    lineup = optimize(players, sport);
 
-  // JSD uniqueness score
-  const jsdScore = calcLineupJSDScore(lineup, players);
+    const jsdScore = calcLineupJSDScore(lineup, players);
+    const valid   = lineup.filter(l => l.player);
+    const avgEdge = valid.length ? Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length) : 0;
+    const avgOwn  = valid.length ? valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length : 20;
+    const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
+    const dna     = analyzeLineupDNA(lineup, sport);
+    const contest = recommendContest(avgEdge);
 
-  // Multivariate Kelly
-  const valid   = lineup.filter(l => l.player);
-  const avgEdge = valid.length ? Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length) : 0;
-  const avgOwn  = valid.length ? valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length : 20;
-  const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
+    fetchLatestNews(sport).catch(() => {});
 
-  const dna     = analyzeLineupDNA(lineup, sport);
-  const contest = recommendContest(avgEdge);
-
-  fetchLatestNews(sport).catch(() => {});
-
-  renderLineup(jsdScore, kelly, dna, contest);
-  renderStacks();
-  renderIntelLive();
-  if (currentScreen === 'signals') renderSignalDashboard();
-  setDot('ok');
-  setStatus('', '');
+    renderLineup(jsdScore, kelly, dna, contest);
+    renderStacks();
+    renderIntelLive();
+    if (currentScreen === 'signals') renderSignalDashboard();
+    setDot('ok');
+    setStatus('', '');
+  } catch(err) {
+    console.error('EdgeIQ buildAndRender error:', err);
+    setDot('error');
+    setStatus('Error building lineup — try uploading CSV again', 'var(--amber)');
+  }
 }
 
 function rebuildLineup() {
