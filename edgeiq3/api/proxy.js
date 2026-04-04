@@ -1,3 +1,5 @@
+export const config = { maxDuration: 60 }; // Vercel Pro: 60s, Free: 10s
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -23,7 +25,7 @@ export default async function handler(req, res) {
     if (!scraperKey) return fetchDirect(url, timeout);
     const credits = render ? '&render=true' : '';
     const proxyUrl = `http://api.scraperapi.com?api_key=${scraperKey}&url=${encodeURIComponent(url)}${credits}`;
-    return fetch(proxyUrl, { signal: AbortSignal.timeout(timeout) });
+    return fetch(proxyUrl, { signal: AbortSignal.timeout(Math.min(timeout, 12000)) });
   }
 
   // ── OWNERSHIP ACTION ─────────────────────────────────────────────
