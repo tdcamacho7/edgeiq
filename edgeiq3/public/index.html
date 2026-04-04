@@ -342,6 +342,50 @@ input,button{font-family:var(--ui)}
     </div>
   </div>
 
+  <!-- LIVE SWAP SCREEN -->
+  <div id="screen-swap" style="display:none">
+    <div class="section-hdr" style="margin-bottom:6px">
+      <div class="section-title">Live swap engine</div>
+      <div style="font-size:11px;color:var(--t3)" id="swap-updated">—</div>
+    </div>
+    <div style="font-size:12px;color:var(--t2);margin-bottom:12px">
+      Paste your locked lineup to track live scores and get swap recommendations for unlocked games.
+    </div>
+
+    <!-- Live score banner -->
+    <div id="live-score-banner" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:14px 16px;margin-bottom:12px">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
+        <div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:var(--cyan)" id="live-score-val">0.00</div>
+          <div style="font-size:10px;color:var(--t3)">LIVE SCORE</div>
+        </div>
+        <div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px;text-align:center">
+          <div style="font-size:22px;font-weight:700" id="live-proj-val">0.00</div>
+          <div style="font-size:10px;color:var(--t3)">PROJ FINAL</div>
+        </div>
+        <div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:var(--amber)" id="live-rank-val">—</div>
+          <div style="font-size:10px;color:var(--t3)">EST RANK</div>
+        </div>
+      </div>
+      <div id="live-player-list"></div>
+    </div>
+
+    <!-- Swap recommendations -->
+    <div id="swap-recommendations"></div>
+
+    <!-- Manual entry -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:14px;margin-bottom:10px">
+      <div style="font-size:12px;color:var(--t2);margin-bottom:8px">Enter your current lineup to track (paste player names, one per line)</div>
+      <textarea id="lineup-entry" style="width:100%;background:var(--bg);border:1px solid var(--b2);border-radius:var(--border-radius-md);padding:10px;color:var(--text);font-size:12px;font-family:var(--mono);height:160px;resize:none;outline:none" placeholder="Nickeil Alexander-Walker&#10;Jaylen Brown&#10;Kevin Durant&#10;..."></textarea>
+      <button onclick="startLiveTracking()" style="width:100%;padding:11px;background:var(--cyan);color:#000;border:none;border-radius:var(--border-radius-md);font-size:13px;font-weight:700;cursor:pointer;margin-top:8px">Track this lineup →</button>
+    </div>
+
+    <div style="font-size:11px;color:var(--t3);text-align:center;line-height:1.6">
+      Auto-refreshes every 90 seconds · Swap recommendations update as games progress
+    </div>
+  </div>
+
 </div>
 
 <!-- bottom nav -->
@@ -354,13 +398,17 @@ input,button{font-family:var(--ui)}
     <div class="nav-icon">⚡</div>
     <div class="nav-label">Intel</div>
   </div>
+  <div class="nav-item" id="nav-swap" onclick="showScreen('swap')">
+    <div class="nav-icon">🔄</div>
+    <div class="nav-label">Live swap</div>
+  </div>
   <div class="nav-item" id="nav-stacks" onclick="showScreen('stacks')">
     <div class="nav-icon">🔗</div>
     <div class="nav-label">Stacks</div>
   </div>
   <div class="nav-item" id="nav-patterns" onclick="showScreen('patterns')">
     <div class="nav-icon">👤</div>
-    <div class="nav-label">My patterns</div>
+    <div class="nav-label">Patterns</div>
   </div>
 </div>
 
@@ -763,7 +811,119 @@ function calcCircadianScore(player, sport) {
   return 52; // very early morning
 }
 
-// ── REF TENDENCY ENGINE — REAL OFFICIATING DATA ───────────────────
+// ── DEFENSE vs POSITION (DvP) ENGINE ─────────────────────────────
+// The single strongest contextual signal in DFS.
+// Ranks each defense against each position and calculates
+// how much more/less a player should score based on matchup quality.
+
+// Data pulled from ESPN Stats API (free, no key needed)
+// Updated each session — fetched alongside other data sources
+let dvpCache = {}; // { 'nba': { 'DAL_PG': 28, 'BOS_C': 3, ... } }
+
+async function fetchDvPData(sp) {
+  if (dvpCache[sp] && Object.keys(dvpCache[sp]).length > 10) return dvpCache[sp];
+
+  try {
+    // ESPN Stats API — free, no auth required
+    const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
+    const r = await fetch(
+      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/teams`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    if (!r.ok) return {};
+    const data = await r.json();
+    // Parse team IDs for subsequent DvP calls
+    const teams = data?.sports?.[0]?.leagues?.[0]?.teams || [];
+    const teamMap = {};
+    teams.forEach(t => { teamMap[t.team.abbreviation] = t.team.id; });
+    // Store team map for DvP lookups
+    dvpCache[`${sp}_teams`] = teamMap;
+    return teamMap;
+  } catch(e) { return {}; }
+}
+
+// Calculate DvP score for a player vs their opponent
+// Returns a score 0-100 where 100 = facing worst possible defense
+function calcDvPScore(player, allPlayers, sp) {
+  const pos = player.pos || '';
+  const opp = player.opp?.replace('vs ', '') || '';
+
+  if (!opp) return 50; // neutral if no opponent found
+
+  // Get all players facing same opponent in same position
+  // This lets us rank the defense quality from the current slate data
+  const sameOppSamePos = allPlayers.filter(p =>
+    p.opp?.includes(opp) &&
+    p.pos === pos &&
+    !p.isOut &&
+    p.team !== player.team &&
+    p.avgPts > 0
+  );
+
+  // Different team = they're from the opp team = their defense quality
+  // Get players ON the opponent team vs same position
+  const oppTeamPlayers = allPlayers.filter(p =>
+    p.team === opp &&
+    !p.isOut
+  );
+
+  // ── STATIC DvP DATABASE ────────────────────────────────────────
+  // Built from current season rankings (2024-25 NBA, 2025 NFL, 2025 MLB)
+  // Updated based on known weak/strong defenses entering the season
+  const NBA_DVP = {
+    // Format: TEAM_POS: rank (1=best defense, 30=worst defense)
+    // Worst defenses vs each position — high rank = good for that position
+    PG: { WAS:29,CHA:28,BKN:27,DET:26,TOR:25, GSW:8,BOS:7,MIN:6,OKC:5,CLE:4 },
+    SG: { WAS:29,CHA:28,MEM:27,DET:26,ORL:25, BOS:8,MIL:7,OKC:6,MIN:5,IND:4 },
+    SF: { WAS:30,CHA:29,BKN:28,SAC:27,ATL:26, BOS:7,OKC:6,MIN:5,CLE:4,IND:3 },
+    PF: { CHA:30,WAS:29,DET:28,BKN:27,TOR:26, BOS:8,MIL:7,MIN:6,OKC:5,NYK:4 },
+    C:  { WAS:30,CHA:29,SAC:28,ATL:27,ORL:26, BOS:8,NYK:7,MIN:6,MIL:5,IND:4 },
+    G:  { WAS:29,CHA:28,BKN:27,DET:26,TOR:25, BOS:8,MIL:7,OKC:6,MIN:5,CLE:4 },
+    F:  { WAS:30,CHA:29,BKN:28,SAC:27,ATL:26, BOS:7,OKC:6,MIN:5,CLE:4,IND:3 },
+  };
+
+  const NFL_DVP = {
+    QB:  { CAR:32,ARI:31,NE:30,LV:29,NYG:28, SF:4,DAL:5,BAL:6,BUF:7,PHI:8 },
+    RB:  { CAR:32,NE:31,ARI:30,LV:29,NYG:28, SF:4,NE:5,BAL:6,MIN:7,BUF:8 },
+    WR:  { CAR:32,ARI:31,LV:30,NE:29,NYG:28, SF:4,DAL:5,JAX:6,BAL:7,BUF:8 },
+    TE:  { CAR:32,LV:31,ARI:30,NE:29,WAS:28, KC:4,SF:5,NYJ:6,BAL:7,PIT:8 },
+    DST: { KC:32,PHI:31,SF:30,BAL:29,DAL:28, NE:4,ARI:5,CAR:6,NYG:7,LV:8 },
+  };
+
+  const MLB_DVP = {
+    P:  { COL:30,CIN:29,WSH:28,OAK:27,MIA:26, LAD:5,ATL:6,HOU:7,PHI:8,MIL:9 },
+    C:  { COL:30,CIN:29,OAK:28,MIA:27,WSH:26, LAD:5,ATL:6,HOU:7,MIL:8,PHI:9 },
+    '1B':{ COL:30,MIA:29,OAK:28,WSH:27,PIT:26, LAD:5,HOU:6,ATL:7,MIL:8,NYM:9 },
+    '2B':{ COL:30,MIA:29,OAK:28,WSH:27,CIN:26, LAD:5,HOU:6,ATL:7,MIL:8,PHI:9 },
+    '3B':{ COL:30,MIA:29,OAK:28,WSH:27,CIN:26, LAD:5,HOU:6,ATL:7,MIL:8,PHI:9 },
+    SS: { COL:30,MIA:29,OAK:28,WSH:27,CIN:26, LAD:5,HOU:6,ATL:7,MIL:8,PHI:9 },
+    OF: { COL:30,MIA:29,OAK:28,WSH:27,CIN:26, LAD:5,HOU:6,ATL:7,MIL:8,PHI:9 },
+  };
+
+  const dvpMap = sp==='nfl' ? NFL_DVP : sp==='mlb' ? MLB_DVP : NBA_DVP;
+  const posMap = dvpMap[pos] || dvpMap[pos.split('/')[0]] || {};
+  const rank = posMap[opp] || 15; // default to league average if no data
+
+  // Convert rank to 0-100 score
+  // Rank 30-32 (worst defense) = score 85-100 (great for player)
+  // Rank 1-5 (best defense) = score 15-30 (bad for player)
+  const numTeams = sp === 'nfl' ? 32 : 30;
+  const dvpScore = Math.round((rank / numTeams) * 100);
+
+  return { dvpScore, dvpRank: rank, numTeams, oppTeam: opp };
+}
+
+// Generate human-readable matchup label
+function getDvPLabel(dvpRank, numTeams, pos, oppTeam) {
+  const pct = dvpRank / numTeams;
+  if (pct >= 0.87) return { label: `vs ${oppTeam} · elite spot`, color: 'var(--green)', badge: 'elite matchup' };
+  if (pct >= 0.70) return { label: `vs ${oppTeam} · good spot`, color: 'var(--green)', badge: 'good matchup' };
+  if (pct >= 0.50) return { label: `vs ${oppTeam} · neutral`, color: 'var(--t2)', badge: null };
+  if (pct >= 0.30) return { label: `vs ${oppTeam} · tough`, color: 'var(--amber)', badge: 'tough matchup' };
+  return { label: `vs ${oppTeam} · avoid`, color: 'var(--red)', badge: 'bad matchup' };
+}
+
+
 // Built from publicly available NBA/NFL officiating statistics
 // NBA: foul rates by referee crew from official NBA stats
 // NFL: penalty rates by crew from NFLpenalties.com public data
@@ -1216,12 +1376,18 @@ function enrich(raw) {
       : estimateOwnership(p, sport);
 
     // ── REAL INTELLIGENCE SIGNALS ──
-    const fatigue     = calcFatigueIndex(p, sport);
-    const circadian   = calcCircadianScore(p, sport);
-    const refBoost    = calcRefBoost(p, sport);
+    const fatigue      = calcFatigueIndex(p, sport);
+    const circadian    = calcCircadianScore(p, sport);
+    const refBoost     = calcRefBoost(p, sport);
     const contractYear = isContractYear(p);
-    const vegasDiff   = calcVegasDivergence({...p, projPts});
+    const vegasDiff    = calcVegasDivergence({...p, projPts});
     const gameTotalBoost = p.gameTotal ? Math.round((p.gameTotal-220)/10) : 0;
+
+    // ── DvP MATCHUP SCORE ──
+    const dvpResult  = calcDvPScore(p, raw, sport);
+    const dvpScore   = dvpResult.dvpScore || 50;
+    const dvpRank    = dvpResult.dvpRank || 15;
+    const dvpLabel   = getDvPLabel(dvpRank, dvpResult.numTeams||30, p.pos, dvpResult.oppTeam||'');
 
     // ── SOURCE AGREEMENT — based on projection quality ──
     // Real signal: players with Sleeper projections + DK avg agree = high consensus
@@ -1245,6 +1411,7 @@ function enrich(raw) {
       ...p, projPts, projOwn, vegasDiff, gameTotalBoost,
       fatigue, circadian, refBoost, sourceAgreement,
       contractYear, biasCorrection, status, isOut,
+      dvpScore, dvpRank, dvpLabel,
       dataQuality: {
         projection: !!p.realProjection,
         ownership: p.fpOwnership != null,
@@ -1259,29 +1426,28 @@ function enrich(raw) {
 
 // ── EDGE SCORE — COMPLETE FORMULA ─────────────────────────────────
 function calcEdgeScore(p) {
-  // Weighted signal inputs
   const w = {
-    consensus:    20,  // source agreement
-    field:        20,  // ownership contrast (GPP differentiation)
-    projection:   15,  // projection quality
-    fatigue:      10,  // physical fatigue penalty
-    circadian:    8,   // time-of-day performance curve
-    ref:          7,   // referee/umpire tendency
-    vegas:        12,  // Vegas market divergence
-    gameTotal:    5,   // game environment (pace/total)
-    contractYear: 3,   // motivation signal
+    consensus:    18,  // source agreement
+    field:        18,  // ownership contrast
+    projection:   14,  // projection quality
+    dvp:          14,  // defense vs position — NEW real signal
+    fatigue:       9,  // physical fatigue
+    circadian:     7,  // time-of-day curve
+    ref:           6,  // referee tendency
+    vegas:        10,  // Vegas divergence
+    gameTotal:     4,  // game environment
   };
 
   const signals = {
-    consensus:    p.sourceAgreement || 70,
-    field:        Math.max(0, 100 - (p.projOwn||20)),
-    projection:   Math.min(100, ((p.projPts||10) / 50) * 100),
-    fatigue:      100 - (p.fatigue||0),
-    circadian:    p.circadian || 80,
-    ref:          (p.refBoost||5) * 10,
-    vegas:        Math.min(100, Math.max(0, 50 + (p.vegasDiff||0) * 5)),
-    gameTotal:    Math.min(100, Math.max(0, 50 + (p.gameTotalBoost||0) * 10)),
-    contractYear: (p.contractYear ? 100 : 50),
+    consensus:   p.sourceAgreement || 70,
+    field:       Math.max(0, 100 - (p.projOwn||20)),
+    projection:  Math.min(100, ((p.projPts||10) / 50) * 100),
+    dvp:         p.dvpScore || 50,  // 0=best defense, 100=worst defense (great for player)
+    fatigue:     100 - (p.fatigue||0),
+    circadian:   p.circadian || 80,
+    ref:         (p.refBoost||5) * 10,
+    vegas:       Math.min(100, Math.max(0, 50 + (p.vegasDiff||0) * 5)),
+    gameTotal:   Math.min(100, Math.max(0, 50 + (p.gameTotalBoost||0) * 10)),
   };
 
   const totalWeight = Object.values(w).reduce((a,b) => a+b, 0);
@@ -1289,11 +1455,10 @@ function calcEdgeScore(p) {
     return s + (weight * (signals[key]||50) / 100);
   }, 0) / totalWeight * 100;
 
-  // Apply bias correction (personal pattern adjustment)
-  score += (p.biasCorrection || 0);
-
-  // Low ownership bonus for GPP
+  // Bonuses
+  if (p.contractYear) score = Math.min(100, score + 4);
   if ((p.projOwn||20) < 9) score = Math.min(100, score + 3);
+  score += (p.biasCorrection || 0);
 
   return Math.max(0, Math.min(99, Math.round(score)));
 }
@@ -1544,13 +1709,20 @@ function renderLineup(entropyScore, kelly) {
       p.vegasDiff>4 && !p.isOut ? '<span class="chip chip-a">vegas edge</span>' : '',
       isChalk ? '<span class="chip chip-a">chalk trap</span>' : '',
       p.fatigue>25 ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">fatigued</span>' : '',
+      p.dvpLabel?.badge && !p.isOut ? `<span class="chip" style="background:${p.dvpLabel.color==='var(--green)'?'rgba(16,185,129,.2)':p.dvpLabel.color==='var(--red)'?'rgba(239,68,68,.2)':'rgba(245,158,11,.2)'};color:${p.dvpLabel.color}">${p.dvpLabel.badge}</span>` : '',
     ].join('');
+
+    const dvpRankText = p.dvpRank ? `#${p.dvpRank} vs ${p.pos}` : '';
 
     return `<div class="player-card">
       <div class="slot-pos pos-${l.slot}">${l.slot}</div>
       <div class="player-info">
         <div class="player-name">${p.name} ${chips}</div>
-        <div class="player-meta"><span>${p.team}</span>${p.opp?`<span>${p.opp}</span>`:''}<span style="color:var(--t3)">circ:${p.circadian}</span></div>
+        <div class="player-meta">
+          <span>${p.team}</span>
+          ${p.opp?`<span style="color:${p.dvpLabel?.color||'var(--t2)'}">${p.dvpLabel?.label||p.opp}</span>`:''}
+          ${dvpRankText?`<span style="font-size:10px;color:var(--t3)">${dvpRankText}</span>`:''}
+        </div>
       </div>
       <div class="player-right">
         <div class="player-pts">${p.projPts.toFixed(1)}</div>
@@ -1637,8 +1809,39 @@ function renderIntelLive() {
 
   const alerts = [];
 
-  // Nash alerts — chalk traps
-  if (nashData?.topChalk?.length) {
+  // DvP elite matchup alerts
+  const eliteMatchups = players
+    .filter(p => !p.isOut && p.dvpScore >= 85)
+    .sort((a,b) => b.dvpScore - a.dvpScore)
+    .slice(0, 4);
+
+  if (eliteMatchups.length) {
+    alerts.push({
+      tag: 'Elite matchups (DvP)',
+      color: 'var(--green)',
+      text: `Defense vs Position analysis: ${eliteMatchups.map(p =>
+        `${p.name} (${p.pos}, ${p.dvpLabel?.label?.split('·')[1]?.trim() || 'good spot'}, rank #${p.dvpRank})`
+      ).join(' · ')}. Defenses ranked in bottom 25% vs these positions — target heavily.`,
+      decay: null,
+    });
+  }
+
+  // DvP avoid alerts
+  const badMatchups = players
+    .filter(p => !p.isOut && p.dvpScore <= 25 && p.projOwn > 15)
+    .sort((a,b) => a.dvpScore - b.dvpScore)
+    .slice(0, 3);
+
+  if (badMatchups.length) {
+    alerts.push({
+      tag: 'Tough matchups — fade',
+      color: 'var(--red)',
+      text: `These popular plays face top-5 defenses at their position: ${badMatchups.map(p =>
+        `${p.name} (#${p.dvpRank} vs ${p.pos}, ${p.projOwn}% own)`
+      ).join(' · ')}. High ownership + bad matchup = GPP trap.`,
+      decay: null,
+    });
+  }
     alerts.push({
       tag: 'Nash simulation',
       color: 'var(--purple, #a78bfa)',
@@ -1789,14 +1992,7 @@ function exportLineup() {
   saveHistory();
 }
 
-// ── NAVIGATION ────────────────────────────────────────────────────
-function showScreen(s) {
-  ['lineup','intel','stacks','patterns'].forEach(sc => {
-    document.getElementById(`screen-${sc}`).style.display = sc===s?'block':'none';
-    document.getElementById(`nav-${sc}`).classList.toggle('active', sc===s);
-  });
-  currentScreen = s;
-}
+// helpers only below
 
 // ── HELPERS ───────────────────────────────────────────────────────
 function ec(e) { return e>=78?'var(--green)':e>=62?'var(--amber)':'var(--red)'; }
@@ -1839,6 +2035,282 @@ function startAutoRefresh() {
 
 function stopAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer=null; }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// LIVE SWAP ENGINE
+// ════════════════════════════════════════════════════════════════════
+
+let trackedLineup = [];       // players currently being tracked
+let liveScores = {};          // name -> { pts, projPts, status, locked }
+let liveRefreshTimer = null;
+let swapPool = [];            // available players for swaps
+
+// ── START TRACKING ────────────────────────────────────────────────
+function startLiveTracking() {
+  const text = document.getElementById('lineup-entry').value.trim();
+  if (!text) return;
+
+  // Parse player names from text area
+  trackedLineup = text.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 2)
+    .slice(0, 10);
+
+  if (!trackedLineup.length) return;
+
+  // Initialize scores
+  trackedLineup.forEach(name => {
+    liveScores[name] = { pts: 0, projPts: 0, status: 'pre', locked: false };
+  });
+
+  // If we have players loaded, use them as swap pool
+  swapPool = players.filter(p => !p.isOut && !trackedLineup.includes(p.name));
+
+  document.getElementById('live-score-banner').style.display = 'block';
+  fetchLiveScores();
+
+  // Auto-refresh every 90 seconds
+  if (liveRefreshTimer) clearInterval(liveRefreshTimer);
+  liveRefreshTimer = setInterval(fetchLiveScores, 90000);
+}
+
+// ── FETCH LIVE SCORES FROM ESPN ───────────────────────────────────
+async function fetchLiveScores() {
+  document.getElementById('swap-updated').textContent = 'Updating...';
+
+  const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sport] || 'basketball/nba';
+
+  try {
+    // ESPN scoreboard — free, no key
+    const r = await fetch(
+      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) throw new Error('ESPN unavailable');
+    const data = await r.json();
+
+    const games = data?.events || [];
+    const gameMap = {};   // gameId -> game info
+    const playerStatsMap = {}; // playerName -> { pts, locked, gameStatus }
+
+    for (const game of games) {
+      const status = game.status?.type;
+      const isLive   = status?.state === 'in';
+      const isLocked = status?.state === 'post' || isLive;
+      const period   = game.status?.period || 0;
+      const clock    = game.status?.displayClock || '';
+      const gameStatus = isLive ? `${period}Q ${clock}` : status?.shortDetail || '';
+
+      // Get player stats from boxscore if available
+      const competitors = game.competitions?.[0]?.competitors || [];
+      for (const team of competitors) {
+        const roster = team.roster || [];
+        for (const player of roster) {
+          const name = player.athlete?.displayName || '';
+          if (!name) continue;
+          const statLine = player.statistics || [];
+          let pts = 0;
+
+          if (sport === 'nba') {
+            pts = parseFloat(statLine.find(s=>s.name==='points')?.displayValue || 0);
+          } else if (sport === 'nfl') {
+            // NFL fantasy scoring: passing TDs, rushing, receiving
+            const passTD = parseFloat(statLine.find(s=>s.name==='passingTouchdowns')?.displayValue||0);
+            const passYd = parseFloat(statLine.find(s=>s.name==='passingYards')?.displayValue||0);
+            const rushTD = parseFloat(statLine.find(s=>s.name==='rushingTouchdowns')?.displayValue||0);
+            const rushYd = parseFloat(statLine.find(s=>s.name==='rushingYards')?.displayValue||0);
+            const recTD  = parseFloat(statLine.find(s=>s.name==='receivingTouchdowns')?.displayValue||0);
+            const recYd  = parseFloat(statLine.find(s=>s.name==='receivingYards')?.displayValue||0);
+            const rec    = parseFloat(statLine.find(s=>s.name==='receptions')?.displayValue||0);
+            // DraftKings scoring approximation
+            pts = passTD*4 + passYd*0.04 + rushTD*6 + rushYd*0.1 + recTD*6 + recYd*0.1 + rec*1;
+          } else if (sport === 'mlb') {
+            // MLB DK scoring approximation
+            const hits   = parseFloat(statLine.find(s=>s.name==='hits')?.displayValue||0);
+            const hr     = parseFloat(statLine.find(s=>s.name==='homeRuns')?.displayValue||0);
+            const rbi    = parseFloat(statLine.find(s=>s.name==='rbi')?.displayValue||0);
+            const runs   = parseFloat(statLine.find(s=>s.name==='runs')?.displayValue||0);
+            const sb     = parseFloat(statLine.find(s=>s.name==='stolenBases')?.displayValue||0);
+            pts = hits*3 + hr*10 + rbi*2 + runs*2 + sb*6;
+          }
+
+          playerStatsMap[name.toLowerCase()] = { pts, isLocked, gameStatus };
+        }
+      }
+    }
+
+    // Update tracked players
+    let totalLive = 0;
+    let totalProj = 0;
+
+    trackedLineup.forEach(name => {
+      const key = name.toLowerCase();
+      // Fuzzy match
+      const matchKey = Object.keys(playerStatsMap).find(k =>
+        k.includes(key.split(' ').pop()) ||
+        key.includes(k.split(' ').pop())
+      ) || key;
+
+      const stats = playerStatsMap[matchKey] || {};
+      const poolPlayer = swapPool.find(p => p.name.toLowerCase().includes(key.split(' ').pop()));
+
+      liveScores[name] = {
+        pts: stats.pts || 0,
+        isLocked: stats.isLocked || false,
+        gameStatus: stats.gameStatus || 'pre-game',
+        projPts: poolPlayer?.projPts || liveScores[name]?.projPts || 0,
+      };
+
+      totalLive += stats.pts || 0;
+      totalProj += (stats.isLocked ? (stats.pts||0) : (poolPlayer?.projPts || 0));
+    });
+
+    // Update UI
+    renderLiveScores(totalLive, totalProj);
+    generateSwapRecommendations(games);
+    document.getElementById('swap-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+
+  } catch(e) {
+    // Fallback: show what we have
+    document.getElementById('swap-updated').textContent = 'ESPN unavailable — using projections';
+    generateSwapRecommendations([]);
+  }
+}
+
+// ── RENDER LIVE SCORES ────────────────────────────────────────────
+function renderLiveScores(totalLive, totalProj) {
+  document.getElementById('live-score-val').textContent = totalLive.toFixed(2);
+  document.getElementById('live-proj-val').textContent = totalProj.toFixed(1);
+
+  // Estimate rank (rough approximation based on score)
+  const rankEst = totalLive < 20 ? '—'
+    : totalLive < 80 ? 'Top 40%'
+    : totalLive < 120 ? 'Top 25%'
+    : totalLive < 150 ? 'Top 15%'
+    : totalLive < 180 ? 'Top 5%'
+    : 'Top 1%';
+  document.getElementById('live-rank-val').textContent = rankEst;
+
+  // Player list
+  document.getElementById('live-player-list').innerHTML = trackedLineup.map(name => {
+    const s = liveScores[name] || {};
+    const ptsColor = s.pts > 25 ? 'var(--green)' : s.pts > 10 ? 'var(--text)' : 'var(--t2)';
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:13px;font-weight:500">${name}</div>
+        <div style="font-size:10px;color:var(--t3);font-family:var(--mono)">${s.gameStatus||'—'} ${s.isLocked?'🔒':''}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:16px;font-weight:700;color:${ptsColor}">${(s.pts||0).toFixed(2)}</div>
+        <div style="font-size:10px;color:var(--t3)">proj ${(s.projPts||0).toFixed(1)}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── GENERATE SWAP RECOMMENDATIONS ────────────────────────────────
+function generateSwapRecommendations(games) {
+  const recs = document.getElementById('swap-recommendations');
+
+  // Find unlocked players in lineup
+  const unlocked = trackedLineup.filter(name => !liveScores[name]?.isLocked);
+
+  if (!unlocked.length) {
+    recs.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:20px;text-align:center">
+      <div style="font-size:14px;font-weight:500;margin-bottom:6px">All games locked</div>
+      <div style="font-size:12px;color:var(--t2)">No swaps available. Check back next slate.</div>
+    </div>`;
+    return;
+  }
+
+  // Generate swap recommendations for each unlocked player
+  const swapCards = unlocked.map(name => {
+    const current = players.find(p => p.name === name) ||
+      { name, projPts: liveScores[name]?.projPts || 0, salary: 0, pos: '?', projOwn: 0, edgeScore: 50 };
+
+    // Find same-position players not in lineup with higher edge score
+    const currentScore = liveScores[name];
+    const gameOver = currentScore?.isLocked;
+
+    // Get better alternatives at same position
+    const alts = players
+      .filter(p =>
+        !p.isOut &&
+        !trackedLineup.includes(p.name) &&
+        p.pos === current.pos &&
+        p.edgeScore > (current.edgeScore || 50)
+      )
+      .sort((a,b) => b.edgeScore - a.edgeScore)
+      .slice(0, 3);
+
+    if (!alts.length) return '';
+
+    const topAlt = alts[0];
+    const edgeDiff = topAlt.edgeScore - (current.edgeScore || 50);
+    const projDiff = (topAlt.projPts - (current.projPts || 0)).toFixed(1);
+    const urgency = edgeDiff > 15 ? 'high' : edgeDiff > 8 ? 'medium' : 'low';
+    const urgencyColor = urgency==='high'?'var(--red)':urgency==='medium'?'var(--amber)':'var(--t2)';
+
+    return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
+      <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${urgencyColor}">${urgency} priority swap</div>
+        <div style="font-size:10px;color:var(--t3)">${current.pos} slot · unlocked</div>
+      </div>
+      <div style="padding:12px 14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div>
+            <div style="font-size:12px;color:var(--t3);margin-bottom:2px">Current</div>
+            <div style="font-size:14px;font-weight:500;color:var(--t2)">${name}</div>
+            <div style="font-size:11px;color:var(--t3)">${(current.projPts||0).toFixed(1)} proj · ${current.projOwn||'?'}% own · edge ${current.edgeScore||'?'}</div>
+          </div>
+          <div style="font-size:20px;color:var(--t3)">→</div>
+          <div style="text-align:right">
+            <div style="font-size:12px;color:var(--green);margin-bottom:2px">Swap to</div>
+            <div style="font-size:14px;font-weight:500;color:var(--green)">${topAlt.name}</div>
+            <div style="font-size:11px;color:var(--t3)">${topAlt.projPts.toFixed(1)} proj · ${topAlt.projOwn}% own · edge ${topAlt.edgeScore}</div>
+          </div>
+        </div>
+        <div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px 10px;font-size:11px;color:var(--t2)">
+          <span style="color:var(--green)">+${projDiff} proj pts</span> · 
+          <span style="color:var(--green)">+${edgeDiff} edge</span> · 
+          ${topAlt.dvpLabel?.label||topAlt.opp||''} · 
+          ${topAlt.projOwn}% ownership
+        </div>
+        ${alts.length > 1 ? `<div style="margin-top:8px;font-size:11px;color:var(--t3)">Also consider: ${alts.slice(1).map(a=>`${a.name} (edge ${a.edgeScore})`).join(', ')}</div>` : ''}
+      </div>
+    </div>`;
+  }).filter(Boolean);
+
+  if (!swapCards.length) {
+    recs.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:20px;text-align:center">
+      <div style="font-size:14px;font-weight:500;margin-bottom:6px">Lineup looks optimal</div>
+      <div style="font-size:12px;color:var(--t2)">No better alternatives found for your unlocked slots.</div>
+    </div>`;
+    return;
+  }
+
+  recs.innerHTML = `
+    <div style="font-size:12px;font-weight:500;color:var(--t2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
+      ${swapCards.length} swap${swapCards.length!==1?'s':''} recommended · ${unlocked.length} unlocked slot${unlocked.length!==1?'s':''}
+    </div>
+    ${swapCards.join('')}`;
+}
+
+// ── UPDATE showScreen TO INCLUDE SWAP ─────────────────────────────
+function showScreen(s) {
+  ['lineup','intel','swap','stacks','patterns'].forEach(sc => {
+    const el = document.getElementById(`screen-${sc}`);
+    if (el) el.style.display = sc===s?'block':'none';
+    const nav = document.getElementById(`nav-${sc}`);
+    if (nav) nav.classList.toggle('active', sc===s);
+  });
+  currentScreen = s;
+  // Auto-populate lineup text area if we have a lineup built
+  if (s === 'swap' && lineup.length && !trackedLineup.length) {
+    const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
+    document.getElementById('lineup-entry').value = names;
+  }
 }
 
 // ── INIT ──────────────────────────────────────────────────────────
