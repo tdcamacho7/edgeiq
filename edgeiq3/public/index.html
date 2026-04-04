@@ -3051,16 +3051,7 @@ function optimize(all, sp) {
       teamData[p.team].positions.add(p.pos);
       teamData[p.team].players.push(p);
     });
-    const teamRankings = Object.entries(teamData)
-      .filter(([, t]) => t.players.length >= 3)
-      .map(([team, t]) => {
-        const top4avg = t.players.sort((a,b)=>b.edgeScore-a.edgeScore)
-          .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, t.players.length);
-        const coverage = Math.min(1.3, 1 + t.positions.size * 0.05);
-        return [team, top4avg * coverage];
-      }).sort((a,b)=>b[1]-a[1]);
-    const stackTeam = teamRankings[0]?.[0] || null;
-
+    // stackTeam is determined inside the pitcher loop (depends on which pitchers are picked)
     let bestMLBScore = -1, bestMLBLineup = null;
     const topPitchers = pitchers.slice(0, 8);
 
@@ -3070,20 +3061,21 @@ function optimize(all, sp) {
         const remainingBudget = CAP - p1.salary - p2.salary;
         if (remainingBudget < hitterSlots.length * 2500) continue;
 
-        // Find opponents of these pitchers — their hitters CANNOT be our stack
-        // (stacking hitters against your own pitcher suppresses their ceiling)
-        const pitcherOpponents = new Set();
+        // Blocked teams: pitcher's OWN team + pitcher's OPPONENT team
+        // Own team: stacking your own pitcher's teammates suppresses their ceiling
+        //   (Gore pitches FOR TEX → don't stack TEX hitters facing Gore)
+        // Opp team: stacking hitters FACING your pitcher contradicts the pitcher pick
+        //   (Gore faces CIN → don't stack CIN hitters who Gore is trying to retire)
+        const blockedFromStack = new Set();
         [p1, p2].forEach(pitcher => {
-          // pitcher.opp = "vs CIN" or "@ CIN" — extract team abbr
+          if (pitcher.team) blockedFromStack.add(pitcher.team); // pitcher's OWN team
           const oppTeam = (pitcher.opp || '').replace(/^(vs |@ )/,'').trim().split(' ')[0];
-          if (oppTeam) pitcherOpponents.add(oppTeam);
-          // Also block pitcher's own team from being stacked (no self-stack)
-          if (pitcher.team) pitcherOpponents.add(pitcher.team + '_PITCHER');
+          if (oppTeam) blockedFromStack.add(oppTeam); // pitcher's OPPONENT team
         });
 
-        // Re-rank stack teams excluding pitcher opponents
+        // Re-rank stack teams excluding all blocked teams
         const validTeamRankings = Object.entries(teamData)
-          .filter(([team, t]) => !pitcherOpponents.has(team) && t.players.length >= 3)
+          .filter(([team, t]) => !blockedFromStack.has(team) && t.players.length >= 3)
           .map(([team, t]) => {
             const top4avg = t.players.sort((a,b)=>b.edgeScore-a.edgeScore)
               .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, t.players.length);
@@ -3092,16 +3084,20 @@ function optimize(all, sp) {
           }).sort((a,b)=>b[1]-a[1]);
         const stackTeam = validTeamRankings[0]?.[0] || null;
 
-        // ── BRING-BACK MINI-STACK ─────────────────────────────────────
-        // Add 1 hitter from pitcher's OPPONENT team to exploit game correlation.
-        // When our pitcher is great, the game goes fast and both offenses run.
-        // The best bring-back target: highest-edge hitter from opp team who ISN'T stacked.
-        const bringBackTeam = pitcherOpponents.has(p1.opp?.replace(/^(vs |@ )/,'').trim())
-          ? p1.opp?.replace(/^(vs |@ )/,'').trim()
-          : p2.opp?.replace(/^(vs |@ )/,'').trim();
-        const bringBackCandidate = hitters
-          .filter(h => h.team === bringBackTeam && !pitcherOpponents.has(h.team + '_PITCHER'))
-          .sort((a,b) => b.edgeScore - a.edgeScore)[0] || null;
+        // ── BRING-BACK: 1 elite hitter from pitcher's opponent team ───
+        // Only if they score ≥ 88 edge (genuinely elite play, not just filling a slot)
+        // This adds game correlation: if Gore dominates CIN, the scoring environment
+        // favors NYY hitters in the same broadcast window — different game, same energy
+        // NOTE: bring-back is from a DIFFERENT game than the stack (adds true diversity)
+        const bringBackCandidates = hitters
+          .filter(h =>
+            blockedFromStack.has(h.team) === false && // not blocked themselves
+            h.team !== stackTeam &&                    // not duplicating the stack
+            h.edgeScore >= 88 &&                       // must be genuinely elite
+            h.salary >= 3500 &&                        // must be a real starter
+            h.projPts >= 10                            // must project meaningful points
+          ).sort((a,b) => b.edgeScore - a.edgeScore);
+        const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
         const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
