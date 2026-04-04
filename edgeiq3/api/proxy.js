@@ -305,6 +305,69 @@ export default async function handler(req, res) {
     } catch(e) { return {}; }
   }
 
+  async function fetchPlayerProps(sp) {
+    if (!oddsKey) return {};
+    try {
+      const sportKeys = {
+        nfl: 'americanfootball_nfl', nba: 'basketball_nba',
+        mlb: 'baseball_mlb', nhl: 'icehockey_nhl',
+      };
+      const markets = sp === 'nba'
+        ? 'player_points,player_rebounds,player_assists'
+        : sp === 'nfl'
+        ? 'player_pass_tds,player_rush_yds,player_reception_yds'
+        : 'pitcher_strikeouts,batter_home_runs,batter_hits';
+      const url = `https://api.the-odds-api.com/v4/sports/${sportKeys[sp]||'basketball_nba'}/events?apiKey=${oddsKey}`;
+      const eventsRes = await fetchDirect(url, 6000);
+      if (!eventsRes.ok) return {};
+      const events = await eventsRes.json();
+      if (!events?.length) return {};
+
+      // Fetch props for first 4 games (free tier limit)
+      const propsMap = {};
+      const eventSlice = events.slice(0, 4);
+      await Promise.all(eventSlice.map(async event => {
+        try {
+          const propUrl = `https://api.the-odds-api.com/v4/sports/${sportKeys[sp]}/events/${event.id}/odds?apiKey=${oddsKey}&regions=us&markets=${markets}&oddsFormat=american`;
+          const r = await fetchDirect(propUrl, 6000);
+          if (!r.ok) return;
+          const data = await r.json();
+          const bookmakers = data?.bookmakers || [];
+          const book = bookmakers[0];
+          if (!book) return;
+          for (const market of (book.markets || [])) {
+            for (const outcome of (market.outcomes || [])) {
+              const name = outcome.description?.toLowerCase() || '';
+              if (!name) continue;
+              if (!propsMap[name]) propsMap[name] = {};
+              const statKey = market.key.replace('player_','').replace('pitcher_','').replace('batter_','');
+              if (outcome.name === 'Over') {
+                propsMap[name][statKey] = { line: outcome.point, type: 'over' };
+              }
+            }
+          }
+        } catch(e) {}
+      }));
+      return propsMap;
+    } catch(e) { return {}; }
+  }
+
+  async function fetchESPNNews(sp) {
+    const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
+    try {
+      const r = await fetchDirect(`https://site.api.espn.com/apis/site/v2/sports/${sportPath}/news?limit=20`, 5000);
+      if (!r.ok) return [];
+      const data = await r.json();
+      const articles = data?.articles || [];
+      return articles.map(a => ({
+        headline: a.headline || '',
+        published: a.published || '',
+        description: a.description || '',
+        players: (a.keywords || []).filter(k => k.type === 'athlete').map(k => k.displayName?.toLowerCase()),
+      })).filter(a => a.players.length > 0);
+    } catch(e) { return []; }
+  }
+
   async function fetchVegasOdds(sp) {
     if (!oddsKey) return {};
     try {
@@ -369,17 +432,19 @@ export default async function handler(req, res) {
   const sp = sport || 'nba';
 
   // ── FETCH ALL DATA IN PARALLEL ────────────────────────────────────
-  const [oddsRes, sleeperRes, ownershipRes, recentFormRes] = await Promise.allSettled([
+  const [oddsRes, sleeperRes, ownershipRes, recentFormRes, propsRes] = await Promise.allSettled([
     fetchVegasOdds(sp),
     fetchSleeperProjections(sp),
     fetchAllOwnership(sp),
     fetchRecentFormData(sp),
+    fetchPlayerProps(sp),
   ]);
 
   const odds        = oddsRes.status       === 'fulfilled' ? oddsRes.value       : {};
   const projections = sleeperRes.status    === 'fulfilled' ? sleeperRes.value    : {};
   const ownership   = ownershipRes.status  === 'fulfilled' ? ownershipRes.value  : {};
   const recentForm  = recentFormRes.status === 'fulfilled' ? recentFormRes.value : {};
+  const playerProps = propsRes.status      === 'fulfilled' ? propsRes.value      : {};
 
   // ── FETCH DRAFTKINGS PLAYERS ──────────────────────────────────────
   const endpoints = [
@@ -417,6 +482,13 @@ export default async function handler(req, res) {
         // Real ownership from scraped sources
         const fpOwnership  = fuzzyMatch(name, ownership);
 
+        // Player props from Odds API — sharper than game total projections
+        const propData = playerProps[name.toLowerCase()] ||
+          playerProps[Object.keys(playerProps).find(k =>
+            k.includes(name.toLowerCase().split(' ').pop()) ||
+            name.toLowerCase().includes(k.split(' ').pop())
+          )] || null;
+
         // Real recent form from ESPN game logs
         const nameLower = name.toLowerCase();
         const formKey = Object.keys(recentForm).find(k =>
@@ -436,7 +508,8 @@ export default async function handler(req, res) {
           gameTotal,
           realProjection: sleeperProj,
           fpOwnership,
-          recentFormData,  // { weightedAvg, trend, last5 }
+          recentFormData,
+          propData,       // player prop lines from Odds API
           status,
           isOut,
         };
