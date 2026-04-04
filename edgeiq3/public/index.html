@@ -2753,10 +2753,10 @@ function calcPlayerCeiling(p, teammates = []) {
   // Use dvpScore for ceiling multiplier adjustment
   // Use null check not truthy check (dvpScore=0 is a real "worst" value)
   const dvpPct = (p.dvpScore != null ? p.dvpScore : 50) / 100;
-  if (p.dvpLabel?.badge === 'elite matchup') multiplier += 0.30;
-  else if (p.dvpLabel?.badge === 'good matchup') multiplier += 0.15;
-  else if (p.dvpLabel?.badge === 'bad matchup') multiplier -= 0.20;
-  else if (p.dvpLabel?.badge === 'tough matchup') multiplier -= 0.10;
+  if (p.dvpLabel?.badge === 'elite matchup') multiplier += 0.25;
+  else if (p.dvpLabel?.badge === 'good matchup') multiplier += 0.12;
+  else if (p.dvpLabel?.badge === 'bad matchup') multiplier -= 0.12; // reduced from -0.20
+  else if (p.dvpLabel?.badge === 'tough matchup') multiplier -= 0.07; // reduced from -0.10
   else if (dvpPct >= 0.85) multiplier += 0.25;
   else if (dvpPct <= 0.25) multiplier -= 0.15;
   if (p.recentForm?.trend === 'hot')  multiplier += 0.20;
@@ -2909,11 +2909,11 @@ function calcEdgeScore(p) {
     score = Math.max(10, score - 15); // -15 points for questionable players
   }
 
-  // DvP matchup — use dvpLabel which is correctly computed for ALL positions
-  // dvpLabel.badge === 'bad matchup' = bottom 30% of defenses = hard cap
-  // dvpLabel.badge === 'tough matchup' = soft penalty
-  if (p.dvpLabel?.badge === 'bad matchup')   score = Math.min(score, 42);
-  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
+  // DvP matchup — soft penalties only (no hard caps)
+  // Hard caps excluded players from stack building even when needed
+  // Soft penalties let the optimizer still use them when required (e.g. stack completion)
+  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);  // -20 penalty
+  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);  // -10 penalty
 
   return Math.max(10, Math.min(99, score));
 }
