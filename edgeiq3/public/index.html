@@ -628,11 +628,15 @@ async function handleCsv(input){
 
     setStatus(`${raw.length} players found · fetching live data...`,'var(--amber)');
 
-    // Fetch all live data in parallel
+    // Fetch live data with hard 6-second timeout
+    // If any source hangs, we continue without it — never block lineup generation
+    const timeout = ms => new Promise(resolve => setTimeout(() => resolve(null), ms));
+    const safe = fn => Promise.race([fn(), timeout(6000)]);
+
     const [injuryMap, ownershipData, vegasData] = await Promise.all([
-      fetchESPNInjuries(sport),
-      fetchOwnershipFromProxy(sport),
-      fetchVegasFromProxy(sport),
+      safe(() => fetchESPNInjuries(sport)).then(r => r || {}),
+      safe(() => fetchOwnershipFromProxy(sport)).then(r => r || {}),
+      safe(() => fetchVegasFromProxy(sport)).then(r => r || {}),
     ]);
 
     // Apply all data to players
@@ -3224,13 +3228,63 @@ function greedyFillSlots(pool, slots, budget, sp) {
 }
 
 
+async function buildAndRender() {
+  setStatus('Building lineup...', 'var(--amber)');
+
+  // Yield to UI so status message renders before computation starts
+  await new Promise(r => setTimeout(r, 30));
+
+  // Nash simulation — capped at 120 players and 150 iterations for speed
+  nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
+
+  // Monte Carlo — top 80 players only, 300 iterations max
+  // 678 players × 2000 iterations = browser freeze; cap avoids this
+  const eligibleForMC = players
+    .filter(p => !p.isOut && p.projPts > 0)
+    .sort((a, b) => b.edgeScore - a.edgeScore)
+    .slice(0, 80);
+  const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
+
+  // Re-score with Monte Carlo probabilities + Gumbel stack boosts
+  players = players.map(p => {
+    p._mcFirstPlaceProb = mcProbs[p.name] || 0;
+    const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
+    p._ceiling  = calcPlayerCeiling(p, teammates);
+    p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
+    return p;
+  });
+
+  lineup = optimize(players, sport);
+
+  // JSD uniqueness score
+  const jsdScore = calcLineupJSDScore(lineup, players);
+
+  // Multivariate Kelly
+  const valid   = lineup.filter(l => l.player);
+  const avgEdge = valid.length ? Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length) : 0;
+  const avgOwn  = valid.length ? valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length : 20;
+  const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
+
+  const dna     = analyzeLineupDNA(lineup, sport);
+  const contest = recommendContest(avgEdge);
+
+  fetchLatestNews(sport).catch(() => {});
+
+  renderLineup(jsdScore, kelly, dna, contest);
+  renderStacks();
+  renderIntelLive();
+  if (currentScreen === 'signals') renderSignalDashboard();
+  setDot('ok');
+  setStatus('', '');
+}
+
 function rebuildLineup() {
   // Slight variation for lineup diversity
   players = players.map(p => ({
     ...p,
     edgeScore: p.isOut ? 0 : Math.max(30, Math.min(99, p.edgeScore + Math.round((Math.random()-0.5)*10)))
   }));
-  nashData = runNashSimulation(players, sport, 300);
+  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
   lineup = optimize(players, sport);
   const entropyScore = calcEntropyScore(lineup, nashData);
   const valid = lineup.filter(l=>l.player);
@@ -3681,7 +3735,11 @@ function startAutoRefresh() {
         const newOut  = newPlayers.filter(p=>p.isOut).map(p=>p.name);
         const justOut = newOut.filter(n=>!prevOut.includes(n));
         players = newPlayers;
-        nashData = runNashSimulation(players, sport, 300);
+        setStatus('Building lineup...', 'var(--amber)');
+  // Use setTimeout so status update renders before blocking computation
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
         lineup = optimize(players, sport);
         renderLineup(calcEntropyScore(lineup, nashData));
         renderIntelLive();
