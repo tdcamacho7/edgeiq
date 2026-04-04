@@ -474,7 +474,7 @@ input,button{font-family:var(--ui)}
 let sport = 'nfl';
 let players = [];
 let lineup = [];
-let excludedPlayers = new Set(); // player names manually excluded by user
+let excludedPlayers = new Set(JSON.parse(localStorage.getItem('edgeiq_banned') || '[]'));
 let currentScreen = 'lineup';
 
 const CAP = 50000;
@@ -3352,6 +3352,13 @@ async function buildAndRender() {
       if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) slatePosCeilMax[pos] = p._ceiling;
     });
 
+    // Apply persistent bans before scoring
+    players = players.map(p => {
+      if (excludedPlayers.has(p.name.toLowerCase())) {
+        return { ...p, isOut: true, edgeScore: 0, status: 'Excluded' };
+      }
+      return p;
+    });
     // Pass 2: re-score
     players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
 
@@ -3402,7 +3409,7 @@ function saveAndRebuild() {
 
 function excludePlayer(name) {
   excludedPlayers.add(name.toLowerCase());
-  // Mark as out and rebuild
+  localStorage.setItem('edgeiq_banned', JSON.stringify([...excludedPlayers]));
   players = players.map(p => {
     if (p.name.toLowerCase() === name.toLowerCase()) {
       return { ...p, isOut: true, edgeScore: 0, status: 'Excluded' };
@@ -3410,13 +3417,13 @@ function excludePlayer(name) {
     return p;
   });
   buildAndRender();
-  setStatus(`Excluded ${name} — rebuilding lineup`, 'var(--amber)');
+  setStatus(`🚫 ${name} banned — rebuilding without them`, 'var(--amber)');
 }
 
 function clearExclusions() {
   excludedPlayers.clear();
-  // Reload from last build
-  setStatus('Exclusions cleared — re-upload CSV to restore all players', 'var(--cyan)');
+  localStorage.removeItem('edgeiq_banned');
+  setStatus('All bans cleared — re-upload CSV to rebuild', 'var(--cyan)');
 }
 
 // ── RENDER LINEUP ─────────────────────────────────────────────────
@@ -3472,7 +3479,12 @@ function renderLineup(entropyScore, kelly, dna, contest) {
     return `<div class="player-card">
       <div class="slot-pos pos-${l.slot}">${l.slot}</div>
       <div class="player-info">
-        <div class="player-name">${p.name} ${chips}</div>
+        <div class="player-name">
+          ${p.name} ${chips}
+          <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}')" 
+            style="background:none;border:none;cursor:pointer;font-size:12px;opacity:0.4;margin-left:4px;padding:0;vertical-align:middle" 
+            title="Ban ${p.name} from future lineups">🚫</button>
+        </div>
         <div class="player-meta">
           <span>${p.team}</span>
           ${p.opp?`<span style="color:${p.dvpLabel?.color||'var(--t2)'}">${p.dvpLabel?.label||p.opp}</span>`:''}
