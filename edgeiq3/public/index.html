@@ -1966,6 +1966,18 @@ async function fetchRealOwnership(playerList, sp) {
 }
 
 function estimateOwnership(player, sp) {
+  // MLB-specific calibration: salaries $2500-$12000, not relative to $50K cap
+  if (sp === 'mlb') {
+    const midSal = player.pos === 'P' ? 8000 : 4200;
+    const salMod = ((player.salary || midSal) - midSal) / midSal * 18;
+    const posBase = player.pos === 'P' ? 17 : 9;
+    const avgPts = player.avgPts || 10;
+    const posAvg = player.pos === 'P' ? 22 : 10;
+    const ptsMod = (avgPts - posAvg) * 1.5;
+    return Math.round(Math.max(1, Math.min(55, posBase + salMod + ptsMod)));
+  }
+  // NFL/NBA: original salary-percentage-based formula works fine
+
   const sal = player.salary || 5000;
   const pos = player.pos || '';
   const avgPts = player.avgPts || 20;
@@ -2298,8 +2310,9 @@ function enrich(raw) {
     const kalmanProjection = kalmanResult?.estimate || bayesianMean;
 
     // Use Kalman-filtered projection as our best estimate
-    p._bayesianMean = bayesianMean;
-    p._kalmanProjection = kalmanProjection;
+    // Kalman = optimal linear estimator combining all sources (Bayesian, Vegas, recent form)
+    p._bayesianMean = bayesianMean;    // stored for reference
+    p._kalmanProjection = kalmanProjection; // ← THIS is what ceiling calc should use
     p._projSigma = projSigma;
 
     // ── TIER 1 SIGNALS ──
@@ -2680,7 +2693,9 @@ function monteCarloFirstPlaceScore(players, sp, iterations = 2000) {
     // For each player, sample their score from their Gamma distribution
     const simScores = {};
     for (const p of players) {
-      const mean  = p._bayesianMean || p.projPts || p.avgPts || 15;
+      // Use Kalman-filtered projection (best linear estimate combining all sources)
+  // Falls back to Bayesian → projPts → avgPts in order of data quality
+  const mean  = p._kalmanProjection || p._bayesianMean || p.projPts || p.avgPts || 15;
       const sigma = p._projSigma    || mean * 0.35;
       const { k, theta } = gammaParams(mean, sigma * sigma);
       // Sample from Gamma using Marsaglia-Tsang method
@@ -2788,7 +2803,9 @@ function multivariateKelly(avgEdge, avgOwnership, correlation, bankroll = 100, e
 
 // ── COMPLETE PLAYER SCORING — ALL MATH INTEGRATED ─────────────────
 function calcPlayerCeiling(p, teammates = []) {
-  const mean  = p._bayesianMean || p.projPts || p.avgPts || 15;
+  // Use Kalman-filtered projection (best linear estimate combining all sources)
+  // Falls back to Bayesian → projPts → avgPts in order of data quality
+  const mean  = p._kalmanProjection || p._bayesianMean || p.projPts || p.avgPts || 15;
   const sigma = p._projSigma    || mean * 0.35;
   const variance = sigma * sigma;
 
@@ -2815,12 +2832,11 @@ function calcPlayerCeiling(p, teammates = []) {
   // Use dvpScore for ceiling multiplier adjustment
   // Use null check not truthy check (dvpScore=0 is a real "worst" value)
   const dvpPct = (p.dvpScore != null ? p.dvpScore : 50) / 100;
-  if (p.dvpLabel?.badge === 'elite matchup') multiplier += 0.25;
-  else if (p.dvpLabel?.badge === 'good matchup') multiplier += 0.12;
-  else if (p.dvpLabel?.badge === 'bad matchup') multiplier -= 0.12; // reduced from -0.20
-  else if (p.dvpLabel?.badge === 'tough matchup') multiplier -= 0.07; // reduced from -0.10
-  else if (dvpPct >= 0.85) multiplier += 0.25;
-  else if (dvpPct <= 0.25) multiplier -= 0.15;
+  // DvP penalty applied separately in calcEdgeScore — only boost elite matchups in ceiling
+  // (avoid double-counting the penalty; ceiling should reflect true upside potential)
+  if (p.dvpLabel?.badge === 'elite matchup') multiplier += 0.20;
+  else if (p.dvpLabel?.badge === 'good matchup') multiplier += 0.10;
+  // bad/tough matchup penalties are handled in calcEdgeScore, not here
   if (p.recentForm?.trend === 'hot')  multiplier += 0.20;
   if (p.recentForm?.trend === 'cold') multiplier -= 0.12;
   const gt = p.gameTotal || 220;
@@ -2840,8 +2856,8 @@ function calcPlayerCeiling(p, teammates = []) {
   multiplier += gs * 0.03;
   if ((p.lineMovement || 0) > 0) multiplier += 0.06;
   if ((p.refBoost || 0) >= 8) multiplier += 0.08;
-  if ((p.parkFactor || 0) > 5) multiplier += 0.10;
-  if ((p.parkFactor || 0) < -5) multiplier -= 0.08;
+  // parkFactor applied as flat projPts boost in enrich() — don't double-count in ceiling
+  // (removing the multiplier here prevents park factor being counted twice)
   multiplier = Math.max(0.5, Math.min(2.5, multiplier));
   const signalCeil = mean * multiplier;
 
@@ -2951,10 +2967,17 @@ function calcEdgeScore(p) {
   //   Good  + mod own (70% posMax, 15% own):  0.70 × 1.29 × 99 = 89.3 → 89
   //   Chalk + high own (80% posMax, 35% own): 0.80 × 1.01 × 99 = 80.0 → 80
   //   Weak  + low own (30% posMax, 5% own):   0.30 × 1.43 × 99 = 42.5 → 43
-  const rawScore = ceilPct * oMult * 99;
+  const rawScore = ceilPct * effectiveOMult * 99;
 
   // Monte Carlo first-place probability boost (mild, max +3)
-  const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0.10) * 15);
+  // Monte Carlo first-place boost — 0 default for players outside top-80
+  // (they genuinely have near-zero first-place probability)
+  // Nash-adjusted ownership: field simulation gives more accurate own% than raw estimate
+  const nashOwn = (typeof nashData !== 'undefined' && nashData?.ownership?.[p.name]) || null;
+  const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own; // blend real + Nash
+  const effectiveOMult = ownershipMult(effectiveOwn);
+
+  const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
 
   let score = Math.min(99, Math.round(rawScore + mcBoost));
 
