@@ -2836,9 +2836,17 @@ function calcEdgeScore(p) {
   const avgPts = p.avgPts  || p.projPts || 15;
   const pos    = p.pos || 'FLEX';
 
-  // Position-specific max ceiling — what an elite game at this position looks like
-  const posMaxMap = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
-  const posMax    = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
+  // SLATE-RELATIVE posMax: 70% slate best + 30% absolute historical max
+  // Normalizes each player against the best ceiling on TONIGHT'S slate
+  // → Best player at each position always scores near 99
+  // → Scores are meaningful relative to what's actually available
+  const posMaxMap     = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
+  const absolutePosMax = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
+  const slatePosMax   = slatePosCeilMax[pos] || 0;
+  // Blend: use slate max when meaningful (>5 pts), else use absolute
+  const posMax = slatePosMax > 5
+    ? slatePosMax * 0.70 + absolutePosMax * 0.30
+    : absolutePosMax;
 
   // Reliability-adjusted ceiling — shrinks inflated small-sample estimates
   const posAvgMap = POS_AVG_MAP[sport] || POS_AVG_MAP.nba;
@@ -2846,7 +2854,7 @@ function calcEdgeScore(p) {
   const rel       = ceilingReliability(avgPts, posAvg);
   const adjCeil   = ceiling * rel + (posAvg * 1.4) * (1 - rel);
 
-  // Ceiling fraction: how close to elite is this player tonight?
+  // Ceiling fraction: how close to tonight's best is this player?
   const ceilPct = Math.min(1.0, adjCeil / posMax);
 
   // Ownership multiplier: uniqueness bonus
