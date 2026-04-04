@@ -777,7 +777,7 @@ function parseCsv(text){
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     const status=statusI>=0?v[statusI]||'':'';
-    const isOut=['out','o','ir'].includes(status.toLowerCase());
+    const isOut=['out','o','ir','il','injured list','injured reserve'].includes(status.toLowerCase());
     // Normalize DK MLB position strings
     let rawPos = (v[pi]||'').split('/')[0].toUpperCase().trim();
     // DK uses SP/RP for pitchers → normalize to P
@@ -2277,7 +2277,7 @@ function enrich(raw) {
 
     const biasCorrection = getBiasCorrection(p, history, sport);
     const status = p.status || '';
-    const isOut = p.isOut || ['out','ir','o','injured reserve'].includes(status.toLowerCase());
+    const isOut = p.isOut || ['out','ir','o','il','injured reserve','injured list','dtd'].includes(status.toLowerCase());
 
     // Combined flat boosts applied to projected points
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
@@ -3222,18 +3222,24 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
       const mustStack = stackCount < 4 && stackSlots < needMore; // must pick stack or can't reach 4
       const wantStack = stackCount < 4; // still building toward 4
 
-      if (mustStack) {
-        // MUST pick stack team player — no fallback
-        pick = sorted.find(p =>
+      if (mustStack || wantStack) {
+        const stackPick = sorted.find(p =>
           !used.has(p.name) && p.salary <= maxBudget &&
           positions.includes(p.pos) && p.team === stackTeam
         );
-      } else if (wantStack) {
-        // Prefer stack team, but allow fallback if none fits
-        pick = sorted.find(p =>
-          !used.has(p.name) && p.salary <= maxBudget &&
-          positions.includes(p.pos) && p.team === stackTeam
-        );
+        if (mustStack) {
+          // MUST pick stack — no fallback allowed
+          pick = stackPick;
+        } else if (stackPick) {
+          // Prefer stack unless non-stack player is 12+ edge points better
+          // This forces us to build the stack except for truly dominant alternatives
+          const bestNonStack = sorted.find(p =>
+            !used.has(p.name) && p.salary <= maxBudget &&
+            positions.includes(p.pos) && p.team !== stackTeam
+          );
+          const gap = (bestNonStack?.edgeScore || 0) - stackPick.edgeScore;
+          pick = (gap > 12) ? bestNonStack : stackPick;
+        }
       }
     }
 
