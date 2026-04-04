@@ -3378,11 +3378,10 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 
     let pick = null;
     const needStack = sp === 'mlb' && slot !== 'P' && stackTeam;
+    const mustStack = needStack && stackCount < 4 && stackSlots < needMore;
+    const wantStack = needStack && stackCount < 4;
 
     if (needStack) {
-      const mustStack = stackCount < 4 && stackSlots < needMore; // must pick stack or can't reach 4
-      const wantStack = stackCount < 4; // still building toward 4
-
       if (mustStack || wantStack) {
         // Find best stack team player at this position
         const stackPick = sorted.find(p =>
