@@ -419,6 +419,33 @@ export default async function handler(req, res) {
   }
 
   // ── RESOLVE CONTEST ID → DRAFT GROUP ID ──────────────────────────
+  // ── MLB ACTIVE ROSTERS ACTION ──────────────────────────────────────
+  if (action === 'mlb_rosters') {
+    const teams = (req.query.teams || '').split(',').filter(Boolean);
+    const MLB_TEAM_IDS = {
+      NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
+      MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
+      STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
+      TOR:141,LAD:119,CWS:145
+    };
+    const season = new Date().getFullYear();
+    const activeNames = [];
+    await Promise.all(teams.map(async abbr => {
+      const id = MLB_TEAM_IDS[abbr]; if (!id) return;
+      try {
+        const r = await fetch(`https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
+          { signal: AbortSignal.timeout(4000) });
+        if (!r.ok) return;
+        const data = await r.json();
+        for (const p of (data.roster || [])) {
+          const name = (p.person?.fullName || '').toLowerCase();
+          if (name) activeNames.push(name);
+        }
+      } catch(e) {}
+    }));
+    return res.json({ success: true, activeNames, teamCount: teams.length });
+  }
+
   if (!dgId) return res.status(400).json({ error: 'No ID provided' });
 
   let draftGroupId = dgId;
