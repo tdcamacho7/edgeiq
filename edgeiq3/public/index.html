@@ -474,6 +474,7 @@ input,button{font-family:var(--ui)}
 let sport = 'nfl';
 let players = [];
 let lineup = [];
+let nashData = { topChalk: [], contrarianPlays: [], fieldFrequency: {}, iterations: 0, ownership: {} };
 let excludedPlayers = new Set(JSON.parse(localStorage.getItem('edgeiq_banned') || '[]'));
 let currentScreen = 'lineup';
 
@@ -2971,15 +2972,16 @@ function calcEdgeScore(p) {
   //   Good  + mod own (70% posMax, 15% own):  0.70 × 1.29 × 99 = 89.3 → 89
   //   Chalk + high own (80% posMax, 35% own): 0.80 × 1.01 × 99 = 80.0 → 80
   //   Weak  + low own (30% posMax, 5% own):   0.30 × 1.43 × 99 = 42.5 → 43
-  const rawScore = ceilPct * effectiveOMult * 99;
+  // rawScore moved below effectiveOMult
 
   // Monte Carlo first-place probability boost (mild, max +3)
   // Monte Carlo first-place boost — 0 default for players outside top-80
   // (they genuinely have near-zero first-place probability)
   // Nash-adjusted ownership: field simulation gives more accurate own% than raw estimate
-  const nashOwn = (typeof nashData !== 'undefined' && nashData?.ownership?.[p.name]) || null;
-  const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own; // blend real + Nash
+  const nashOwn = (nashData?.ownership?.[p.name]) || null;
+  const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own;
   const effectiveOMult = ownershipMult(effectiveOwn);
+  const rawScore = ceilPct * effectiveOMult * 99;
 
   const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
 
