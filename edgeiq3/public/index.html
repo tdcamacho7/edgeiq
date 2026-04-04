@@ -1413,11 +1413,13 @@ function analyzeLineupDNA(lineup, sp) {
 
   // Winning GPP lineup patterns (from historical analysis):
 
-  // 1. Salary: winning lineups use $48,500+ (94%+ of cap)
-  if (totalSal < 48000) {
-    dnaScore -= 10;
-    warnings.push(`Salary too low ($${(totalSal/1000).toFixed(1)}K) — winners use $48.5K+`);
-  } else if (totalSal >= 49500) {
+  // 1. Production quality: every player must project above minimum viable threshold
+  const minPts = { nba: 18, nfl: 10, mlb: 8 }[sp] || 15;
+  const lowCeilingPlayers = valid.filter(l => (l.player.projPts || 0) < minPts);
+  if (lowCeilingPlayers.length > 0) {
+    dnaScore -= 15;
+    warnings.push(`${lowCeilingPlayers.map(l=>l.player.name).join(', ')} projecting under minimum viable threshold — liability plays`);
+  } else {
     dnaScore += 5;
   }
 
@@ -2255,68 +2257,167 @@ function enrich(raw) {
   });
 }
 
-// ── EDGE SCORE — COMPLETE FORMULA (ALL TIERS) ────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// FIRST PLACE OPTIMIZER — THE ONLY GOAL IS WINNING FIRST
+// ═══════════════════════════════════════════════════════════════════
+//
+// First place requires ONE thing:
+// The lineup with the HIGHEST CEILING that the FEWEST PEOPLE HAVE.
+//
+// Not highest projected points. Not highest expected value.
+// CEILING × DIFFERENTIATION.
+//
+// Every signal in this engine exists to answer two questions:
+// 1. How high can this player actually go on a great night?
+// 2. How few other people will have this player?
+//
+// The optimizer then finds the combination that maximizes
+// TOTAL CEILING × TOTAL DIFFERENTIATION within salary constraints.
+
+// ── CEILING CALCULATOR ────────────────────────────────────────────
+// Calculates the realistic MAXIMUM a player could score tonight
+// Not their average. Their ceiling if everything breaks right.
+function calcPlayerCeiling(p) {
+  const base = p.projPts || p.avgPts || 15;
+
+  // Each signal multiplies the ceiling upward
+  let multiplier = 1.0;
+
+  // DvP: facing bottom 20% defense = massive ceiling boost
+  const dvpPct = (p.dvpScore || 50) / 100;
+  if (dvpPct >= 0.85) multiplier += 0.30;      // elite matchup +30%
+  else if (dvpPct >= 0.70) multiplier += 0.18; // good matchup +18%
+  else if (dvpPct <= 0.25) multiplier -= 0.15; // bad matchup -15%
+
+  // Recent form: hot streak = higher ceiling
+  if (p.recentForm?.trend === 'hot')  multiplier += 0.20;
+  if (p.recentForm?.trend === 'cold') multiplier -= 0.12;
+
+  // Vegas game total: high-total games = more scoring opportunities
+  const gt = p.gameTotal || 220;
+  if (gt > 235) multiplier += 0.15;
+  else if (gt > 225) multiplier += 0.08;
+  else if (gt < 210) multiplier -= 0.10;
+
+  // NBA pace: fast games = more possessions = higher ceiling
+  if (p.paceBoost > 2) multiplier += 0.12;
+  else if (p.paceBoost < -2) multiplier -= 0.08;
+
+  // Props market: when Odds API is bullish, ceiling is higher
+  const pd = p.propsDivergence || 0;
+  if (pd >= 7) multiplier += 0.15;
+  else if (pd >= 4) multiplier += 0.08;
+  else if (pd <= -4) multiplier -= 0.10;
+
+  // Contract year: motivated players reach ceiling more often
+  if (p.contractYear) multiplier += 0.08;
+
+  // Injury return window: coaches protect usage = more reliable ceiling
+  if ((p.injuryReturnBoost || 0) > 0) multiplier += 0.10;
+
+  // Fatigue penalty: tired players rarely hit ceiling
+  if (p.fatigue > 25) multiplier -= 0.12;
+  if (p.fatigue > 35) multiplier -= 0.08; // stacks
+
+  // Game script: if team is favored heavily, RBs get more touches
+  const gs = p.gameScript || 0;
+  if (gs > 0) multiplier += gs * 0.03;
+  if (gs < 0) multiplier += gs * 0.03; // negative
+
+  // Vegas line movement (sharp money): line moving up = ceiling going up
+  const lm = p.lineMovement || 0;
+  if (lm > 0) multiplier += 0.06;
+
+  // Positional ref boost: high-foul games inflate centers/PFs
+  if ((p.refBoost || 0) >= 8) multiplier += 0.08;
+
+  // Park factor for MLB hitters
+  if (p.parkFactor > 5) multiplier += 0.10;
+  if (p.parkFactor < -5) multiplier -= 0.08;
+
+  // Weather penalty for outdoor sports
+  const wp = p.weatherPenalty || 0;
+  if (wp < -5) multiplier += wp * 0.015;
+
+  // Cap multiplier range — realistic ceiling is max ~2.5x projection
+  multiplier = Math.max(0.5, Math.min(2.5, multiplier));
+
+  const ceiling = Math.round(base * multiplier * 10) / 10;
+  return ceiling;
+}
+
+// ── DIFFERENTIATION SCORE ─────────────────────────────────────────
+// How unique will this player make your lineup?
+// Lower ownership = higher differentiation = more first-place potential
+function calcDifferentiationScore(p) {
+  const own = p.projOwn || 20;
+
+  // Exponential reward for very low ownership
+  // 0-3%: massive differentiation — when this hits, almost nobody else wins
+  // 4-10%: strong differentiation
+  // 11-20%: moderate — still useful
+  // 21-30%: weak — too many people have this player
+  // 30%+: chalk trap — almost guaranteed to not be unique enough for first
+
+  if (own <= 2)  return 100; // maximum uniqueness
+  if (own <= 5)  return 90;
+  if (own <= 8)  return 80;
+  if (own <= 12) return 70;
+  if (own <= 18) return 58;
+  if (own <= 25) return 44;
+  if (own <= 35) return 28;
+  if (own <= 45) return 15;
+  return 5; // 45%+ ownership = almost never wins first place alone
+}
+
+// ── FIRST PLACE SCORE ─────────────────────────────────────────────
+// The single number that predicts first-place potential
+// Ceiling × Differentiation — both must be high to win first
+function calcFirstPlaceScore(p) {
+  const ceiling = calcPlayerCeiling(p);
+  const diffScore = calcDifferentiationScore(p);
+
+  // Both signals must be present:
+  // High ceiling + high ownership = chalk — can't win first
+  // Low ownership + low ceiling = zero-own bust — worthless
+  // High ceiling + low ownership = FIRST PLACE PLAY
+
+  // Scale ceiling to 0-100 (NBA: 50pts = 100, NFL: 60pts = 100, MLB: 30pts = 100)
+  const ceilMax = { nba: 50, nfl: 60, mlb: 30 };
+  const cMax = ceilMax[sport] || 50;
+  const ceilingScore = Math.min(100, Math.round((ceiling / cMax) * 100));
+
+  // Geometric mean — both must be high (neither can be near zero)
+  // If ceiling is 90 but diff is 5 (45% ownership) → score is low
+  // If diff is 95 but ceiling is 20 (low projection) → score is low
+  const geoMean = Math.round(Math.sqrt(ceilingScore * diffScore));
+
+  // Apply qualifier penalties
+  let score = geoMean;
+
+  // Dead weight: never reaches viable ceiling → never wins first
+  const minViable = { nba: 18, nfl: 10, mlb: 8 };
+  if (ceiling < (minViable[sport] || 15)) score = Math.max(5, score - 40);
+
+  // Near-zero own + low ceiling = bust, not contrarian gem
+  if ((p.projOwn || 20) < 2 && ceiling < 20) score = Math.max(5, score - 30);
+
+  // Injury risk: players with recurrence history cap ceiling
+  if ((p.injuryRisk || 0) < -2) score = Math.max(10, score - 8);
+
+  // Usage restriction: minute limits cap ceiling
+  if ((p.usagePenalty || 0) < -5) score = Math.max(10, score - 10);
+
+  return Math.max(0, Math.min(99, score));
+}
+
+// Legacy alias — edge score IS first place score now
 function calcEdgeScore(p) {
-  // ── WEIGHTED CORE SIGNALS ──
-  const w = {
-    consensus:   15,  // source agreement
-    field:       15,  // ownership contrast
-    projection:  12,  // projection quality vs salary
-    dvp:         12,  // defense vs position
-    recentForm:  10,  // last 5 game weighted trend — TIER 1
-    fatigue:      7,  // physical fatigue/travel
-    circadian:    5,  // game time performance curve
-    ref:          5,  // referee/umpire tendency
-    vegas:        9,  // Vegas market divergence
-    gameTotal:    4,  // game environment/pace
-    gameScript:   3,  // blowout risk for position — TIER 1
-    lineMovement: 3,  // sharp money direction — TIER 1
-  };
-
-  const signals = {
-    consensus:   p.sourceAgreement || 70,
-    field:       Math.max(0, 100 - (p.projOwn||20)),
-    projection:  Math.min(100, ((p.projPts||10) / 50) * 100),
-    dvp:         p.dvpScore || 50,
-    recentForm:  p.recentForm ? Math.min(100, 50 + (p.recentForm.trendBoost||0) * 3 + 50) : 50,
-    fatigue:     100 - (p.fatigue||0),
-    circadian:   p.circadian || 80,
-    ref:         (p.refBoost||5) * 10,
-    vegas:       Math.min(100, Math.max(0, 50 + (p.vegasDiff||0) * 5)),
-    gameTotal:   Math.min(100, Math.max(0, 50 + (p.gameTotalBoost||0) * 10)),
-    gameScript:  Math.min(100, Math.max(0, 50 + (p.gameScript||0) * 5)),
-    lineMovement:Math.min(100, Math.max(0, 50 + (p.lineMovement||0) * 8)),
-  };
-
-  const totalWeight = Object.values(w).reduce((a,b) => a+b, 0);
-  let score = Object.entries(w).reduce((s, [key, weight]) => {
-    return s + (weight * (signals[key]||50) / 100);
-  }, 0) / totalWeight * 100;
-
-  // ── FLAT BONUSES / PENALTIES (all tiers) ──
-  if (p.contractYear) score = Math.min(100, score + 4);       // contract year motivation
-  if ((p.projOwn||20) < 9) score = Math.min(100, score + 3);  // low own GPP bonus
-  score += (p.biasCorrection || 0);                            // personal bias correction
-  score += (p.scarcityBoost || 0);                             // TIER 2: positional scarcity
-  score += (p.usagePenalty || 0);                              // TIER 2: minute restrictions
-  score += (p.targetShare || 0);                               // TIER 2: NFL target share
-  score += (p.paceBoost ? Math.round(p.paceBoost * 1.5) : 0); // TIER 1: NBA pace
-  score += (p.propsDivergence || 0);   // props vs DK divergence
-  score += (p.coachBoost || 0);        // coach tendency
-  score += (p.injuryReturnBoost || 0); // injury return window
-  score += (p.ownCorrelPenalty || 0);  // ownership correlation penalty
-
-  // ── CEILING QUALIFIER ──
-  // Learned from Mann 0.0% own, 5.25 pts — zero-own plays need real ceiling
-  if ((p.projOwn||20) < 2 && (p.projPts||0) < 18) {
-    score = Math.max(20, score - 20);
-  }
-  // Minimum viable projection — sub-$4K players projecting under 10pts never start
-  if ((p.projPts||0) < 10 && (p.salary||0) < 4000) {
-    score = Math.max(15, score - 25);
-  }
-
-  return Math.max(0, Math.min(99, Math.round(score)));
+  if (p.isOut) return 0;
+  const fps = calcFirstPlaceScore(p);
+  // Store ceiling for display and optimizer
+  p._ceiling = calcPlayerCeiling(p);
+  return fps;
 }
 
 // Legacy alias
@@ -2338,13 +2439,7 @@ function optimize(all, sp) {
     return [slot];
   }
 
-  // Pre-sort players by edge score descending for each slot
-  const slotPools = slots.map(slot => {
-    const positions = getPositions(slot);
-    return eligible
-      .filter(p => positions.includes(p.pos))
-      .sort((a, b) => b.edgeScore - a.edgeScore);
-  });
+  // slotPools built after viable pool filter below
 
   // Calculate upper bound for remaining slots (used for pruning)
   function upperBound(slotIdx, salLeft, usedNames) {
@@ -2357,7 +2452,23 @@ function optimize(all, sp) {
     return bound;
   }
 
-  // Min salary needed for remaining slots
+  // Minimum viable projected points — filter by production quality, NOT salary
+  // A $3,500 player projecting 35pts is better than a $9,000 player projecting 35pts
+  // We never force high salary — we force high production
+  const MIN_PROJ_PTS = { nba: 18, nfl: 10, mlb: 8 };
+  const minPts = MIN_PROJ_PTS[sp] || 15;
+  const viablePool = eligible.filter(p => (p.projPts || 0) >= minPts);
+  const searchPool = viablePool.length >= slots.length + 3 ? viablePool : eligible;
+
+  // Rebuild slot pools from viable pool
+  const slotPools = slots.map(slot => {
+    const positions = getPositions(slot);
+    return searchPool
+      .filter(p => positions.includes(p.pos))
+      .sort((a, b) => b.edgeScore - a.edgeScore);
+  });
+
+  // Min salary needed for remaining slots (for budget constraint only)
   const minSalaries = slots.map((_, i) => {
     return slotPools[i].length > 0
       ? Math.min(...slotPools[i].map(p => p.salary))
@@ -2367,27 +2478,57 @@ function optimize(all, sp) {
   let bestScore = -1;
   let bestLineup = null;
 
-  // Branch and bound search
+  // ── FIRST PLACE OPTIMIZER ────────────────────────────────────────
+  // Objective: maximize TOTAL CEILING × DIFFERENTIATION across lineup
+  // This is the only objective that wins first place consistently.
+  // We find the combination where:
+  // - Every player has the highest realistic ceiling
+  // - The overall lineup is differentiated from the field
+  // - Correlated players stack so ceilings are reached together
+
+  function calcLineupFirstPlaceScore(filledPlayers, sp) {
+    if (!filledPlayers.length) return 0;
+
+    // Sum of individual first-place scores
+    const individualSum = filledPlayers.reduce((s,p) => s + (p.edgeScore || 0), 0);
+
+    // Correlation bonus: when correlated players hit, they ALL hit together
+    // This multiplies the chance of reaching lineup ceiling simultaneously
+    let corrBonus = 0;
+    for (let i = 0; i < filledPlayers.length; i++) {
+      for (let j = i + 1; j < filledPlayers.length; j++) {
+        const corr = getCorrelation(filledPlayers[i], filledPlayers[j], sp);
+        // Positive correlation = stacked players = ceiling more likely
+        // Negative correlation = hedging = ceiling less likely
+        corrBonus += corr * 12;
+      }
+    }
+
+    // Total lineup ceiling (sum of individual player ceilings)
+    const totalCeiling = filledPlayers.reduce((s,p) => s + (p._ceiling || p.projPts || 0), 0);
+
+    // Average ownership differentiation across lineup
+    const avgOwn = filledPlayers.reduce((s,p) => s + (p.projOwn || 20), 0) / filledPlayers.length;
+    const lineupDiff = Math.max(0, 100 - avgOwn); // lower avg own = higher diff
+
+    // First place score = (individual sum + corr bonus) weighted by lineup ceiling
+    // High ceiling lineups get amplified — that's what wins
+    const ceilingAmplifier = Math.min(1.5, totalCeiling / (filledPlayers.length * 30));
+    const fps = ((individualSum + corrBonus) / filledPlayers.length) * ceilingAmplifier;
+
+    return fps;
+  }
+
   function search(slotIdx, salLeft, currentScore, currentLineup, usedNames) {
     // Base case — all slots filled
     if (slotIdx === slots.length) {
-      const salUsed = CAP - salLeft;
-      if (salUsed < CAP * 0.94) return;
+      if (salLeft < 0) return;
 
-      // Calculate correlation bonus for this complete lineup
-      // This is the key GPP advantage — correlated players win together
-      let corrBonus = 0;
       const filledPlayers = currentLineup.map(l => l.player).filter(Boolean);
-      for (let i = 0; i < filledPlayers.length; i++) {
-        for (let j = i + 1; j < filledPlayers.length; j++) {
-          const corr = getCorrelation(filledPlayers[i], filledPlayers[j], sp);
-          corrBonus += corr * 8; // scale correlation to edge points
-        }
-      }
+      const lineupScore = calcLineupFirstPlaceScore(filledPlayers, sp);
 
-      const avgEdge = (currentScore + corrBonus) / slots.length;
-      if (avgEdge > bestScore) {
-        bestScore = avgEdge;
+      if (lineupScore > bestScore) {
+        bestScore = lineupScore;
         bestLineup = [...currentLineup];
       }
       return;
@@ -2594,7 +2735,7 @@ function renderLineup(entropyScore, kelly, dna, contest) {
         </div>
       </div>
       <div class="player-right">
-        <div class="player-pts">${p.projPts.toFixed(1)}</div>
+        <div class="player-pts" title="Ceiling: ${(p._ceiling||p.projPts).toFixed(1)}">${p.projPts.toFixed(1)}<span style="font-size:9px;color:var(--green);margin-left:3px">↑${(p._ceiling||p.projPts).toFixed(0)}</span></div>
         <div class="edge-bar-row" style="justify-content:flex-end">
           <div class="edge-track"><div class="edge-fill" style="width:${e}%;background:${ec(e)}"></div></div>
           <div class="player-edge" style="color:${ec(e)}">${e}</div>
