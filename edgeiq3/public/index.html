@@ -342,6 +342,40 @@ input,button{font-family:var(--ui)}
     </div>
   </div>
 
+  <!-- MULTI-LINEUP SCREEN -->
+  <div id="screen-multi" style="display:none">
+    <div class="section-hdr" style="margin-bottom:6px">
+      <div class="section-title">Multi-lineup generator</div>
+      <div style="font-size:11px;color:var(--t3)" id="multi-status">Build a lineup first</div>
+    </div>
+    <div style="font-size:12px;color:var(--t2);margin-bottom:12px;line-height:1.6">
+      Generates multiple lineups with different stacks to cover more outcomes. Each targets a different game environment — if any game explodes, you have exposure.
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:14px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <div style="font-size:13px;font-weight:500">Number of lineups</div>
+        <div style="display:flex;gap:6px" id="count-btns">
+          <button onclick="setLineupCount(3,this)" style="padding:6px 12px;border-radius:var(--border-radius-md);border:1px solid var(--border2);background:var(--bg);color:var(--text);font-size:12px;cursor:pointer">3</button>
+          <button onclick="setLineupCount(5,this)" style="padding:6px 12px;border-radius:var(--border-radius-md);border:1px solid var(--cyan);background:rgba(34,211,238,.1);color:var(--cyan);font-size:12px;cursor:pointer;font-weight:600">5</button>
+          <button onclick="setLineupCount(10,this)" style="padding:6px 12px;border-radius:var(--border-radius-md);border:1px solid var(--border2);background:var(--bg);color:var(--text);font-size:12px;cursor:pointer">10</button>
+          <button onclick="setLineupCount(20,this)" style="padding:6px 12px;border-radius:var(--border-radius-md);border:1px solid var(--border2);background:var(--bg);color:var(--text);font-size:12px;cursor:pointer">20</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div>
+          <div style="font-size:13px;font-weight:500">Max player exposure</div>
+          <div style="font-size:11px;color:var(--t3)">Cap on how often one player appears</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="range" id="exposure-slider" min="20" max="100" value="60" step="10" style="width:80px" oninput="document.getElementById('exposure-val').textContent=this.value+'%'">
+          <span style="font-size:13px;font-weight:500;min-width:36px" id="exposure-val">60%</span>
+        </div>
+      </div>
+      <button onclick="generateMultiLineups()" style="width:100%;padding:12px;background:var(--cyan);color:#000;border:none;border-radius:var(--border-radius-md);font-size:14px;font-weight:700;cursor:pointer">Generate lineups →</button>
+    </div>
+    <div id="multi-results"></div>
+  </div>
+
   <!-- LIVE SWAP SCREEN -->
   <div id="screen-swap" style="display:none">
     <div class="section-hdr" style="margin-bottom:6px">
@@ -397,6 +431,10 @@ input,button{font-family:var(--ui)}
   <div class="nav-item" id="nav-intel" onclick="showScreen('intel')">
     <div class="nav-icon">⚡</div>
     <div class="nav-label">Intel</div>
+  </div>
+  <div class="nav-item" id="nav-multi" onclick="showScreen('multi')">
+    <div class="nav-icon">📋</div>
+    <div class="nav-label">Multi</div>
   </div>
   <div class="nav-item" id="nav-swap" onclick="showScreen('swap')">
     <div class="nav-icon">🔄</div>
@@ -1427,22 +1465,22 @@ function enrich(raw) {
 // ── EDGE SCORE — COMPLETE FORMULA ─────────────────────────────────
 function calcEdgeScore(p) {
   const w = {
-    consensus:    18,  // source agreement
-    field:        18,  // ownership contrast
-    projection:   14,  // projection quality
-    dvp:          14,  // defense vs position — NEW real signal
-    fatigue:       9,  // physical fatigue
-    circadian:     7,  // time-of-day curve
-    ref:           6,  // referee tendency
-    vegas:        10,  // Vegas divergence
-    gameTotal:     4,  // game environment
+    consensus:    18,
+    field:        18,
+    projection:   14,
+    dvp:          14,
+    fatigue:       9,
+    circadian:     7,
+    ref:           6,
+    vegas:        10,
+    gameTotal:     4,
   };
 
   const signals = {
     consensus:   p.sourceAgreement || 70,
     field:       Math.max(0, 100 - (p.projOwn||20)),
     projection:  Math.min(100, ((p.projPts||10) / 50) * 100),
-    dvp:         p.dvpScore || 50,  // 0=best defense, 100=worst defense (great for player)
+    dvp:         p.dvpScore || 50,
     fatigue:     100 - (p.fatigue||0),
     circadian:   p.circadian || 80,
     ref:         (p.refBoost||5) * 10,
@@ -1459,6 +1497,22 @@ function calcEdgeScore(p) {
   if (p.contractYear) score = Math.min(100, score + 4);
   if ((p.projOwn||20) < 9) score = Math.min(100, score + 3);
   score += (p.biasCorrection || 0);
+
+  // ── CEILING QUALIFIER FOR NEAR-ZERO OWNERSHIP ──
+  // Very low ownership plays (< 2%) must have real ceiling to qualify
+  // Learned from: Mann 0.0% own, 5.25 pts — killed lineup
+  // Rule: under 2% own requires projected pts > 18 to get full edge boost
+  // Otherwise the low-own bonus is negated — it's a bad play not a contrarian gem
+  if ((p.projOwn||20) < 2 && (p.projPts||0) < 18) {
+    score = Math.max(20, score - 20); // heavy penalty for low-ceiling, near-zero own
+  }
+
+  // ── MINIMUM VIABLE PROJECTION ──
+  // Player projecting under 10 pts should never appear in lineup
+  // regardless of how low their ownership is
+  if ((p.projPts||0) < 10 && (p.salary||0) < 4000) {
+    score = Math.max(15, score - 25);
+  }
 
   return Math.max(0, Math.min(99, Math.round(score)));
 }
@@ -1842,6 +1896,8 @@ function renderIntelLive() {
       decay: null,
     });
   }
+  // Nash alerts — chalk traps
+  if (nashData?.topChalk?.length) {
     alerts.push({
       tag: 'Nash simulation',
       color: 'var(--purple, #a78bfa)',
@@ -2297,9 +2353,220 @@ function generateSwapRecommendations(games) {
     ${swapCards.join('')}`;
 }
 
-// ── UPDATE showScreen TO INCLUDE SWAP ─────────────────────────────
+// ════════════════════════════════════════════════════════════════════
+// MULTI-LINEUP GENERATOR
+// Generates N lineups with different stacks, controlled exposure,
+// and maximum coverage of outcome space
+// ════════════════════════════════════════════════════════════════════
+
+let multiLineupCount = 5;
+let multiLineups = [];
+
+function setLineupCount(n, btn) {
+  multiLineupCount = n;
+  document.querySelectorAll('#count-btns button').forEach(b => {
+    b.style.borderColor = 'var(--border2)';
+    b.style.background = 'var(--bg)';
+    b.style.color = 'var(--text)';
+    b.style.fontWeight = '400';
+  });
+  if (btn) {
+    btn.style.borderColor = 'var(--cyan)';
+    btn.style.background = 'rgba(34,211,238,.1)';
+    btn.style.color = 'var(--cyan)';
+    btn.style.fontWeight = '600';
+  }
+}
+
+function generateMultiLineups() {
+  if (!players.length) {
+    document.getElementById('multi-results').innerHTML = `<div class="empty"><div class="empty-title">Load a slate first</div><div class="empty-desc">Upload a CSV or paste your contest URL on the Lineup tab first.</div></div>`;
+    return;
+  }
+
+  const maxExposure = parseInt(document.getElementById('exposure-slider').value) / 100;
+  const n = multiLineupCount;
+  const slots = SLOTS[sport];
+
+  document.getElementById('multi-status').textContent = `Generating ${n} lineups...`;
+  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px">Running optimizer ${n} times...</div>`;
+
+  // Run async to not block UI
+  setTimeout(() => {
+    multiLineups = buildMultipleLineups(n, maxExposure, slots);
+    renderMultiLineups();
+  }, 50);
+}
+
+function buildMultipleLineups(n, maxExposure, slots) {
+  const eligible = players.filter(p => !p.isOut && p.edgeScore > 0);
+  const results = [];
+
+  // Track exposure counts
+  const exposureCounts = {};
+  const maxAppearances = Math.ceil(n * maxExposure);
+
+  // Get unique game stacks to target
+  const games = {};
+  eligible.forEach(p => {
+    if (p.gameInfo) games[p.gameInfo] = (games[p.gameInfo] || 0) + 1;
+  });
+  const gameList = Object.keys(games).sort((a,b) => games[b] - games[a]);
+
+  for (let i = 0; i < n; i++) {
+    // Rotate which game stack to target
+    const targetGame = gameList[i % gameList.length];
+
+    // Apply exposure limits — if player is at max, reduce their edge score
+    const adjustedPlayers = eligible.map(p => {
+      const count = exposureCounts[p.name] || 0;
+      if (count >= maxAppearances) {
+        return { ...p, edgeScore: 0 }; // blocked from further lineups
+      }
+      // Diversity bonus — players not yet used get a small boost
+      const diversityBoost = count === 0 ? 5 : count === 1 ? 2 : 0;
+      // Stack incentive — boost players from target game
+      const stackBoost = p.gameInfo === targetGame ? 8 : 0;
+      return {
+        ...p,
+        edgeScore: Math.min(99, p.edgeScore + diversityBoost + stackBoost),
+        _targetGame: targetGame,
+        _inTargetStack: p.gameInfo === targetGame,
+      };
+    });
+
+    // Run optimizer on adjusted pool
+    const lineupResult = optimize(adjustedPlayers, sport);
+    const valid = lineupResult.filter(l => l.player);
+
+    if (valid.length >= Math.floor(slots.length * 0.75)) {
+      results.push({
+        lineup: lineupResult,
+        num: i + 1,
+        targetGame,
+        totalPts: valid.reduce((s,l) => s + l.player.projPts, 0),
+        avgEdge: Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length),
+        avgOwn: Math.round(valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length),
+        totalSal: valid.reduce((s,l) => s + l.player.salary, 0),
+      });
+
+      // Update exposure counts
+      valid.forEach(l => {
+        exposureCounts[l.player.name] = (exposureCounts[l.player.name] || 0) + 1;
+      });
+    }
+  }
+
+  return results;
+}
+
+function renderMultiLineups() {
+  const container = document.getElementById('multi-results');
+
+  if (!multiLineups.length) {
+    container.innerHTML = `<div class="empty"><div class="empty-title">Could not generate lineups</div><div class="empty-desc">Not enough eligible players. Try uploading a fresh CSV.</div></div>`;
+    return;
+  }
+
+  // Calculate exposure report
+  const exposureMap = {};
+  multiLineups.forEach(ml => {
+    ml.lineup.filter(l=>l.player).forEach(l => {
+      exposureMap[l.player.name] = (exposureMap[l.player.name] || 0) + 1;
+    });
+  });
+
+  const topExposure = Object.entries(exposureMap)
+    .sort((a,b) => b[1]-a[1])
+    .slice(0, 5);
+
+  document.getElementById('multi-status').textContent = `${multiLineups.length} lineups generated`;
+
+  // Export all button
+  const exportBtn = `<button onclick="exportAllLineups()" style="width:100%;padding:11px;border:1px solid var(--cyan);color:var(--cyan);background:transparent;border-radius:var(--border-radius-md);font-size:13px;font-weight:600;cursor:pointer;margin-bottom:12px">Export all ${multiLineups.length} lineups to CSV →</button>`;
+
+  // Exposure summary
+  const exposureSummary = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:12px 14px;margin-bottom:12px">
+      <div style="font-size:11px;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Player exposure across ${multiLineups.length} lineups</div>
+      ${topExposure.map(([name, count]) => {
+        const pct = Math.round(count / multiLineups.length * 100);
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+          <span style="font-size:12px;flex:1">${name}</span>
+          <div style="width:80px;height:3px;background:var(--border2);border-radius:2px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:${pct>70?'var(--amber)':'var(--cyan)'};border-radius:2px"></div>
+          </div>
+          <span style="font-size:11px;font-family:var(--mono);color:${pct>70?'var(--amber)':'var(--t2)'};min-width:32px;text-align:right">${pct}%</span>
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  // Individual lineups
+  const lineupCards = multiLineups.map(ml => {
+    const valid = ml.lineup.filter(l => l.player);
+    const rows = ml.lineup.map(l => {
+      if (!l.player) return '';
+      const p = l.player;
+      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--border)">
+        <span style="font-size:10px;font-weight:600;min-width:34px;padding:2px 5px;border-radius:4px;text-align:center;background:rgba(34,211,238,.1);color:var(--cyan)">${l.slot}</span>
+        <span style="flex:1;font-size:12px;font-weight:500">${p.name}</span>
+        <span style="font-size:11px;color:var(--t3)">${p.team}</span>
+        <span style="font-size:12px;font-family:var(--mono)">${p.projPts.toFixed(1)}</span>
+        <span style="font-size:11px;font-family:var(--mono);color:${ec(p.edgeScore)}">${p.edgeScore}</span>
+      </div>`;
+    }).join('');
+
+    return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
+      <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <span style="font-size:13px;font-weight:600">Lineup ${ml.num}</span>
+          <span style="font-size:11px;color:var(--t3);margin-left:8px">stack: ${ml.targetGame?.split(' ')[0]||'mixed'}</span>
+        </div>
+        <div style="display:flex;gap:12px;font-size:11px;font-family:var(--mono)">
+          <span style="color:var(--green)">${ml.totalPts.toFixed(1)} pts</span>
+          <span>edge ${ml.avgEdge}</span>
+          <span style="color:var(--green)">${ml.avgOwn}% own</span>
+          <span style="color:var(--cyan)">$${(ml.totalSal/1000).toFixed(1)}K</span>
+        </div>
+      </div>
+      <div style="padding:8px 14px">
+        ${rows}
+      </div>
+    </div>`;
+  }).join('');
+
+  container.innerHTML = exportBtn + exposureSummary + lineupCards;
+}
+
+function exportAllLineups() {
+  if (!multiLineups.length) return;
+
+  const slots = SLOTS[sport];
+  const rows = ['Lineup,' + slots.join(',') + ',ProjPts,AvgEdge,Salary'];
+
+  multiLineups.forEach(ml => {
+    const valid = ml.lineup.filter(l => l.player);
+    const names = ml.lineup.map(l => l.player?.name || '').join(',');
+    rows.push(`${ml.num},${names},${ml.totalPts.toFixed(1)},${ml.avgEdge},${ml.totalSal}`);
+  });
+
+  // Also export in DK import format
+  const dkRows = ['\n--- DraftKings Import Format ---\n'];
+  multiLineups.forEach(ml => {
+    const names = ml.lineup.filter(l=>l.player).map(l=>l.player.name).join(';');
+    dkRows.push(names);
+  });
+
+  const blob = new Blob([rows.join('\n') + dkRows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `EdgeIQ_Multi_${sport.toUpperCase()}_${multiLineupCount}lineups_${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+}
+
+// ── UPDATE showScreen TO INCLUDE MULTI ───────────────────────────
 function showScreen(s) {
-  ['lineup','intel','swap','stacks','patterns'].forEach(sc => {
+  ['lineup','intel','multi','swap','stacks','patterns'].forEach(sc => {
     const el = document.getElementById(`screen-${sc}`);
     if (el) el.style.display = sc===s?'block':'none';
     const nav = document.getElementById(`nav-${sc}`);
@@ -2311,6 +2578,55 @@ function showScreen(s) {
     const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
     document.getElementById('lineup-entry').value = names;
   }
+}
+
+// ── RESULT LOGGER ─────────────────────────────────────────────────
+// Saves actual contest results to improve future projections
+function logContestResult(playerResults) {
+  // playerResults: [{name, actualPts, projPts, ownership, edgeScore}]
+  const results = JSON.parse(localStorage.getItem(`edgeiq_results_${sport}`) || '[]');
+  results.push({
+    date: new Date().toISOString(),
+    sport,
+    players: playerResults,
+    totalActual: playerResults.reduce((s,p)=>s+p.actualPts,0),
+    totalProj: playerResults.reduce((s,p)=>s+p.projPts,0),
+  });
+  // Keep last 50 contests
+  if (results.length > 50) results.shift();
+  localStorage.setItem(`edgeiq_results_${sport}`, JSON.stringify(results));
+}
+
+// Parse the DraftKings result screenshot data manually entered
+function logTonightResult() {
+  const tonightData = [
+    { name:'N. Alexander-Walker', actualPts:36.50, projPts:29.41, ownership:11.9, edgeScore:77 },
+    { name:'J. Brown',            actualPts:39.75, projPts:50.03, ownership:12.7, edgeScore:73 },
+    { name:'K. Durant',           actualPts:43.75, projPts:43.93, ownership:10.1, edgeScore:74 },
+    { name:'S. Barnes',           actualPts:22.75, projPts:40.54, ownership:25.6, edgeScore:77 },
+    { name:'J. Huff',             actualPts:29.50, projPts:34.38, ownership:1.3,  edgeScore:85 },
+    { name:'A. Green',            actualPts:20.25, projPts:26.06, ownership:2.6,  edgeScore:74 },
+    { name:'S. James',            actualPts:29.00, projPts:28.97, ownership:0.6,  edgeScore:85 },
+    { name:'T. Mann',             actualPts:5.25,  projPts:10.00, ownership:0.0,  edgeScore:86 },
+  ];
+  logContestResult(tonightData);
+
+  // Analysis
+  const overPerformers = tonightData.filter(p => p.actualPts > p.projPts * 1.1);
+  const underPerformers = tonightData.filter(p => p.actualPts < p.projPts * 0.7);
+  const lowOwnBusts = tonightData.filter(p => p.ownership < 2 && p.actualPts < 15);
+
+  console.log('EdgeIQ Result Analysis:');
+  console.log('Over-performers:', overPerformers.map(p=>p.name));
+  console.log('Under-performers:', underPerformers.map(p=>p.name));
+  console.log('Low-own busts (driving new ceiling rule):', lowOwnBusts.map(p=>`${p.name} ${p.actualPts}pts`));
+}
+
+// Auto-log tonight's result on first load after contest
+// (normally would be triggered by user entering result)
+if (!localStorage.getItem('edgeiq_logged_apr3')) {
+  logTonightResult();
+  localStorage.setItem('edgeiq_logged_apr3', '1');
 }
 
 // ── INIT ──────────────────────────────────────────────────────────
