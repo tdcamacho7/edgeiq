@@ -2779,120 +2779,100 @@ function calcPlayerCeiling(p, teammates = []) {
   return Math.round(Math.max(mean, cappedCeil) * 10) / 10;
 }
 
+// ── FIRST-PLACE SCORING ENGINE ────────────────────────────────────
+// OBJECTIVE: Highest DK fantasy points + enough uniqueness to win.
+// score = (adjustedCeiling / positionMax) × ownershipMult × 99
+//
+// Position ceiling maximums — realistic best-case DK pts per position
+const POS_CEIL_MAX = {
+  nba: { PG:80, SG:75, SF:75, PF:80, C:78, G:78, F:77, UTIL:76 },
+  nfl: { QB:65, RB:55, WR:55, TE:50, DST:28, K:22, FLEX:55 },
+  mlb: { P:62, C:36, '1B':46, '2B':40, '3B':43, SS:43, OF:50, FLEX:46 },
+};
+
+// Position average DK points — for reliability calculation
+const POS_AVG_MAP = {
+  nba: { PG:32, SG:29, SF:28, PF:27, C:26, G:30, F:27, UTIL:28 },
+  nfl: { QB:30, RB:18, WR:20, TE:15, DST:9, K:8, FLEX:18 },
+  mlb: { P:22, C:10, '1B':12, '2B':10, '3B':11, SS:11, OF:11, FLEX:11 },
+};
+
+// Ownership multiplier: rewards uniqueness
+// 0% own  → 1.50x | 15% own → 1.30x | 30% own → 1.10x | 45%+ → 0.90x
+function ownershipMult(own) {
+  return Math.max(0.80, 1.50 - own * 0.014);
+}
+
+// Reliability: shrinks low-sample players toward position average
+// Prevents 3-game rookie averages from inflating projections
+function ceilingReliability(avgPts, posAvg) {
+  return Math.min(1.0, Math.max(0.3, avgPts / Math.max(posAvg, 1)));
+}
+
+// Compatibility alias
 function calcDifferentiationScore(p) {
   const own = p.projOwn || 20;
-
-  // Piecewise differentiation — rewards low ownership but doesn't
-  // excessively penalize moderate ownership (15-25% is still GPP-viable)
-  //
-  // 0-5%:   90-100 (highly differentiated — maximum GPP value)
-  // 6-12%:  75-89  (well differentiated — good GPP plays)
-  // 13-20%: 55-74  (moderately differentiated — viable GPP)
-  // 21-30%: 35-54  (low differentiation — chalk territory)
-  // 31-40%: 20-34  (chalk — only if massive ceiling)
-  // 40%+:   5-19   (too chalk for first place in large GPPs)
-
-  if (own <= 2)  return 100;
-  if (own <= 5)  return 92;
-  if (own <= 8)  return 84;
-  if (own <= 12) return 76;
-  if (own <= 16) return 66;
-  if (own <= 20) return 56;
-  if (own <= 25) return 44;
-  if (own <= 30) return 33;
-  if (own <= 35) return 24;
-  if (own <= 40) return 16;
-  return 8; // 40%+ ownership
+  if (own <= 2)  return 100; if (own <= 5)  return 92;
+  if (own <= 8)  return 84;  if (own <= 12) return 76;
+  if (own <= 16) return 66;  if (own <= 20) return 56;
+  if (own <= 25) return 44;  if (own <= 30) return 33;
+  if (own <= 35) return 24;  if (own <= 40) return 16;
+  return 8;
 }
 
-function calcFirstPlaceScore(p) {
-  const ceiling   = p._ceiling || calcPlayerCeiling(p);
-  const diffScore = calcDifferentiationScore(p);
-  const mcProb    = p._mcFirstPlaceProb || 0.15;
-  const avgPts    = p.avgPts || p.projPts || 15;
-
-  // ── MINIMUM PRODUCTION GATE ───────────────────────────────────────
-  // Filter out players who simply can't produce enough
-  const minAvg = sport === 'mlb'
-    ? (p.pos === 'P' ? 8 : 4)   // pitchers need 8+ avg, hitters 4+
-    : sport === 'nba' ? 20 : 10;
-  if (avgPts < minAvg) return Math.max(5, 20 - (minAvg - avgPts) * 2);
-
-  // ── SCALE CEILING TO 0-100 ────────────────────────────────────────
-  // MLB pitchers can score 55-60, hitters 40-50 on great nights
-  // NBA players can score 65+ on triple-double nights
-  const ceilMax = sport === 'mlb'
-    ? (p.pos === 'P' ? 60 : 50)  // pitchers 60, hitters 50
-    : sport === 'nba' ? 70
-    : sport === 'nfl' ? 70
-    : 70;
-  const ceilScore = Math.min(100, (ceiling / ceilMax) * 100);
-
-  // ── BAYESIAN SHRINKAGE OF CEILING SCORE ──────────────────────────
-  // Players with low averages relative to their position get shrunk
-  const posAvgMap = {
-    nba: { PG:32, SG:29, SF:28, PF:27, C:26, G:31, F:28, UTIL:28 },
-    nfl: { QB:30, RB:18, WR:20, TE:15, DST:8 },
-    mlb: { P:22, C:10, '1B':12, '2B':10, '3B':11, SS:11, OF:11 },
-  };
-  const posAvg = (posAvgMap[sport] || posAvgMap.nba)[p.pos] || avgPts;
-  // Shrinkage: blend ceiling toward position-adjusted expectation
-  // More shrinkage for small-sample players (avgPts << posAvg)
-  const reliability = Math.min(1.0, avgPts / Math.max(posAvg, 1));
-  const shrunkCeilScore = ceilScore * reliability + (ceilScore * 0.6) * (1 - reliability);
-
-  // ── WEIGHTED COMBINATION: 70% CEILING + 30% DIFFERENTIATION ──────
-  // Ceiling is primary — production wins first place
-  // Differentiation is necessary — uniqueness allows you to actually win
-  const rawScore = Math.pow(Math.max(1, shrunkCeilScore), 0.70) *
-                   Math.pow(Math.max(1, diffScore), 0.30);
-
-  // ── MONTE CARLO MULTIPLIER ────────────────────────────────────────
-  // Mild boost for players who frequently appear in simulated winners
-  const mcMultiplier = 1.0 + Math.min(0.3, mcProb * 1.5);
-
-  // ── RESCALE TO TARGET RANGE ───────────────────────────────────────
-  // Elite plays → 85-97, good plays → 70-84, average → 55-69
-  // rawScore range: ~1 (terrible) to ~85 (elite)
-  // Calibration (verified against test cases):
-  // rawScore 163+ (elite: high ceil + low own) → score 97-99
-  // rawScore 100-130 (good: solid ceil + moderate own) → score 78-88
-  // rawScore 70-99 (solid: avg ceil + some contrast) → score 65-77
-  // rawScore <70 (chalk or low ceil) → score 50-64
-  const normalized = rawScore / 230; // maxRaw = 230 calibrated against DFS data
-  const rescaled = 99 * Math.pow(Math.min(1.0, normalized), 0.55) * mcMultiplier;
-
-  let score = Math.min(99, Math.round(rescaled));
-
-  // ── HARD QUALIFIERS ───────────────────────────────────────────────
-  if (ceiling < minAvg * 1.2)            score = Math.max(5,  score - 35);
-  if ((p.projOwn||20) < 2 && ceiling < 20) score = Math.max(5, score - 25);
-  if ((p.injuryRisk||0) < -2)           score = Math.max(10, score -  8);
-  if ((p.usagePenalty||0) < -5)         score = Math.max(10, score - 10);
-
-  return Math.max(0, Math.min(99, score));
-}
+function calcFirstPlaceScore(p) { return calcEdgeScore(p); }
 
 function calcEdgeScore(p) {
   if (p.isOut) return 0;
 
-  // MLB pitchers get special scoring — they're the highest ceiling position
-  // and must always appear in the lineup. Boost their base score significantly.
-  if (sport === 'mlb' && p.pos === 'P') {
-    p._ceiling = calcPlayerCeiling(p);
-    const baseScore = calcFirstPlaceScore(p);
-    // Elite pitchers ($9K+) should score 75-90
-    // Solid pitchers ($7-9K) should score 65-80
-    // Salary reflects DK's own assessment of pitcher quality
-    const salBoost = Math.round((p.salary - 5000) / 200); // $10K = +25 boost
-    return Math.min(99, Math.max(30, baseScore + Math.max(0, salBoost)));
-  }
+  const ceiling = p._ceiling || calcPlayerCeiling(p);
+  p._ceiling    = ceiling;
 
-  p._ceiling = calcPlayerCeiling(p);
-  return calcFirstPlaceScore(p);
+  const own    = p.projOwn || 20;
+  const avgPts = p.avgPts  || p.projPts || 15;
+  const pos    = p.pos || 'FLEX';
+
+  // Position-specific max ceiling — what an elite game at this position looks like
+  const posMaxMap = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
+  const posMax    = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
+
+  // Reliability-adjusted ceiling — shrinks inflated small-sample estimates
+  const posAvgMap = POS_AVG_MAP[sport] || POS_AVG_MAP.nba;
+  const posAvg    = posAvgMap[pos] || 20;
+  const rel       = ceilingReliability(avgPts, posAvg);
+  const adjCeil   = ceiling * rel + (posAvg * 1.4) * (1 - rel);
+
+  // Ceiling fraction: how close to elite is this player tonight?
+  const ceilPct = Math.min(1.0, adjCeil / posMax);
+
+  // Ownership multiplier: uniqueness bonus
+  const oMult = ownershipMult(own);
+
+  // Core score: ceiling quality × uniqueness
+  // Verified examples (NBA, sport avg own=20%):
+  //   Elite + low own (90% posMax, 5% own):   0.90 × 1.43 × 99 = 127 → 99
+  //   Good  + mod own (70% posMax, 15% own):  0.70 × 1.29 × 99 = 89.3 → 89
+  //   Chalk + high own (80% posMax, 35% own): 0.80 × 1.01 × 99 = 80.0 → 80
+  //   Weak  + low own (30% posMax, 5% own):   0.30 × 1.43 × 99 = 42.5 → 43
+  const rawScore = ceilPct * oMult * 99;
+
+  // Monte Carlo first-place probability boost (mild, max +3)
+  const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0.10) * 15);
+
+  let score = Math.min(99, Math.round(rawScore + mcBoost));
+
+  // Hard disqualifiers — players who simply cannot win first place
+  const minCeil = pos === 'P' ? 15 : 8;
+  if (ceiling < minCeil)            score = Math.min(score, 28); // dead weight
+  if (own < 1.5 && ceiling < 18)   score = Math.min(score, 22); // zero-own busts
+  if ((p.injuryRisk  ||0) < -2)    score = Math.max(10, score - 8);
+  if ((p.usagePenalty||0) < -5)    score = Math.max(10, score - 10);
+
+  return Math.max(10, Math.min(99, score));
 }
 
 function score(p) { return calcEdgeScore(p); }
+
 
 
 // ── OPTIMIZER — GUARANTEED BEST LINEUP ───────────────────────────
@@ -3040,34 +3020,58 @@ function optimize(all, sp) {
   function calcLineupFirstPlaceScore(filledPlayers, sp) {
     if (!filledPlayers.length) return 0;
 
-    // Sum of individual first-place scores
+    // ── LINEUP OBJECTIVE: maximize total edge score + stack bonuses ──
+    // The edge score already encodes ceiling quality AND ownership.
+    // We do NOT amplify by ceiling again — that double-counts it and
+    // incorrectly penalizes MLB (low ceiling sport) vs NBA (high ceiling).
+    // 
+    // Objective = avg(edgeScore) + corrBonus + stackBonus
+    // This is sport-agnostic and directly ranks lineups by first-place potential.
+
+    const n = filledPlayers.length;
+
+    // Individual edge score sum
     const individualSum = filledPlayers.reduce((s,p) => s + (p.edgeScore || 0), 0);
 
-    // Correlation bonus: when correlated players hit, they ALL hit together
-    // This multiplies the chance of reaching lineup ceiling simultaneously
+    // Correlation bonus: stacked players hit ceiling together (Gumbel copula)
+    // QB+WR same team, NBA same-game players, MLB same-team hitters
     let corrBonus = 0;
-    for (let i = 0; i < filledPlayers.length; i++) {
-      for (let j = i + 1; j < filledPlayers.length; j++) {
+    for (let i = 0; i < n; i++) {
+      for (let j = i+1; j < n; j++) {
         const corr = getCorrelation(filledPlayers[i], filledPlayers[j], sp);
-        // Positive correlation = stacked players = ceiling more likely
-        // Negative correlation = hedging = ceiling less likely
-        corrBonus += corr * 12;
+        corrBonus += corr * 15; // 15 pts per correlated pair
       }
     }
 
-    // Total lineup ceiling (sum of individual player ceilings)
-    const totalCeiling = filledPlayers.reduce((s,p) => s + (p._ceiling || p.projPts || 0), 0);
+    // MLB team stack bonus: 4+ hitters from same team = massive ceiling boost
+    // Because when a team explodes, ALL their hitters score big together
+    if (sp === 'mlb') {
+      const teamCounts = {};
+      filledPlayers.filter(p => p.pos !== 'P').forEach(p => {
+        teamCounts[p.team] = (teamCounts[p.team] || 0) + 1;
+      });
+      const maxStack = Math.max(0, ...Object.values(teamCounts));
+      if (maxStack >= 4) corrBonus += 60;       // 4-man stack: huge bonus
+      else if (maxStack === 3) corrBonus += 25;  // 3-man stack: good
+      else if (maxStack === 2) corrBonus += 5;   // 2-man: minor
+      else corrBonus -= 30;                       // no stack: penalize
+    }
 
-    // Average ownership differentiation across lineup
-    const avgOwn = filledPlayers.reduce((s,p) => s + (p.projOwn || 20), 0) / filledPlayers.length;
-    const lineupDiff = Math.max(0, 100 - avgOwn); // lower avg own = higher diff
+    // NFL QB-WR stack bonus
+    if (sp === 'nfl') {
+      const qbs = filledPlayers.filter(p => p.pos === 'QB');
+      const wrs = filledPlayers.filter(p => p.pos === 'WR');
+      const hasStack = qbs.some(qb => wrs.some(wr => wr.team === qb.team));
+      if (hasStack) corrBonus += 40;
+      else corrBonus -= 20;
+    }
 
-    // First place score = (individual sum + corr bonus) weighted by lineup ceiling
-    // High ceiling lineups get amplified — that's what wins
-    const ceilingAmplifier = Math.min(1.5, totalCeiling / (filledPlayers.length * 30));
-    const fps = ((individualSum + corrBonus) / filledPlayers.length) * ceilingAmplifier;
+    // Ownership differentiation: lower avg ownership = more unique = better GPP
+    const avgOwn = filledPlayers.reduce((s,p) => s+(p.projOwn||20), 0) / n;
+    const diffBonus = Math.max(-20, Math.min(20, (25 - avgOwn) * 0.8));
 
-    return fps;
+    // Final lineup score: average per-player score + bonuses per player
+    return (individualSum + corrBonus + diffBonus) / n;
   }
 
   function search(slotIdx, salLeft, currentScore, currentLineup, usedNames) {
@@ -3145,22 +3149,48 @@ function optimize(all, sp) {
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
 function greedyFillSlots(pool, slots, budget, sp) {
+  // Sort by edge score descending
   const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
-  const used = new Set();
-  let salLeft = budget;
+  const used   = new Set();
+  let salLeft  = budget;
   const lineup = [];
-  const min = 2500;
+  const MIN_PER_SLOT = 2500;
+
+  // MLB: identify the best stack team first
+  // Pick the team whose top hitters have highest combined edge scores
+  let stackTeam = null;
+  if (sp === 'mlb') {
+    const teamScores = {};
+    sorted.filter(p => p.pos !== 'P').forEach(p => {
+      teamScores[p.team] = (teamScores[p.team] || 0) + p.edgeScore;
+    });
+    stackTeam = Object.entries(teamScores).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+  }
 
   for (const slot of slots) {
     const remaining = slots.length - lineup.length - 1;
-    const maxBudget = salLeft - (remaining * min);
+    const maxBudget = salLeft - (remaining * MIN_PER_SLOT);
+
     const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
       : slot === 'G' ? G_POS : slot === 'F' ? F_POS
       : slot === 'UTIL' ? UTIL_POS : [slot];
 
-    const pick = sorted.find(p =>
-      !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-    );
+    // For MLB hitter slots: prefer players from stack team
+    let pick = null;
+    if (sp === 'mlb' && slot !== 'P' && stackTeam) {
+      // Try to find a stack team player first
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget &&
+        positions.includes(p.pos) && p.team === stackTeam
+      );
+    }
+
+    // Fall back to best available if no stack player fits
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+      );
+    }
 
     if (pick) {
       lineup.push({ slot, player: pick });
@@ -3171,119 +3201,28 @@ function greedyFillSlots(pool, slots, budget, sp) {
     }
   }
 
-  // Salary upgrade pass
-  if (salLeft > 1000) {
-    for (let i = lineup.length-1; i >= 0; i--) {
-      if (salLeft < 300) break;
-      const cur = lineup[i].player; if (!cur) continue;
-      const slot = lineup[i].slot;
-      const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
-        : slot === 'G' ? G_POS : slot === 'F' ? F_POS
-        : slot === 'UTIL' ? UTIL_POS : [slot];
-      const upgrade = sorted.find(p =>
-        !used.has(p.name) && p.salary > cur.salary &&
-        p.salary <= cur.salary + salLeft - 200 &&
-        positions.includes(p.pos) && p.edgeScore >= cur.edgeScore - 10
-      );
-      if (upgrade) {
-        salLeft = salLeft + cur.salary - upgrade.salary;
-        used.delete(cur.name); used.add(upgrade.name);
-        lineup[i] = { slot, player: upgrade };
-      }
+  // Salary upgrade pass — use remaining budget on better players
+  for (let i = lineup.length-1; i >= 0; i--) {
+    if (salLeft < 300) break;
+    const cur  = lineup[i].player; if (!cur) continue;
+    const slot = lineup[i].slot;
+    const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
+      : slot === 'G' ? G_POS : slot === 'F' ? F_POS
+      : slot === 'UTIL' ? UTIL_POS : [slot];
+    const upgrade = sorted.find(p =>
+      !used.has(p.name) && p.salary > cur.salary &&
+      p.salary <= cur.salary + salLeft - 200 &&
+      positions.includes(p.pos) && p.edgeScore >= cur.edgeScore - 8
+    );
+    if (upgrade) {
+      salLeft = salLeft + cur.salary - upgrade.salary;
+      used.delete(cur.name); used.add(upgrade.name);
+      lineup[i] = { slot, player: upgrade };
     }
   }
   return lineup;
 }
 
-// Fallback greedy optimizer with salary maximization
-function greedyOptimize(eligible, slots, sp) {
-  const sorted = [...eligible].sort((a,b) => b.edgeScore - a.edgeScore);
-  const min = 3000;
-  const used = new Set();
-  let salLeft = CAP;
-  const lineup = [];
-
-  const find = (pos, budget) =>
-    sorted.find(p => !used.has(p.name) && p.salary <= budget && p.pos === pos);
-  const findMulti = (positions, budget) =>
-    sorted.find(p => !used.has(p.name) && p.salary <= budget && positions.includes(p.pos));
-
-  for (const slot of slots) {
-    const remaining = slots.length - lineup.length - 1;
-    const budget = salLeft - (remaining * min);
-    let pick = null;
-    if (slot === 'FLEX') pick = findMulti(FLEX_POS[sp]||[], budget);
-    else if (slot === 'G') pick = findMulti(G_POS, budget);
-    else if (slot === 'F') pick = findMulti(F_POS, budget);
-    else if (slot === 'UTIL') pick = findMulti(UTIL_POS, budget);
-    else pick = find(slot, budget);
-    if (pick) { lineup.push({slot,player:pick}); used.add(pick.name); salLeft-=pick.salary; }
-    else lineup.push({slot,player:null});
-  }
-
-  // Salary upgrade pass
-  if (salLeft > 1500) {
-    for (let i = lineup.length-1; i >= 0; i--) {
-      if (salLeft < 300) break;
-      const current = lineup[i].player; if (!current) continue;
-      const slot = lineup[i].slot;
-      const positions = slot==='FLEX'?(FLEX_POS[sp]||[]):slot==='G'?G_POS:slot==='F'?F_POS:slot==='UTIL'?UTIL_POS:[slot];
-      const budget = current.salary + salLeft - 200;
-      const upgrade = sorted.find(p =>
-        !used.has(p.name) && p.salary > current.salary && p.salary <= budget &&
-        positions.includes(p.pos) && p.edgeScore >= current.edgeScore - 8
-      );
-      if (upgrade) {
-        salLeft = salLeft + current.salary - upgrade.salary;
-        used.delete(current.name); used.add(upgrade.name);
-        lineup[i] = {slot, player: upgrade};
-      }
-    }
-  }
-  return lineup;
-}
-
-// ── BUILD & RENDER ─────────────────────────────────────────────────
-let nashData = null;
-
-function buildAndRender() {
-  nashData = runNashSimulation(players, sport, 300);
-
-  // Run Monte Carlo simulation — 2,000 Gamma-sampled contest outcomes
-  // Estimates the true first-place probability for each player
-  const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0);
-  const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 2000);
-
-  // Re-score all players with full mathematical engine
-  players = players.map(p => {
-    p._mcFirstPlaceProb = mcProbs[p.name] || 0;
-    const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-    p._ceiling = calcPlayerCeiling(p, teammates);
-    p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
-    return p;
-  });
-
-  lineup = optimize(players, sport);
-
-  // Jensen-Shannon divergence — information-theoretic lineup uniqueness
-  const jsdScore = calcLineupJSDScore(lineup, players);
-
-  // Multivariate Kelly Criterion (accounts for player correlations)
-  const valid = lineup.filter(l=>l.player);
-  const avgEdge = valid.length ? Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length) : 0;
-  const avgOwn  = valid.length ? valid.reduce((s,l)=>s+l.player.projOwn,0)/valid.length : 20;
-  const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
-
-  const dna     = analyzeLineupDNA(lineup, sport);
-  const contest = recommendContest(avgEdge);
-
-  fetchLatestNews(sport).catch(()=>{});
-
-  renderLineup(jsdScore, kelly, dna, contest);
-  renderStacks();
-  renderIntelLive();
-  if (currentScreen === 'signals') renderSignalDashboard();
-}
 
 function rebuildLineup() {
   // Slight variation for lineup diversity
