@@ -2183,6 +2183,7 @@ function enrich(raw) {
       vegasImplied: p.vegasImplied,
       recentFormData: p.recentFormData,
       propData: p.propData,
+      pos: p.pos || '',
     };
     const bayesResult = bayesianProjectionUpdate(basePts, bayesSignals);
     const bayesianMean  = bayesResult.mean;
@@ -2421,42 +2422,57 @@ function calcStackCeilingMultiplier(player, teammates, sp) {
 // Posterior: updated Normal distribution
 
 function bayesianProjectionUpdate(basePts, signals) {
-  // Prior parameters from historical data
-  const mu0    = basePts;           // prior mean = DK historical avg
-  const sigma0 = basePts * 0.35;    // prior std = 35% of mean (realistic DFS variance)
-  const n0     = 3;                 // prior strength (equivalent to 3 observations)
+  // Prior parameters — stronger shrinkage for low-sample players
+  // DK average points is reliable only with 20+ games
+  // For rookies / new players, shrink heavily toward position average
+  const NBA_POS_AVG = { PG:32, SG:29, SF:28, PF:27, C:26, G:31, F:28, UTIL:28 };
+  const NFL_POS_AVG = { QB:30, RB:18, WR:20, TE:15, DST:8, K:8 };
+  const MLB_POS_AVG = { P:25, C:9, '1B':11, '2B':10, '3B':10, SS:10, OF:11 };
 
-  // Collect signal evidence
+  const posAvg = (sport === 'nba' ? NBA_POS_AVG : sport === 'nfl' ? NFL_POS_AVG : MLB_POS_AVG);
+
+  // If base projection is unrealistically high vs position average,
+  // shrink toward position average (handles small sample inflation)
+  const pos = signals.pos || '';
+  const leaguePosAvg = posAvg[pos] || basePts;
+  const maxRealistic = leaguePosAvg * 1.8; // no player averages more than 1.8x position avg
+
+  // Shrink inflated estimates toward realistic range
+  const shrunkBase = basePts > maxRealistic
+    ? leaguePosAvg * 1.4 // cap at 1.4x position average
+    : basePts;
+
+  const mu0    = shrunkBase;
+  const sigma0 = shrunkBase * 0.35;
+  const n0     = 3;
+
   const observations = [];
 
   if (signals.realProjection && signals.realProjection > 0) {
-    // Sleeper projection: high confidence evidence
-    observations.push({ value: signals.realProjection, weight: 2.0, sigma: sigma0 * 0.7 });
+    // Also validate Sleeper projection against position avg
+    const validProj = Math.min(signals.realProjection, maxRealistic);
+    observations.push({ value: validProj, weight: 2.0, sigma: sigma0 * 0.7 });
   }
   if (signals.vegasImplied && signals.vegasImplied > 0) {
-    // Vegas implied: very high confidence (market is accurate)
     observations.push({ value: signals.vegasImplied, weight: 2.5, sigma: sigma0 * 0.6 });
   }
   if (signals.recentFormData?.weightedAvg > 0) {
-    // Recent form: moderate confidence
-    observations.push({ value: signals.recentFormData.weightedAvg, weight: 1.5, sigma: sigma0 * 0.8 });
+    const validForm = Math.min(signals.recentFormData.weightedAvg, maxRealistic);
+    observations.push({ value: validForm, weight: 1.5, sigma: sigma0 * 0.8 });
   }
   if (signals.propData) {
-    // Player props: highest confidence (sharpest market)
     const propPts = signals.propData.points?.line || signals.propData.rush_yds?.line;
     if (propPts > 0) {
-      observations.push({ value: propPts, weight: 3.0, sigma: sigma0 * 0.5 });
+      const validProp = Math.min(propPts, maxRealistic);
+      observations.push({ value: validProp, weight: 3.0, sigma: sigma0 * 0.5 });
     }
   }
 
-  if (!observations.length) return mu0;
+  if (!observations.length) return { mean: mu0, sigma: sigma0 };
 
-  // Bayesian update: weighted average of prior and observations
   const totalWeight = n0 + observations.reduce((s,o) => s + o.weight, 0);
   const weightedSum = n0 * mu0 + observations.reduce((s,o) => s + o.weight * o.value, 0);
   const posteriorMean = weightedSum / totalWeight;
-
-  // Posterior variance shrinks as we get more evidence
   const posteriorSigma = sigma0 / Math.sqrt(1 + observations.length * 0.5);
 
   return { mean: Math.round(posteriorMean * 10) / 10, sigma: posteriorSigma };
@@ -2787,11 +2803,63 @@ function score(p) { return calcEdgeScore(p); }
 
 
 // ── OPTIMIZER — GUARANTEED BEST LINEUP ───────────────────────────
-// Uses branch-and-bound search to find the true maximum edge score
-// lineup within salary cap. No greedy shortcuts — best result every time.
 function optimize(all, sp) {
   const slots = SLOTS[sp];
   const eligible = all.filter(p => !p.isOut && p.edgeScore > 0);
+
+  // ── MLB: PRE-SELECT PITCHERS ──────────────────────────────────────
+  // Pitchers are mandatory and high-salary. Select best 2 SPs first,
+  // then fill remaining slots with hitters from remaining budget.
+  if (sp === 'mlb') {
+    const pitchers = eligible
+      .filter(p => p.pos === 'P' && (p.projPts || 0) >= 18)
+      .sort((a, b) => b.edgeScore - a.edgeScore);
+
+    const hitters = eligible.filter(p => p.pos !== 'P');
+
+    // Try top 3 pitcher combinations, return best complete lineup
+    const pitcherSlots = slots.filter(s => s === 'P');
+    const hitterSlots  = slots.filter(s => s !== 'P');
+
+    let bestMLBScore = -1, bestMLBLineup = null;
+
+    // Try top 6 pitcher options in pairs
+    const topPitchers = pitchers.slice(0, 6);
+    for (let i = 0; i < topPitchers.length; i++) {
+      for (let j = i + 1; j < topPitchers.length; j++) {
+        const p1 = topPitchers[i], p2 = topPitchers[j];
+        const pitcherSal = p1.salary + p2.salary;
+        const remainingBudget = CAP - pitcherSal;
+
+        if (remainingBudget < hitterSlots.length * 2500) continue;
+
+        // Fill hitter slots with remaining budget
+        const usedPitchers = new Set([p1.name, p2.name]);
+        const hitterLineup = greedyFillSlots(
+          hitters.filter(h => !usedPitchers.has(h.name)),
+          hitterSlots, remainingBudget, sp
+        );
+
+        if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
+
+        const fullLineup = [
+          { slot: 'P', player: p1 },
+          { slot: 'P', player: p2 },
+          ...hitterLineup,
+        ];
+
+        const allPlayers = fullLineup.filter(l=>l.player).map(l=>l.player);
+        const lineupScore = calcLineupFirstPlaceScore(allPlayers, sp);
+
+        if (lineupScore > bestMLBScore) {
+          bestMLBScore = lineupScore;
+          bestMLBLineup = fullLineup;
+        }
+      }
+    }
+
+    if (bestMLBLineup) return bestMLBLineup;
+  }
 
   // Group players by which slots they can fill
   function getPositions(slot) {
@@ -2900,14 +2968,18 @@ function optimize(all, sp) {
 
       const filledPlayers = currentLineup.map(l => l.player).filter(Boolean);
 
-      // Salary utilization bonus — using more salary is better when ceiling is equal
-      // This prevents the optimizer from leaving $20K unused
-      // Formula: small bonus per $1K used above minimum viable salary
+      // Salary utilization — strong incentive to use full cap
+      // Leaving $10K+ unused means missing better players
       const totalSal = CAP - salLeft;
-      const minViableSal = { nba: 38000, nfl: 42000, mlb: 42000 }[sp] || 40000;
-      const salBonus = totalSal >= minViableSal
-        ? Math.min(5, (totalSal - minViableSal) / 2000) // max +5 bonus for full salary use
-        : Math.max(-15, (totalSal - minViableSal) / 1000); // penalty for very low salary
+      const targetSal = { nba: 49000, nfl: 49000, mlb: 49000 }[sp] || 49000;
+      const salPct = totalSal / CAP;
+      // Smooth bonus: full cap = +8, 90% cap = +4, 80% = 0, below = penalty
+      const salBonus = salPct >= 0.98 ? 8
+        : salPct >= 0.95 ? 6
+        : salPct >= 0.90 ? 4
+        : salPct >= 0.85 ? 1
+        : salPct >= 0.80 ? 0
+        : Math.max(-20, (salPct - 0.80) * 100); // penalty below 80%
 
       const lineupScore = calcLineupFirstPlaceScore(filledPlayers, sp) + salBonus;
 
@@ -2960,6 +3032,58 @@ function optimize(all, sp) {
   }
 
   return bestLineup;
+}
+
+// Greedy slot filler — used by MLB pitcher-first optimizer
+function greedyFillSlots(pool, slots, budget, sp) {
+  const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
+  const used = new Set();
+  let salLeft = budget;
+  const lineup = [];
+  const min = 2500;
+
+  for (const slot of slots) {
+    const remaining = slots.length - lineup.length - 1;
+    const maxBudget = salLeft - (remaining * min);
+    const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
+      : slot === 'G' ? G_POS : slot === 'F' ? F_POS
+      : slot === 'UTIL' ? UTIL_POS : [slot];
+
+    const pick = sorted.find(p =>
+      !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+    );
+
+    if (pick) {
+      lineup.push({ slot, player: pick });
+      used.add(pick.name);
+      salLeft -= pick.salary;
+    } else {
+      lineup.push({ slot, player: null });
+    }
+  }
+
+  // Salary upgrade pass
+  if (salLeft > 1000) {
+    for (let i = lineup.length-1; i >= 0; i--) {
+      if (salLeft < 300) break;
+      const cur = lineup[i].player; if (!cur) continue;
+      const slot = lineup[i].slot;
+      const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
+        : slot === 'G' ? G_POS : slot === 'F' ? F_POS
+        : slot === 'UTIL' ? UTIL_POS : [slot];
+      const upgrade = sorted.find(p =>
+        !used.has(p.name) && p.salary > cur.salary &&
+        p.salary <= cur.salary + salLeft - 200 &&
+        positions.includes(p.pos) && p.edgeScore >= cur.edgeScore - 10
+      );
+      if (upgrade) {
+        salLeft = salLeft + cur.salary - upgrade.salary;
+        used.delete(cur.name); used.add(upgrade.name);
+        lineup[i] = { slot, player: upgrade };
+      }
+    }
+  }
+  return lineup;
 }
 
 // Fallback greedy optimizer with salary maximization
