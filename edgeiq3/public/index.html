@@ -2732,9 +2732,14 @@ function calcPlayerCeiling(p, teammates = []) {
 
   // Method 3: Signal-adjusted ceiling (existing multiplier method)
   let multiplier = 1.0;
-  const dvpPct = (p.dvpScore || 50) / 100;
-  if (dvpPct >= 0.85) multiplier += 0.30;
-  else if (dvpPct >= 0.70) multiplier += 0.18;
+  // Use dvpScore for ceiling multiplier adjustment
+  // Use null check not truthy check (dvpScore=0 is a real "worst" value)
+  const dvpPct = (p.dvpScore != null ? p.dvpScore : 50) / 100;
+  if (p.dvpLabel?.badge === 'elite matchup') multiplier += 0.30;
+  else if (p.dvpLabel?.badge === 'good matchup') multiplier += 0.15;
+  else if (p.dvpLabel?.badge === 'bad matchup') multiplier -= 0.20;
+  else if (p.dvpLabel?.badge === 'tough matchup') multiplier -= 0.10;
+  else if (dvpPct >= 0.85) multiplier += 0.25;
   else if (dvpPct <= 0.25) multiplier -= 0.15;
   if (p.recentForm?.trend === 'hot')  multiplier += 0.20;
   if (p.recentForm?.trend === 'cold') multiplier -= 0.12;
@@ -2879,6 +2884,12 @@ function calcEdgeScore(p) {
   if (own < 1.5 && ceiling < 18)   score = Math.min(score, 22); // zero-own busts
   if ((p.injuryRisk  ||0) < -2)    score = Math.max(10, score - 8);
   if ((p.usagePenalty||0) < -5)    score = Math.max(10, score - 10);
+
+  // DvP matchup — use dvpLabel which is correctly computed for ALL positions
+  // dvpLabel.badge === 'bad matchup' = bottom 30% of defenses = hard cap
+  // dvpLabel.badge === 'tough matchup' = soft penalty
+  if (p.dvpLabel?.badge === 'bad matchup')   score = Math.min(score, 42);
+  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
 
   return Math.max(10, Math.min(99, score));
 }
