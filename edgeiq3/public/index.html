@@ -3291,6 +3291,61 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
   return lineup;
 }
 
+// Slate-relative position ceiling maxima
+let slatePosCeilMax = {};
+
+async function buildAndRender() {
+  setStatus('Building lineup...', 'var(--amber)');
+  await new Promise(r => setTimeout(r, 30));
+  try {
+    nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
+
+    const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
+      .sort((a,b) => b.edgeScore - a.edgeScore).slice(0, 80);
+    const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
+
+    // Pass 1: ceilings
+    players = players.map(p => {
+      p._mcFirstPlaceProb = mcProbs[p.name] || 0;
+      const mates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
+      p._ceiling = calcPlayerCeiling(p, mates);
+      return p;
+    });
+
+    // Build slate-relative position maxima
+    slatePosCeilMax = {};
+    players.filter(p => !p.isOut && p._ceiling > 0).forEach(p => {
+      const pos = p.pos || 'FLEX';
+      if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) slatePosCeilMax[pos] = p._ceiling;
+    });
+
+    // Pass 2: re-score
+    players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
+
+    lineup = optimize(players, sport);
+
+    const jsdScore = calcLineupJSDScore(lineup, players);
+    const valid   = lineup.filter(l => l.player);
+    const avgEdge = valid.length ? Math.round(valid.reduce((s,l) => s+l.player.edgeScore,0)/valid.length) : 0;
+    const avgOwn  = valid.length ? valid.reduce((s,l) => s+l.player.projOwn,0)/valid.length : 20;
+    const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
+    const dna     = analyzeLineupDNA(lineup, sport);
+    const contest = recommendContest(avgEdge);
+
+    fetchLatestNews(sport).catch(()=>{});
+    renderLineup(jsdScore, kelly, dna, contest);
+    renderStacks();
+    renderIntelLive();
+    if (currentScreen === 'signals') renderSignalDashboard();
+    setDot('ok');
+    setStatus('', '');
+  } catch(err) {
+    console.error('EdgeIQ error:', err);
+    setDot('error');
+    setStatus('Error building lineup — try uploading CSV again', 'var(--amber)');
+  }
+}
+
 function rebuildLineup() {
   // Slight variation for lineup diversity
   players = players.map(p => ({
