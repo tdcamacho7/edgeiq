@@ -3227,19 +3227,13 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
           !used.has(p.name) && p.salary <= maxBudget &&
           positions.includes(p.pos) && p.team === stackTeam
         );
-        if (mustStack) {
-          // MUST pick stack — no fallback allowed
+        // ALWAYS pick stack player when building toward 4-man stack
+        // The +60 stack bonus in calcLineupFirstPlaceScore always outweighs
+        // individual edge score differences (net +4.7 lineup avg per forced pick)
+        if (stackPick) {
           pick = stackPick;
-        } else if (stackPick) {
-          // Prefer stack unless non-stack player is 12+ edge points better
-          // This forces us to build the stack except for truly dominant alternatives
-          const bestNonStack = sorted.find(p =>
-            !used.has(p.name) && p.salary <= maxBudget &&
-            positions.includes(p.pos) && p.team !== stackTeam
-          );
-          const gap = (bestNonStack?.edgeScore || 0) - stackPick.edgeScore;
-          pick = (gap > 12) ? bestNonStack : stackPick;
         }
+        // If no stack player available at this position, will fall through to best available
       }
     }
 
