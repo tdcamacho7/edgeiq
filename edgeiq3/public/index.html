@@ -559,7 +559,7 @@ async function fetchSlate(){
       players = players.map(p => {
         const espnStatus = injuryMap[p.name.toLowerCase()] || injuryMap[p.name.toLowerCase().split(' ').pop()];
         if (!espnStatus) return p;
-        const isOut = p.isOut || ['out','ir','injured reserve'].includes(espnStatus.toLowerCase());
+        const isOut = p.isOut || ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes(espnStatus.toLowerCase().trim());
         if (isOut !== p.isOut) changed = true;
         return { ...p, status: espnStatus||p.status, isOut, edgeScore: isOut ? 0 : p.edgeScore };
       });
@@ -648,7 +648,7 @@ async function handleCsv(input){
       // Injury status from ESPN
       const espnStatus = injuryMap[p.name.toLowerCase()] ||
                          injuryMap[p.name.toLowerCase().split(' ').pop()];
-      const isOut = p.isOut || (espnStatus && ['out','ir','injured reserve','did not play'].includes(espnStatus.toLowerCase()));
+      const isOut = p.isOut || (espnStatus && ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes(espnStatus.toLowerCase().trim()));
 
       // Real ownership from scraped sources
       const fpOwnership = fuzzyMatchOwnership(p.name, ownershipData);
@@ -739,15 +739,21 @@ async function fetchESPNInjuries(sp) {
     for (const team of teams) {
       for (const injury of (team.injuries || [])) {
         const name = injury?.athlete?.displayName || injury?.athlete?.fullName || '';
-        const status = injury?.status || injury?.type?.description || '';
-        if (name) {
+        // Capture all possible status fields ESPN returns
+        const status = injury?.status || injury?.type?.description || 
+                        injury?.details?.type || injury?.longComment || '';
+        if (name && status) {
           map[name.toLowerCase()] = status;
           // Also index by last name for fuzzy matching
           const lastName = name.toLowerCase().split(' ').pop();
-          if (lastName.length > 3) map[lastName] = status;
+          if (lastName.length > 3 && !map[lastName]) map[lastName] = status;
+          // Also index first + last initial (e.g. "k stowers" for "kyle stowers")
+          const parts = name.toLowerCase().split(' ');
+          if (parts.length >= 2) map[`${parts[0][0]} ${parts[parts.length-1]}`] = status;
         }
       }
     }
+    // Also try ESPN scoreboard roster to catch IL players not in injuries endpoint
     return map;
   } catch(e) {
     return {};
@@ -777,7 +783,11 @@ function parseCsv(text){
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     const status=statusI>=0?v[statusI]||'':'';
-    const isOut=['out','o','ir','il','injured list','injured reserve'].includes(status.toLowerCase());
+    const statusLow = (status||'').toLowerCase().trim();
+    const isOut = ['out','o','ir','il','il10','il60','il-10','il-60','injured list',
+      'injured reserve','injured','inactive','na','sus','suspended',
+      'did not play','dnp','scratched','out indefinitely'
+    ].includes(statusLow) || statusLow.startsWith('il') || statusLow.includes('injured list');
     // Normalize DK MLB position strings
     let rawPos = (v[pi]||'').split('/')[0].toUpperCase().trim();
     // DK uses SP/RP for pitchers → normalize to P
@@ -2291,7 +2301,7 @@ function enrich(raw) {
 
     const biasCorrection = getBiasCorrection(p, history, sport);
     const status = p.status || '';
-    const isOut = p.isOut || ['out','ir','o','il','injured reserve','injured list'].includes(status.toLowerCase()); // DTD = still plays, just penalized
+    const isOut = p.isOut || ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes((status||'').toLowerCase().trim());
 
     // Combined flat boosts applied to projected points
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
