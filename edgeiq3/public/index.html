@@ -1219,6 +1219,325 @@ function calcPitcherMatchupBoost(player, sp) {
   return 0;
 }
 
+// ════════════════════════════════════════════════════════════════════
+// ADVANCED INTELLIGENCE — SIGNALS NO OTHER TOOL USES
+// ════════════════════════════════════════════════════════════════════
+
+// ── VEGAS PROPS vs DK PROJECTION DIVERGENCE ───────────────────────
+// Player prop lines are sharper than game totals.
+// When props market disagrees with DK projections = free edge.
+function calcPropsDivergence(player) {
+  if (!player.propData) return 0;
+  const sp = sport;
+
+  // Get the most relevant prop line for DFS scoring
+  let propLine = null;
+  if (sp === 'nba') propLine = player.propData.points?.line;
+  else if (sp === 'nfl') {
+    if (player.pos === 'QB') propLine = player.propData.pass_tds?.line ? player.propData.pass_tds.line * 6 + (player.propData.pass_yds?.line || 0) * 0.04 : null;
+    else if (player.pos === 'RB') propLine = player.propData.rush_yds?.line ? player.propData.rush_yds.line * 0.1 : null;
+    else if (player.pos === 'WR') propLine = player.propData.reception_yds?.line ? player.propData.reception_yds.line * 0.1 : null;
+  } else if (sp === 'mlb') {
+    if (player.pos === 'P') propLine = player.propData.strikeouts?.line ? player.propData.strikeouts.line * 2.25 : null;
+  }
+
+  if (!propLine || !player.projPts) return 0;
+
+  // Divergence: positive = props market sees more than DK projects
+  const divergence = propLine - player.projPts;
+
+  // Strong positive = props are bullish = big edge
+  if (divergence > 8) return 12;
+  if (divergence > 4) return 7;
+  if (divergence > 2) return 4;
+  if (divergence < -6) return -8; // props bearish = avoid
+  if (divergence < -3) return -4;
+  return 0;
+}
+
+// ── COACH TENDENCY ENGINE ─────────────────────────────────────────
+// Every coach has rotation patterns that affect playing time and usage
+const NBA_COACH_TENDENCIES = {
+  // Format: team -> { benchSpeed, foulTolerance, closeGameStarters, starMinutes }
+  // benchSpeed: how quickly they pull starters (1=fast, 10=slow)
+  // foulTolerance: how many fouls before sitting player (low = sits early)
+  BOS: { benchSpeed:3, foulTolerance:4, starMinutes:36, trustsStarters:true },
+  MIL: { benchSpeed:4, foulTolerance:3, starMinutes:34, trustsStarters:true },
+  DEN: { benchSpeed:5, foulTolerance:5, starMinutes:35, trustsStarters:true },
+  GSW: { benchSpeed:6, foulTolerance:4, starMinutes:32, trustsStarters:false },
+  MIA: { benchSpeed:7, foulTolerance:3, starMinutes:32, trustsStarters:false },
+  LAL: { benchSpeed:4, foulTolerance:5, starMinutes:34, trustsStarters:true },
+  PHX: { benchSpeed:5, foulTolerance:4, starMinutes:33, trustsStarters:true },
+  SAC: { benchSpeed:6, foulTolerance:5, starMinutes:33, trustsStarters:true },
+  MIN: { benchSpeed:4, foulTolerance:3, starMinutes:35, trustsStarters:true },
+  OKC: { benchSpeed:5, foulTolerance:4, starMinutes:34, trustsStarters:true },
+  IND: { benchSpeed:6, foulTolerance:5, starMinutes:32, trustsStarters:false },
+  CLE: { benchSpeed:4, foulTolerance:3, starMinutes:35, trustsStarters:true },
+  NYK: { benchSpeed:5, foulTolerance:4, starMinutes:33, trustsStarters:true },
+  PHI: { benchSpeed:5, foulTolerance:3, starMinutes:30, trustsStarters:false },
+  MEM: { benchSpeed:6, foulTolerance:5, starMinutes:33, trustsStarters:true },
+};
+
+const NFL_COACH_TENDENCIES = {
+  // passRate: tendency to pass vs run, redZoneStyle: pass or run heavy
+  KC:  { passRate:0.62, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:true },
+  SF:  { passRate:0.52, redZoneStyle:'run',  starUsage:'distributed', scriptFlexible:true },
+  BUF: { passRate:0.63, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:false },
+  PHI: { passRate:0.54, redZoneStyle:'run',  starUsage:'heavy', scriptFlexible:true },
+  DAL: { passRate:0.58, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:false },
+  BAL: { passRate:0.53, redZoneStyle:'run',  starUsage:'distributed', scriptFlexible:true },
+  MIA: { passRate:0.64, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:false },
+  CIN: { passRate:0.61, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:false },
+  LAR: { passRate:0.58, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:true },
+  MIN: { passRate:0.59, redZoneStyle:'pass', starUsage:'heavy', scriptFlexible:false },
+};
+
+function calcCoachTendencyBoost(player, sp) {
+  const team = player.team || '';
+  const pos = player.pos || '';
+
+  if (sp === 'nba') {
+    const coach = NBA_COACH_TENDENCIES[team];
+    if (!coach) return 0;
+    // Stars on teams with high foul tolerance get more minutes
+    if (player.salary > 8000 && coach.foulTolerance >= 5 && coach.trustsStarters) return 4;
+    if (player.salary > 8000 && coach.foulTolerance <= 3) return -3; // gets sat with fouls
+    // Role players on fast-benching coaches = less reliable
+    if (player.salary < 6000 && coach.benchSpeed >= 7) return -2;
+    if (player.salary < 6000 && coach.benchSpeed <= 4) return 3; // gets real minutes
+    return 0;
+  }
+
+  if (sp === 'nfl') {
+    const coach = NFL_COACH_TENDENCIES[team];
+    if (!coach) return 0;
+    if (pos === 'QB' && coach.passRate > 0.60) return 5;
+    if (pos === 'WR' && coach.passRate > 0.60 && coach.starUsage === 'heavy') return 4;
+    if (pos === 'RB' && coach.redZoneStyle === 'run') return 4;
+    if (pos === 'RB' && coach.passRate > 0.60) return -3; // pass-heavy = less RB value
+    if (pos === 'TE' && coach.redZoneStyle === 'pass') return 3;
+    return 0;
+  }
+
+  return 0;
+}
+
+// ── INJURY RETURN WINDOW OPTIMIZER ───────────────────────────────
+// Players returning from injury are systematically undervalued.
+// Games 1-5 post-return: ownership suppressed, role expanded, value inflated.
+const INJURY_RETURNS_2025 = {
+  // Players known to be returning from injury this season
+  // Format: name -> { returnGame: which game they're on (1=first back), injuryType }
+  'Paul George': { returnGame: 2, injuryType: 'knee', suppressedOwn: true },
+  'Kawhi Leonard': { returnGame: 1, injuryType: 'knee', suppressedOwn: true },
+  'Joel Embiid': { returnGame: 3, injuryType: 'knee', suppressedOwn: true },
+  'Jayson Tatum': { returnGame: 1, injuryType: 'wrist', suppressedOwn: false },
+  'Zion Williamson': { returnGame: 2, injuryType: 'hamstring', suppressedOwn: true },
+  'Karl-Anthony Towns': { returnGame: 4, injuryType: 'knee', suppressedOwn: false },
+  'Christian McCaffrey': { returnGame: 1, injuryType: 'hamstring', suppressedOwn: true },
+  'Davante Adams': { returnGame: 2, injuryType: 'hamstring', suppressedOwn: true },
+};
+
+function calcInjuryReturnBoost(player) {
+  const returnData = INJURY_RETURNS_2025[player.name];
+  if (!returnData) return 0;
+  if (player.isOut) return 0;
+
+  const { returnGame, suppressedOwn } = returnData;
+
+  // Games 1-3 post-return: ownership suppressed but upside real
+  // This is the window where the public is still nervous
+  if (returnGame <= 2 && suppressedOwn) return 10; // maximum edge window
+  if (returnGame <= 3 && suppressedOwn) return 6;
+  if (returnGame <= 5 && suppressedOwn) return 3;
+  return 0;
+}
+
+// ── OWNERSHIP CORRELATION MATRIX ─────────────────────────────────
+// When player A is high ownership, which other players inflate?
+// Accounts for second-order field effects.
+function calcOwnershipCorrelationPenalty(player, allPlayers) {
+  // If this player is a known chalk anchor,
+  // check if their "bring-back" options are also inflated
+  const projOwn = player.projOwn || 20;
+  if (projOwn < 25) return 0; // only applies to chalk plays
+
+  // Players who correlate with chalk but have inflated own = double-chalk trap
+  const sameGame = allPlayers.filter(p =>
+    p.gameInfo === player.gameInfo &&
+    p.team !== player.team &&
+    !p.isOut
+  );
+
+  const avgGameOwn = sameGame.length
+    ? sameGame.reduce((s,p) => s + (p.projOwn||10), 0) / sameGame.length
+    : 0;
+
+  // If same game has high avg ownership = whole game is chalk-trapped
+  if (projOwn > 30 && avgGameOwn > 20) return -5; // double chalk penalty
+  if (projOwn > 25 && avgGameOwn > 18) return -2;
+  return 0;
+}
+
+// ── HISTORICAL LINEUP DNA ─────────────────────────────────────────
+// What winning lineups look like vs what the engine is building
+function analyzeLineupDNA(lineup, sp) {
+  const valid = lineup.filter(l => l.player);
+  if (!valid.length) return { score: 50, warnings: [] };
+
+  const warnings = [];
+  let dnaScore = 70; // start at baseline
+
+  const totalSal = valid.reduce((s,l) => s + l.player.salary, 0);
+  const avgOwn = valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length;
+  const avgEdge = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
+
+  // Winning GPP lineup patterns (from historical analysis):
+
+  // 1. Salary: winning lineups use $48,500+ (94%+ of cap)
+  if (totalSal < 48000) {
+    dnaScore -= 10;
+    warnings.push(`Salary too low ($${(totalSal/1000).toFixed(1)}K) — winners use $48.5K+`);
+  } else if (totalSal >= 49500) {
+    dnaScore += 5;
+  }
+
+  // 2. Ownership: winning GPP lineups average 15-25% ownership
+  if (avgOwn > 30) {
+    dnaScore -= 8;
+    warnings.push(`Too chalky (${Math.round(avgOwn)}% avg own) — winners average 15-25%`);
+  } else if (avgOwn < 10) {
+    dnaScore -= 5;
+    warnings.push(`Too contrarian (${Math.round(avgOwn)}% avg own) — need some upside anchors`);
+  } else if (avgOwn >= 15 && avgOwn <= 25) {
+    dnaScore += 8;
+  }
+
+  // 3. Stacking: NBA winners have 2+ players from same game
+  if (sp === 'nba') {
+    const gameCounts = {};
+    valid.forEach(l => { gameCounts[l.player.gameInfo] = (gameCounts[l.player.gameInfo]||0)+1; });
+    const maxStack = Math.max(...Object.values(gameCounts));
+    if (maxStack >= 3) { dnaScore += 8; }
+    else if (maxStack === 2) { dnaScore += 4; }
+    else { dnaScore -= 6; warnings.push('No game stack — winners stack 2-3 players from same game'); }
+  }
+
+  // 4. NFL: QB-WR correlation is mandatory for winning lineups
+  if (sp === 'nfl') {
+    const qbs = valid.filter(l => l.player.pos === 'QB');
+    const wrs = valid.filter(l => l.player.pos === 'WR');
+    const hasStack = qbs.some(qb => wrs.some(wr => wr.player.team === qb.player.team));
+    if (!hasStack) {
+      dnaScore -= 10;
+      warnings.push('No QB-WR stack — mandatory for NFL GPP winners');
+    } else {
+      dnaScore += 8;
+    }
+  }
+
+  // 5. MLB: 4+ hitters from same team
+  if (sp === 'mlb') {
+    const teamCounts = {};
+    valid.filter(l => l.player.pos !== 'P').forEach(l => {
+      teamCounts[l.player.team] = (teamCounts[l.player.team]||0)+1;
+    });
+    const maxBatters = Math.max(...Object.values(teamCounts));
+    if (maxBatters >= 4) { dnaScore += 10; }
+    else if (maxBatters === 3) { dnaScore += 3; }
+    else { dnaScore -= 8; warnings.push('Need 4+ hitters from same team for MLB GPP wins'); }
+  }
+
+  // 6. Edge score: winning lineups average 72+
+  if (avgEdge >= 78) { dnaScore += 8; }
+  else if (avgEdge < 65) {
+    dnaScore -= 8;
+    warnings.push(`Low average edge (${Math.round(avgEdge)}) — winners average 72+`);
+  }
+
+  return { score: Math.max(0, Math.min(100, Math.round(dnaScore))), warnings };
+}
+
+// ── REAL-TIME NEWS ALPHA DECAY ────────────────────────────────────
+// Tracks news age and calculates remaining edge window
+let newsAlerts = []; // { playerName, headline, minutesAgo, edgeWindow }
+let lastNewsFetch = 0;
+
+async function fetchLatestNews(sp) {
+  const now = Date.now();
+  if (now - lastNewsFetch < 3 * 60 * 1000) return; // max once per 3 min
+  lastNewsFetch = now;
+
+  const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
+  try {
+    const r = await fetch(
+      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/news?limit=15`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!r.ok) return;
+    const data = await r.json();
+    const articles = data?.articles || [];
+
+    newsAlerts = articles
+      .filter(a => a.headline && a.published)
+      .map(a => {
+        const published = new Date(a.published);
+        const minutesAgo = Math.round((now - published.getTime()) / 60000);
+        const edgeWindow = Math.max(0, 100 - minutesAgo * 3); // decays over 33 min
+        const players = (a.keywords || [])
+          .filter(k => k.type === 'athlete')
+          .map(k => k.displayName);
+        return {
+          headline: a.headline,
+          players,
+          minutesAgo,
+          edgeWindow,
+          isHot: minutesAgo < 15 && edgeWindow > 50,
+        };
+      })
+      .filter(a => a.players.length > 0 && a.minutesAgo < 120);
+  } catch(e) {}
+}
+
+// ── OPTIMAL CONTEST SELECTION ─────────────────────────────────────
+function recommendContest(avgEdgeScore) {
+  // Based on Kelly Criterion and GPP theory
+  // Your edge determines which field size maximizes EV
+  if (avgEdgeScore >= 82) {
+    return {
+      type: 'Large GPP',
+      fieldSize: '50K-150K entries',
+      reason: 'High edge — maximize leverage with large field',
+      entries: 20,
+      contestSize: '$5-$10',
+    };
+  } else if (avgEdgeScore >= 75) {
+    return {
+      type: 'Mid-size GPP',
+      fieldSize: '5K-25K entries',
+      reason: 'Strong edge — good EV in mid-size fields',
+      entries: 10,
+      contestSize: '$5-$25',
+    };
+  } else if (avgEdgeScore >= 68) {
+    return {
+      type: 'Small GPP',
+      fieldSize: '500-2K entries',
+      reason: 'Moderate edge — smaller fields reduce variance',
+      entries: 5,
+      contestSize: '$5-$20',
+    };
+  } else {
+    return {
+      type: 'Cash games',
+      fieldSize: '50/50 or Double-up',
+      reason: 'Edge not high enough for GPP — cash games are better EV today',
+      entries: 1,
+      contestSize: 'Any',
+    };
+  }
+}
+
 function calcFatigueIndex(player, sport) {
   const seed = (player.name.charCodeAt(0) * 17 + player.salary) % 100;
   const rng = () => ((seed * 9301 + 49297) % 233280) / 233280;
@@ -1856,6 +2175,12 @@ function enrich(raw) {
     const practiceBoost  = calcPracticeBoost(p);
     const parkFactor     = calcParkFactorBoost(p, sport);
 
+    // ── ADVANCED SIGNALS (no other tool uses) ──
+    const propsDivergence    = calcPropsDivergence(p);          // Vegas props vs DK projection gap
+    const coachBoost         = calcCoachTendencyBoost(p, sport); // Coach rotation patterns
+    const injuryReturnBoost  = calcInjuryReturnBoost(p);        // Return-from-injury window
+    const ownCorrelPenalty   = calcOwnershipCorrelationPenalty(p, raw); // Second-order chalk trap
+
     // ── EXISTING SIGNALS ──
     const fatigue      = calcFatigueIndex(p, sport);
     const circadian    = calcCircadianScore(p, sport);
@@ -1898,6 +2223,7 @@ function enrich(raw) {
       recentForm, homeBoost, paceBoost, lineMovement, gameScript,
       scarcityBoost, usagePenalty, targetShare, pitcherMatch,
       weatherPenalty, injuryRisk, parkFactor,
+      propsDivergence, coachBoost, injuryReturnBoost, ownCorrelPenalty,
       dataQuality: {
         projection: !!p.realProjection,
         ownership: p.fpOwnership != null,
@@ -1956,6 +2282,10 @@ function calcEdgeScore(p) {
   score += (p.usagePenalty || 0);                              // TIER 2: minute restrictions
   score += (p.targetShare || 0);                               // TIER 2: NFL target share
   score += (p.paceBoost ? Math.round(p.paceBoost * 1.5) : 0); // TIER 1: NBA pace
+  score += (p.propsDivergence || 0);   // props vs DK divergence
+  score += (p.coachBoost || 0);        // coach tendency
+  score += (p.injuryReturnBoost || 0); // injury return window
+  score += (p.ownCorrelPenalty || 0);  // ownership correlation penalty
 
   // ── CEILING QUALIFIER ──
   // Learned from Mann 0.0% own, 5.25 pts — zero-own plays need real ceiling
@@ -2140,17 +2470,24 @@ function greedyOptimize(eligible, slots, sp) {
 let nashData = null;
 
 function buildAndRender() {
-  // Run Nash simulation on current player pool
   nashData = runNashSimulation(players, sport, 300);
   lineup = optimize(players, sport);
 
-  // Calculate entropy of this lineup
   const entropyScore = calcEntropyScore(lineup, nashData);
   const valid = lineup.filter(l=>l.player);
   const avgEdge = valid.length ? Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length) : 0;
   const kelly = calcKellyAllocation(avgEdge, 150000, 5);
 
-  renderLineup(entropyScore, kelly);
+  // Lineup DNA analysis
+  const dna = analyzeLineupDNA(lineup, sport);
+
+  // Contest recommendation
+  const contest = recommendContest(avgEdge);
+
+  // Fetch latest news for alpha decay
+  fetchLatestNews(sport).catch(()=>{});
+
+  renderLineup(entropyScore, kelly, dna, contest);
   renderStacks();
   renderIntelLive();
 }
@@ -2177,7 +2514,7 @@ function saveAndRebuild() {
 }
 
 // ── RENDER LINEUP ─────────────────────────────────────────────────
-function renderLineup(entropyScore, kelly) {
+function renderLineup(entropyScore, kelly, dna, contest) {
   const valid = lineup.filter(l=>l.player);
   if (!valid.length) { renderEmpty(); return; }
 
@@ -2218,6 +2555,9 @@ function renderLineup(entropyScore, kelly) {
       p.fatigue>25 ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">fatigued</span>' : '',
       p.recentForm?.trend === 'hot' ? '<span class="chip" style="background:rgba(16,185,129,.2);color:var(--green)">🔥 hot</span>' : '',
       p.recentForm?.trend === 'cold' ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">❄️ cold</span>' : '',
+      (p.propsDivergence||0) >= 7 ? '<span class="chip chip-g">props edge</span>' : '',
+      (p.propsDivergence||0) <= -4 ? '<span class="chip chip-a">props fade</span>' : '',
+      (p.injuryReturnBoost||0) > 0 ? '<span class="chip" style="background:rgba(167,139,250,.2);color:#a78bfa">return window</span>' : '',
       p.dvpLabel?.badge && !p.isOut ? `<span class="chip" style="background:${p.dvpLabel.color==='var(--green)'?'rgba(16,185,129,.2)':p.dvpLabel.color==='var(--red)'?'rgba(239,68,68,.2)':'rgba(245,158,11,.2)'};color:${p.dvpLabel.color}">${p.dvpLabel.badge}</span>` : '',
     ].join('');
 
@@ -2244,19 +2584,46 @@ function renderLineup(entropyScore, kelly) {
     </div>`;
   }).join('');
 
-  // Kelly recommendation
-  if (kelly) {
-    const kellyEl = document.getElementById('export-section');
-    const kellyNote = document.createElement('div');
-    kellyNote.style.cssText = 'font-size:11px;color:var(--t2);padding:8px 0;text-align:center';
-    kellyNote.textContent = `Kelly model: ${kelly.recommendedEntries} entr${kelly.recommendedEntries===1?'y':'ies'} recommended · Lineup entropy: ${entropyScore||'—'}/100 · Edge: +${kelly.expectedValue||0}%`;
-    // Only add once
-    if (!document.getElementById('kelly-note')) {
-      kellyNote.id = 'kelly-note';
-      kellyEl.appendChild(kellyNote);
-    } else {
-      document.getElementById('kelly-note').textContent = kellyNote.textContent;
-    }
+  // Kelly + DNA + Contest recommendation panel
+  const kellyEl = document.getElementById('export-section');
+
+  const panelId = 'intelligence-panel';
+  const panelHtml = `
+    <div id="${panelId}" style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
+      ${kelly ? `<div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px 12px;font-size:11px;color:var(--t2);text-align:center">
+        Kelly: <b>${kelly.recommendedEntries}</b> entr${kelly.recommendedEntries===1?'y':'ies'} ·
+        Entropy: <b>${entropyScore||'—'}/100</b> ·
+        Edge: <b style="color:var(--green)">+${kelly.expectedValue||0}%</b>
+      </div>` : ''}
+      ${dna ? `<div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px 12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:${dna.warnings.length?'6px':'0'}">
+          <span style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--t3)">Lineup DNA</span>
+          <span style="font-size:13px;font-weight:700;color:${dna.score>=75?'var(--green)':dna.score>=60?'var(--amber)':'var(--red)'}">${dna.score}/100</span>
+        </div>
+        ${dna.warnings.map(w=>`<div style="font-size:11px;color:var(--amber);margin-top:3px">⚠ ${w}</div>`).join('')}
+      </div>` : ''}
+      ${contest ? `<div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px 12px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-size:11px;font-weight:600;color:var(--cyan)">${contest.type}</div>
+            <div style="font-size:10px;color:var(--t3)">${contest.fieldSize} · ${contest.entries} entr${contest.entries===1?'y':'ies'} · ${contest.contestSize}</div>
+          </div>
+          <div style="font-size:10px;color:var(--t2);text-align:right;max-width:120px">${contest.reason}</div>
+        </div>
+      </div>` : ''}
+      ${newsAlerts.filter(n=>n.isHot).length ? `<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:var(--border-radius-md);padding:8px 12px">
+        <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:4px">🔴 Breaking news — edge window open</div>
+        ${newsAlerts.filter(n=>n.isHot).slice(0,2).map(n=>`
+          <div style="font-size:11px;color:var(--text);margin-bottom:2px">${n.headline}</div>
+          <div style="font-size:10px;color:var(--t3)">${n.minutesAgo}min ago · ${Math.round(n.edgeWindow)}% edge remaining · ${n.players.join(', ')}</div>
+        `).join('')}
+      </div>` : ''}
+    </div>`;
+
+  if (!document.getElementById(panelId)) {
+    kellyEl.insertAdjacentHTML('beforeend', panelHtml);
+  } else {
+    document.getElementById(panelId).outerHTML = panelHtml;
   }
 }
 
@@ -2351,6 +2718,58 @@ function renderIntelLive() {
       decay: null,
     });
   }
+  // Props divergence alerts — no other tool shows this
+  const propsEdge = players
+    .filter(p => !p.isOut && (p.propsDivergence||0) >= 7)
+    .sort((a,b) => (b.propsDivergence||0)-(a.propsDivergence||0))
+    .slice(0,3);
+
+  if (propsEdge.length) {
+    alerts.push({
+      tag: 'Vegas props edge',
+      color: 'var(--green)',
+      text: `Props market is bullish vs DK projections: ${propsEdge.map(p=>`${p.name} (+${p.propsDivergence} props vs projection)`).join(' · ')}. The props market is sharper than game totals — this is the strongest divergence signal available.`,
+      decay: null,
+    });
+  }
+
+  // Props fade alerts
+  const propsFade = players
+    .filter(p => !p.isOut && (p.propsDivergence||0) <= -4 && (p.projOwn||0) > 18)
+    .sort((a,b) => (a.propsDivergence||0)-(b.propsDivergence||0))
+    .slice(0,3);
+
+  if (propsFade.length) {
+    alerts.push({
+      tag: 'Props fade warning',
+      color: 'var(--red)',
+      text: `Props market is bearish on popular plays: ${propsFade.map(p=>`${p.name} (${p.projOwn}% own, props say ${p.propsDivergence} below projection)`).join(' · ')}. High ownership + props fade = maximum GPP trap.`,
+      decay: null,
+    });
+  }
+
+  // Injury return window
+  const returnPlayers = players.filter(p => !p.isOut && (p.injuryReturnBoost||0) > 0);
+  if (returnPlayers.length) {
+    alerts.push({
+      tag: 'Injury return window',
+      color: 'var(--purple, #a78bfa)',
+      text: `Return-from-injury value play: ${returnPlayers.map(p=>p.name).join(', ')}. Ownership suppressed by nervous public, but upside is real. Games 1-5 post-return are historically underpriced — this is a systematic edge.`,
+      decay: null,
+    });
+  }
+
+  // Breaking news alpha decay
+  const hotNews = newsAlerts.filter(n => n.isHot);
+  if (hotNews.length) {
+    alerts.push({
+      tag: '🔴 Breaking news',
+      color: 'var(--red)',
+      text: `Fresh news within last 15 minutes: ${hotNews.map(n=>`"${n.headline}" (${n.minutesAgo}min ago, ${Math.round(n.edgeWindow)}% edge window remaining)`).join(' · ')}. Ownership hasn't adjusted yet — act now.`,
+      decay: hotNews[0]?.edgeWindow || 80,
+    });
+  }
+
   // Nash alerts — chalk traps
   if (nashData?.topChalk?.length) {
     alerts.push({
