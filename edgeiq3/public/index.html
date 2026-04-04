@@ -474,6 +474,7 @@ input,button{font-family:var(--ui)}
 let sport = 'nfl';
 let players = [];
 let lineup = [];
+let excludedPlayers = new Set(); // player names manually excluded by user
 let currentScreen = 'lineup';
 
 const CAP = 50000;
@@ -3397,6 +3398,25 @@ function saveAndRebuild() {
   saveHistory();
   rebuildLineup();
   setStatus('Lineup saved · rebuilding with variation', 'var(--green)');
+}
+
+function excludePlayer(name) {
+  excludedPlayers.add(name.toLowerCase());
+  // Mark as out and rebuild
+  players = players.map(p => {
+    if (p.name.toLowerCase() === name.toLowerCase()) {
+      return { ...p, isOut: true, edgeScore: 0, status: 'Excluded' };
+    }
+    return p;
+  });
+  buildAndRender();
+  setStatus(`Excluded ${name} — rebuilding lineup`, 'var(--amber)');
+}
+
+function clearExclusions() {
+  excludedPlayers.clear();
+  // Reload from last build
+  setStatus('Exclusions cleared — re-upload CSV to restore all players', 'var(--cyan)');
 }
 
 // ── RENDER LINEUP ─────────────────────────────────────────────────
