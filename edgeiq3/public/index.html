@@ -649,17 +649,9 @@ async function handleCsv(input){
       safeFetch(() => fetchVegasFromProxy(sport)),
     ]);
 
-    // For MLB: fetch official active rosters to catch IL players missed by CSV/ESPN
-    // Hard 3s timeout — if API is slow or CORS-blocked, skip gracefully
-    let mlbActiveRosters = null;
-    if (sport === 'mlb') {
-      const teams = [...new Set(raw.map(p => p.teamAbbrev || p.team).filter(Boolean))];
-      setStatus(`${raw.length} players found · checking rosters...`, 'var(--amber)');
-      mlbActiveRosters = await Promise.race([
-        fetchMLBActiveRosters(teams),
-        new Promise(res => setTimeout(() => res(null), 3000)) // 3s max total
-      ]).catch(() => null);
-    }
+    // Active roster check removed — was causing hangs
+    // IL detection uses: ESPN injuries API + CSV status field + 🚫 ban button
+    const mlbActiveRosters = null;
 
     // Apply all data to players
     const withData = raw.map(p => {
@@ -2361,7 +2353,8 @@ function enrich(raw) {
 
     // Combined flat boosts applied to projected points
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
-                      weatherPenalty + injuryRisk + practiceBoost + pitcherMatch;
+                      weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
+                      Math.round(coachBoost * 0.4); // 40% of coach signal into proj pts
     const adjProjPts = Math.max(0, Math.round((projPts + flatBoost) * 10) / 10);
 
     const enriched = {
@@ -2835,6 +2828,27 @@ function calcPlayerCeiling(p, teammates = []) {
   else if (gt > 225) multiplier += 0.08;
   else if (gt < 210) multiplier -= 0.10;
   if (p.paceBoost > 2) multiplier += 0.12;
+
+  // Game script: favorite pitcher gets ceiling boost
+  const gs = p.gameScript || 0;
+  if (gs > 0) multiplier += gs * 0.015;
+  else if (gs < 0) multiplier += gs * 0.015; // negative gs = negative mod
+
+  // Game total: high over/under = more scoring variance = higher ceiling
+  const gt2 = p.gameTotalBoost || 0;
+  if (gt2 > 0) multiplier += gt2 * 0.008;
+  else if (gt2 < 0) multiplier += gt2 * 0.008;
+
+  // Circadian: road teams on late starts are fatigued
+  const circ = p.circadian || 0;
+  if (circ < -3) multiplier -= 0.08; // late game fatigue penalty
+  else if (circ > 3) multiplier += 0.05; // rested home team boost
+
+  // Coach tendency: usage patterns affect ceiling
+  const coach = p.coachBoost || 0;
+  if (coach > 3) multiplier += 0.06;
+  else if (coach < -3) multiplier -= 0.06;
+
   const pd = p.propsDivergence || 0;
   if (pd >= 7) multiplier += 0.15;
   else if (pd >= 4) multiplier += 0.08;
@@ -2843,8 +2857,7 @@ function calcPlayerCeiling(p, teammates = []) {
   if ((p.injuryReturnBoost || 0) > 0) multiplier += 0.10;
   if (p.fatigue > 25) multiplier -= 0.12;
   if (p.fatigue > 35) multiplier -= 0.08;
-  const gs = p.gameScript || 0;
-  multiplier += gs * 0.03;
+  // gameScript now handled earlier in multiplier block
   if ((p.lineMovement || 0) > 0) multiplier += 0.06;
   if ((p.refBoost || 0) >= 8) multiplier += 0.08;
   // parkFactor applied as flat projPts boost in enrich() — don't double-count in ceiling
@@ -2972,6 +2985,19 @@ function calcEdgeScore(p) {
 
   let score = Math.min(99, Math.round(rawScore + mcBoost));
 
+  // ── DEAD SIGNAL RECOVERY ──────────────────────────────────────────
+  // Bias correction: historical engine error → adjust forward
+  const bias = p.biasCorrection || 0;
+  if (Math.abs(bias) > 2) score = Math.max(10, Math.min(99, score + Math.round(bias * 0.5)));
+
+  // Positional scarcity: scarce positions worth more in optimizer
+  const scarcity = p.scarcityBoost || 0;
+  if (scarcity > 0) score = Math.min(99, score + Math.round(scarcity * 0.6));
+
+  // Ownership correlation penalty: chalk in chalk game = trap
+  const ownCorrel = p.ownCorrelPenalty || 0;
+  if (ownCorrel < -2) score = Math.max(10, score + ownCorrel);
+
   // Hard disqualifiers — players who simply cannot win first place
   const minCeil = pos === 'P' ? 15 : 8;
   if (ceiling < minCeil)            score = Math.min(score, 28); // dead weight
@@ -3033,7 +3059,6 @@ function optimize(all, sp) {
       }).sort((a,b)=>b[1]-a[1]);
     const stackTeam = teamRankings[0]?.[0] || null;
 
-    // ── TRY TOP PITCHER PAIRS ─────────────────────────────────────
     let bestMLBScore = -1, bestMLBLineup = null;
     const topPitchers = pitchers.slice(0, 8);
 
@@ -3043,10 +3068,43 @@ function optimize(all, sp) {
         const remainingBudget = CAP - p1.salary - p2.salary;
         if (remainingBudget < hitterSlots.length * 2500) continue;
 
+        // Find opponents of these pitchers — their hitters CANNOT be our stack
+        // (stacking hitters against your own pitcher suppresses their ceiling)
+        const pitcherOpponents = new Set();
+        [p1, p2].forEach(pitcher => {
+          // pitcher.opp = "vs CIN" or "@ CIN" — extract team abbr
+          const oppTeam = (pitcher.opp || '').replace(/^(vs |@ )/,'').trim().split(' ')[0];
+          if (oppTeam) pitcherOpponents.add(oppTeam);
+          // Also block pitcher's own team from being stacked (no self-stack)
+          if (pitcher.team) pitcherOpponents.add(pitcher.team + '_PITCHER');
+        });
+
+        // Re-rank stack teams excluding pitcher opponents
+        const validTeamRankings = Object.entries(teamData)
+          .filter(([team, t]) => !pitcherOpponents.has(team) && t.players.length >= 3)
+          .map(([team, t]) => {
+            const top4avg = t.players.sort((a,b)=>b.edgeScore-a.edgeScore)
+              .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, t.players.length);
+            const coverage = Math.min(1.3, 1 + t.positions.size * 0.05);
+            return [team, top4avg * coverage];
+          }).sort((a,b)=>b[1]-a[1]);
+        const stackTeam = validTeamRankings[0]?.[0] || null;
+
+        // ── BRING-BACK MINI-STACK ─────────────────────────────────────
+        // Add 1 hitter from pitcher's OPPONENT team to exploit game correlation.
+        // When our pitcher is great, the game goes fast and both offenses run.
+        // The best bring-back target: highest-edge hitter from opp team who ISN'T stacked.
+        const bringBackTeam = pitcherOpponents.has(p1.opp?.replace(/^(vs |@ )/,'').trim())
+          ? p1.opp?.replace(/^(vs |@ )/,'').trim()
+          : p2.opp?.replace(/^(vs |@ )/,'').trim();
+        const bringBackCandidate = hitters
+          .filter(h => h.team === bringBackTeam && !pitcherOpponents.has(h.team + '_PITCHER'))
+          .sort((a,b) => b.edgeScore - a.edgeScore)[0] || null;
+
         const usedPitchers = new Set([p1.name, p2.name]);
         const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
 
-        const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam);
+        const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
 
         const fullLineup = [
@@ -3268,7 +3326,7 @@ function optimize(all, sp) {
 }
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
-function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
+function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringBackCandidate = null) {
   const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
   const used   = new Set();
   let salLeft  = budget;
@@ -3335,6 +3393,18 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
       }
     }
 
+    // Bring-back placement: try bring-back candidate in an eligible slot
+    // Only after stack is complete (stackCount >= 4) and only in OF/FLEX slots
+    if (!pick && bringBackCandidate && !used.has(bringBackCandidate.name)) {
+      const stackDone = stackCount >= 4 || (needStack && !wantStack);
+      const isBringBackSlot = ['OF','FLEX','UTIL'].includes(slot);
+      if (stackDone && isBringBackSlot && positions.includes(bringBackCandidate.pos)
+          && bringBackCandidate.salary <= maxBudget
+          && bringBackCandidate.edgeScore >= 75) {
+        pick = bringBackCandidate;
+      }
+    }
+
     // Best available fallback
     if (!pick) {
       pick = sorted.find(p =>
@@ -3380,9 +3450,14 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
     );
 
     if (upgrade) {
-      salLeft += cur.salary - upgrade.salary;
-      used.delete(cur.name); used.add(upgrade.name);
-      lineup[i] = { slot, player: upgrade };
+      // Never swap a stack player for a non-stack player
+      const curInStack = cur.team === presetStackTeam && slot !== 'P';
+      const upgrInStack = upgrade.team === presetStackTeam;
+      if (!curInStack || upgrInStack) {
+        salLeft += cur.salary - upgrade.salary;
+        used.delete(cur.name); used.add(upgrade.name);
+        lineup[i] = { slot, player: upgrade };
+      }
     }
   }
 
