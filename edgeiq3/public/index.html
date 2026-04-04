@@ -2703,7 +2703,7 @@ function multivariateKelly(avgEdge, avgOwnership, correlation, bankroll = 100, e
   const fraction = Math.min(0.25, Math.max(0, kellyFraction));
   const entries  = Math.max(1, Math.min(25, Math.round(bankroll * fraction / entryFee)));
 
-  return { fraction: Math.round(fraction * 1000) / 10, entries };
+  return { fraction: Math.round(fraction * 1000) / 10, entries, recommendedEntries: entries, expectedValue: Math.round(edge * 100) };
 }
 
 // ── COMPLETE PLAYER SCORING — ALL MATH INTEGRATED ─────────────────
@@ -2903,65 +2903,62 @@ function optimize(all, sp) {
   const slots = SLOTS[sp];
   const eligible = all.filter(p => !p.isOut && p.edgeScore > 0);
 
-  // ── MLB: PRE-SELECT PITCHERS ──────────────────────────────────────
-  // Pitchers are mandatory and high-salary. Select best 2 SPs first,
-  // then fill remaining slots with hitters from remaining budget.
+  // ── MLB: TWO-PHASE OPTIMIZER ─────────────────────────────────────
+  // Phase 1: Independently find best 2 pitchers
+  // Phase 2: Find best 4-man HITTER stack (different from pitcher team)
+  //
+  // Pitcher team ≠ stack team in MLB DFS.
+  // The stack team is chosen by which team's hitters have the most
+  // viable DK slots and highest combined edge scores.
   if (sp === 'mlb') {
-    // After normalization, all pitchers are 'P'
-    // Use salary as proxy for quality — top SPs cost $8K-$12K on DK
-    const pitchers = eligible
-      .filter(p => p.pos === 'P')
-      .sort((a, b) => {
-        // Sort by edge score first, but use salary as tiebreaker
-        // Higher salary = more reliable starter
-        const edgeDiff = b.edgeScore - a.edgeScore;
-        if (Math.abs(edgeDiff) > 5) return edgeDiff;
-        return b.salary - a.salary;
-      });
+    const pitchers    = eligible.filter(p => p.pos === 'P').sort((a,b) => b.edgeScore - a.edgeScore);
+    const hitters     = eligible.filter(p => p.pos !== 'P');
+    const hitterSlots = slots.filter(s => s !== 'P');
 
-    const hitters = eligible.filter(p => p.pos !== 'P');
+    // ── IDENTIFY BEST STACK TEAM ──────────────────────────────────
+    // Score = avg edgeScore of top-4 hitters × positional coverage bonus
+    const teamData = {};
+    hitters.forEach(p => {
+      if (!teamData[p.team]) teamData[p.team] = { positions: new Set(), players: [] };
+      teamData[p.team].positions.add(p.pos);
+      teamData[p.team].players.push(p);
+    });
+    const teamRankings = Object.entries(teamData)
+      .filter(([, t]) => t.players.length >= 3)
+      .map(([team, t]) => {
+        const top4avg = t.players.sort((a,b)=>b.edgeScore-a.edgeScore)
+          .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, t.players.length);
+        const coverage = Math.min(1.3, 1 + t.positions.size * 0.05);
+        return [team, top4avg * coverage];
+      }).sort((a,b)=>b[1]-a[1]);
+    const stackTeam = teamRankings[0]?.[0] || null;
 
-    // Try top 3 pitcher combinations, return best complete lineup
-    const pitcherSlots = slots.filter(s => s === 'P');
-    const hitterSlots  = slots.filter(s => s !== 'P');
-
+    // ── TRY TOP PITCHER PAIRS ─────────────────────────────────────
     let bestMLBScore = -1, bestMLBLineup = null;
+    const topPitchers = pitchers.slice(0, 8);
 
-    // Try top 6 pitcher options in pairs
-    const topPitchers = pitchers.slice(0, 6);
     for (let i = 0; i < topPitchers.length; i++) {
       for (let j = i + 1; j < topPitchers.length; j++) {
         const p1 = topPitchers[i], p2 = topPitchers[j];
-        const pitcherSal = p1.salary + p2.salary;
-        const remainingBudget = CAP - pitcherSal;
-
+        const remainingBudget = CAP - p1.salary - p2.salary;
         if (remainingBudget < hitterSlots.length * 2500) continue;
 
-        // Fill hitter slots with remaining budget
         const usedPitchers = new Set([p1.name, p2.name]);
-        const hitterLineup = greedyFillSlots(
-          hitters.filter(h => !usedPitchers.has(h.name)),
-          hitterSlots, remainingBudget, sp
-        );
+        const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
 
+        const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
 
         const fullLineup = [
-          { slot: 'P', player: p1 },
-          { slot: 'P', player: p2 },
+          { slot: 'P', player: p1 }, { slot: 'P', player: p2 },
           ...hitterLineup,
         ];
-
         const allPlayers = fullLineup.filter(l=>l.player).map(l=>l.player);
         const lineupScore = calcLineupFirstPlaceScore(allPlayers, sp);
 
-        if (lineupScore > bestMLBScore) {
-          bestMLBScore = lineupScore;
-          bestMLBLineup = fullLineup;
-        }
+        if (lineupScore > bestMLBScore) { bestMLBScore = lineupScore; bestMLBLineup = fullLineup; }
       }
     }
-
     if (bestMLBLineup) return bestMLBLineup;
   }
 
@@ -3171,7 +3168,7 @@ function optimize(all, sp) {
 }
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
-function greedyFillSlots(pool, slots, budget, sp) {
+function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
   // Sort by edge score descending
   const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
   const used   = new Set();
@@ -3183,22 +3180,24 @@ function greedyFillSlots(pool, slots, budget, sp) {
   // Pick the team whose top hitters have highest combined edge scores
   let stackTeam = null;
   if (sp === 'mlb') {
-    // Score teams by: avg edge of top-4 hitters (what a stack would look like)
-    // This avoids picking teams that have many but all mediocre hitters
-    const teamMap = {};
-    sorted.filter(p => p.pos !== 'P').forEach(p => {
-      if (!teamMap[p.team]) teamMap[p.team] = [];
-      teamMap[p.team].push(p.edgeScore);
-    });
-    // Score = average of top-4 hitters (the actual stack we'd build)
-    const teamStackScores = Object.entries(teamMap)
-      .filter(([, scores]) => scores.length >= 3) // need at least 3 options
-      .map(([team, scores]) => {
-        const top4 = scores.sort((a,b)=>b-a).slice(0,4);
-        const avg = top4.reduce((a,b)=>a+b,0) / top4.length;
-        return [team, avg];
+    if (presetStackTeam) {
+      // Use the stack team identified by the MLB two-phase optimizer
+      stackTeam = presetStackTeam;
+    } else {
+      // Fallback: identify stack team from the pool
+      const teamMap = {};
+      sorted.filter(p => p.pos !== 'P').forEach(p => {
+        if (!teamMap[p.team]) teamMap[p.team] = [];
+        teamMap[p.team].push(p.edgeScore);
       });
-    stackTeam = teamStackScores.sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+      const teamStackScores = Object.entries(teamMap)
+        .filter(([, scores]) => scores.length >= 2)
+        .map(([team, scores]) => {
+          const top4 = [...scores].sort((a,b)=>b-a).slice(0,4);
+          return [team, top4.reduce((a,b)=>a+b,0) / top4.length];
+        });
+      stackTeam = teamStackScores.sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+    }
   }
 
   for (const slot of slots) {
