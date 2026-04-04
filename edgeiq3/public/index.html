@@ -2425,21 +2425,36 @@ function bayesianProjectionUpdate(basePts, signals) {
   // Prior parameters — stronger shrinkage for low-sample players
   // DK average points is reliable only with 20+ games
   // For rookies / new players, shrink heavily toward position average
+  // Position average DK points — reflects true DK scoring, not raw stats
+  // NBA: full game, high-usage players average 30-35 DK pts
+  // NFL: varies wildly by position
+  // MLB: hitters avg 8-14 DK pts per game, pitchers 18-28 per start
   const NBA_POS_AVG = { PG:32, SG:29, SF:28, PF:27, C:26, G:31, F:28, UTIL:28 };
   const NFL_POS_AVG = { QB:30, RB:18, WR:20, TE:15, DST:8, K:8 };
-  const MLB_POS_AVG = { P:25, C:9, '1B':11, '2B':10, '3B':10, SS:10, OF:11 };
+  // MLB realistic averages — don't shrink, these are correct ranges
+  const MLB_POS_AVG = { P:22, C:10, '1B':12, '2B':10, '3B':11, SS:11, OF:11 };
 
   const posAvg = (sport === 'nba' ? NBA_POS_AVG : sport === 'nfl' ? NFL_POS_AVG : MLB_POS_AVG);
 
-  // If base projection is unrealistically high vs position average,
-  // shrink toward position average (handles small sample inflation)
   const pos = signals.pos || '';
   const leaguePosAvg = posAvg[pos] || basePts;
-  const maxRealistic = leaguePosAvg * 1.8; // no player averages more than 1.8x position avg
 
-  // Shrink inflated estimates toward realistic range
-  const shrunkBase = basePts > maxRealistic
-    ? leaguePosAvg * 1.4 // cap at 1.4x position average
+  // Max realistic ceiling multiplier — MLB hitters can go 4-5x average on great nights
+  // NBA: 2.5x (Jokic averages 55, can go 90+ in a blowout)
+  // MLB hitters: 4x (avg 10 pts, can score 40 on HR/multi-hit night)
+  // MLB pitchers: 2.5x (avg 22 pts, can score 55 on 10K shutout)
+  const maxMult = sport === 'mlb'
+    ? (pos === 'P' ? 2.5 : 4.0)   // MLB hitters can explode
+    : sport === 'nba' ? 2.5
+    : sport === 'nfl' ? 3.0
+    : 2.5;
+
+  const maxRealistic = leaguePosAvg * maxMult;
+
+  // Only shrink CLEARLY inflated estimates (small sample rookies with 3 games)
+  // For MLB, almost never shrink — hitter variance is real
+  const shrunkBase = (basePts > maxRealistic && sport !== 'mlb')
+    ? leaguePosAvg * 1.6
     : basePts;
 
   const mu0    = shrunkBase;
@@ -2676,15 +2691,16 @@ function calcPlayerCeiling(p, teammates = []) {
   const sigma = p._projSigma    || mean * 0.35;
   const variance = sigma * sigma;
 
-  // MLB pitchers: completely different ceiling model
-  // SP ceiling driven by: K rate, opponent lineup quality, park factor
-  // A dominant SP can score 40-60 DK pts — massive GPP upside
+  // MLB pitchers: dominant ceiling model
+  // Great SP: 8K game = 50-60 DK pts, shutout bonus, quality start bonus
   if (sport === 'mlb' && p.pos === 'P') {
-    const kBoost   = (p.pitcherMatch || 0) > 4 ? 1.35 : (p.pitcherMatch || 0) > 0 ? 1.15 : 0.95;
-    const parkMod  = 1 + Math.max(-0.15, Math.min(0.15, (p.parkFactor || 0) / 40));
-    const formMod  = p.recentForm?.trend === 'hot' ? 1.20 : p.recentForm?.trend === 'cold' ? 0.85 : 1.0;
-    const pitchCeiling = mean * kBoost * parkMod * formMod * 1.6;
-    return Math.round(Math.max(mean, pitchCeiling) * 10) / 10;
+    const kBoost  = (p.pitcherMatch || 0) > 4 ? 1.4 : (p.pitcherMatch || 0) > 0 ? 1.2 : 1.0;
+    const parkMod = 1 + Math.max(-0.15, Math.min(0.10, (p.parkFactor || 0) / 40));
+    const formMod = p.recentForm?.trend === 'hot' ? 1.25 : p.recentForm?.trend === 'cold' ? 0.88 : 1.0;
+    // SP ceiling = avg * multipliers * GPP_ceiling_factor
+    // Good SP averages 22 pts, can reach 50-60 pts on elite outings
+    const pitchCeiling = Math.max(mean * 1.8, mean * kBoost * parkMod * formMod * 2.2);
+    return Math.round(pitchCeiling * 10) / 10;
   }
 
   // Method 1: Gamma distribution 92nd percentile
@@ -2812,7 +2828,7 @@ function optimize(all, sp) {
   // then fill remaining slots with hitters from remaining budget.
   if (sp === 'mlb') {
     const pitchers = eligible
-      .filter(p => p.pos === 'P' && (p.projPts || 0) >= 18)
+      .filter(p => p.pos === 'P' && (p.avgPts || 0) >= 8) // avg at least 8 DK pts
       .sort((a, b) => b.edgeScore - a.edgeScore);
 
     const hitters = eligible.filter(p => p.pos !== 'P');
@@ -2895,10 +2911,18 @@ function optimize(all, sp) {
     if (sp === 'nfl') return 10;
     return 15;
   };
-  const minAvgPts = { nba: 22, nfl: 12, mlb: 8 }[sp] || 15;
+  // Minimum AVERAGE DK points — removes dead weight
+  // MLB hitters naturally avg 8-12 pts, pitchers 15-25
+  // NBA: need 20+ avg to be a relevant player
+  const minAvgPts = (p) => {
+    if (sp === 'mlb') return p.pos === 'P' ? 12 : 6; // pitchers need real avg
+    if (sp === 'nba') return 20;
+    if (sp === 'nfl') return 10;
+    return 12;
+  };
   const viablePool = eligible.filter(p =>
     (p.projPts || 0) >= minPts(p) &&
-    (p.avgPts || p.projPts || 0) >= minAvgPts
+    (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
   const searchPool = viablePool.length >= slots.length + 3 ? viablePool : eligible;
 
