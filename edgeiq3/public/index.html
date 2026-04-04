@@ -3250,6 +3250,11 @@ function greedyFillSlots(pool, slots, budget, sp) {
 }
 
 
+// Slate-relative position ceiling maxima — set during buildAndRender
+// Normalizes each player against the BEST ceiling on THIS slate for their position
+// Prevents MLB hitters from always scoring low due to fixed absolute maximums
+let slatePosCeilMax = {};
+
 async function buildAndRender() {
   setStatus('Building lineup...', 'var(--amber)');
 
@@ -3260,18 +3265,33 @@ async function buildAndRender() {
   nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
 
   // Monte Carlo — top 80 players only, 300 iterations max
-  // 678 players × 2000 iterations = browser freeze; cap avoids this
   const eligibleForMC = players
     .filter(p => !p.isOut && p.projPts > 0)
     .sort((a, b) => b.edgeScore - a.edgeScore)
     .slice(0, 80);
   const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
 
-  // Re-score with Monte Carlo probabilities + Gumbel stack boosts
+  // Pass 1: compute ceilings for all players with Gumbel stack boosts
   players = players.map(p => {
     p._mcFirstPlaceProb = mcProbs[p.name] || 0;
     const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-    p._ceiling  = calcPlayerCeiling(p, teammates);
+    p._ceiling = calcPlayerCeiling(p, teammates);
+    return p;
+  });
+
+  // Build SLATE-RELATIVE position maxima
+  // Each position's max = the highest ceiling on THIS slate at that position
+  // This ensures top player at each position always scores near 99
+  slatePosCeilMax = {};
+  players.filter(p => !p.isOut && p._ceiling > 0).forEach(p => {
+    const pos = p.pos || 'FLEX';
+    if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) {
+      slatePosCeilMax[pos] = p._ceiling;
+    }
+  });
+
+  // Pass 2: re-score using slate-relative normalization
+  players = players.map(p => {
     p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
     return p;
   });
