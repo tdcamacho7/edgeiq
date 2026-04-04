@@ -3164,11 +3164,22 @@ function greedyFillSlots(pool, slots, budget, sp) {
   // Pick the team whose top hitters have highest combined edge scores
   let stackTeam = null;
   if (sp === 'mlb') {
-    const teamScores = {};
+    // Score teams by: avg edge of top-4 hitters (what a stack would look like)
+    // This avoids picking teams that have many but all mediocre hitters
+    const teamMap = {};
     sorted.filter(p => p.pos !== 'P').forEach(p => {
-      teamScores[p.team] = (teamScores[p.team] || 0) + p.edgeScore;
+      if (!teamMap[p.team]) teamMap[p.team] = [];
+      teamMap[p.team].push(p.edgeScore);
     });
-    stackTeam = Object.entries(teamScores).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+    // Score = average of top-4 hitters (the actual stack we'd build)
+    const teamStackScores = Object.entries(teamMap)
+      .filter(([, scores]) => scores.length >= 3) // need at least 3 options
+      .map(([team, scores]) => {
+        const top4 = scores.sort((a,b)=>b-a).slice(0,4);
+        const avg = top4.reduce((a,b)=>a+b,0) / top4.length;
+        return [team, avg];
+      });
+    stackTeam = teamStackScores.sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
   }
 
   for (const slot of slots) {
@@ -3179,10 +3190,21 @@ function greedyFillSlots(pool, slots, budget, sp) {
       : slot === 'G' ? G_POS : slot === 'F' ? F_POS
       : slot === 'UTIL' ? UTIL_POS : [slot];
 
-    // For MLB hitter slots: prefer players from stack team
+      // For MLB hitter slots: force 4 stack team players
     let pick = null;
-    if (sp === 'mlb' && slot !== 'P' && stackTeam) {
-      // Try to find a stack team player first
+    const stackCount = lineup.filter(l => l.player?.team === stackTeam && l.slot !== 'P').length;
+    const hitterSlotsLeft = slots.slice(lineup.length).filter(s => s !== 'P').length;
+    const needStack = sp === 'mlb' && slot !== 'P' && stackTeam;
+    const mustStack = needStack && stackCount < 4 && hitterSlotsLeft <= (4 - stackCount);
+
+    if (mustStack) {
+      // MUST pick from stack team — not enough slots left to reach 4 otherwise
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget &&
+        positions.includes(p.pos) && p.team === stackTeam
+      );
+    } else if (needStack && stackCount < 4) {
+      // Prefer stack team player, but can fall back if none fit
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget &&
         positions.includes(p.pos) && p.team === stackTeam
