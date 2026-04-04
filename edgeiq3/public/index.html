@@ -3179,52 +3179,35 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
   const lineup = [];
   const MIN    = 2500;
 
-  // ── MLB: PRE-SELECT 4-MAN STACK FIRST ────────────────────────────
-  // Pre-select the 4 best stack team players at DIFFERENT positions
-  // before filling other slots. This guarantees the stack is built
-  // when the team has viable players at multiple positions.
-  const stackPicks = []; // pre-selected stack players
-  if (sp === 'mlb' && presetStackTeam) {
-    const stackPlayers = sorted
-      .filter(p => p.team === presetStackTeam && p.pos !== 'P');
-
-    const usedStackPos = new Set();
-    for (const p of stackPlayers) {
-      if (stackPicks.length >= 4) break;
-      // Only pick one player per position (avoid 2 OFs if only need 1)
-      // But allow up to 3 OF picks since we have 3 OF slots
-      const posCount = stackPicks.filter(sp2 => sp2.pos === p.pos).length;
-      const posMax   = p.pos === 'OF' ? 3 : 1;
-      if (posCount >= posMax) continue;
-      // Verify this slot type exists in the remaining hitter slots
-      const slotNeeded = p.pos === 'OF' ? 'OF'
-        : p.pos === 'SS' ? 'SS'
-        : p.pos;
-      const slotsForPos = slots.filter(s => {
-        if (s === slotNeeded) return true;
-        if (s === 'FLEX' && (FLEX_POS[sp]||[]).includes(p.pos)) return true;
-        return false;
-      });
-      if (slotsForPos.length <= stackPicks.filter(sp2 => sp2.pos === p.pos).length) continue;
-      stackPicks.push(p);
-      used.add(p.name);
-      salLeft -= p.salary;
-    }
-    // If we couldn't get 4, release the partial stack (not worth forcing)
-    if (stackPicks.length < 3) {
-      stackPicks.forEach(p => used.delete(p.name));
-      stackPicks.length = 0;
-      salLeft = budget;
-    }
+  // ── IDENTIFY STACK TEAM ───────────────────────────────────────────
+  // Best team = highest avg edge score among top-4 hitters at 3+ positions
+  let stackTeam = presetStackTeam;
+  if (sp === 'mlb' && !stackTeam) {
+    const teamMap = {};
+    sorted.filter(p => p.pos !== 'P').forEach(p => {
+      if (!teamMap[p.team]) teamMap[p.team] = { pos: new Set(), scores: [] };
+      teamMap[p.team].pos.add(p.pos);
+      teamMap[p.team].scores.push(p.edgeScore);
+    });
+    const ranked = Object.entries(teamMap)
+      .filter(([, t]) => t.scores.length >= 3)
+      .map(([team, t]) => {
+        const top4 = [...t.scores].sort((a,b)=>b-a).slice(0,4);
+        return [team, top4.reduce((a,b)=>a+b,0)/top4.length * (1 + t.pos.size * 0.04)];
+      }).sort((a,b)=>b[1]-a[1]);
+    stackTeam = ranked[0]?.[0] || null;
   }
 
-  // ── FILL ALL SLOTS ────────────────────────────────────────────────
-  // Build a map of which slots the pre-selected stack covers
-  const stackSlotMap = [...stackPicks]; // consume stack picks in order
-
+  // ── SLOT-BY-SLOT FILL WITH STACK PREFERENCE ───────────────────────
+  // Try stack team player first for each slot, fall back to best available.
+  // This guarantees a stack builds naturally when viable players exist.
+  // We track how many slots remain to FORCE the stack when necessary.
   for (const slot of slots) {
-    const remaining = slots.length - lineup.length - 1;
-    const maxBudget = salLeft - (remaining * MIN);
+    const remaining   = slots.length - lineup.length - 1;
+    const maxBudget   = salLeft - (remaining * MIN);
+    const stackCount  = lineup.filter(l => l.player?.team === stackTeam && l.slot !== 'P').length;
+    const stackSlots  = slots.slice(lineup.length + 1).filter(s => s !== 'P').length;
+    const needMore    = Math.max(0, 4 - stackCount);
 
     const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
       : slot === 'G'    ? G_POS
@@ -3232,18 +3215,29 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
       : slot === 'UTIL' ? UTIL_POS
       : [slot];
 
-    // Check if a pre-selected stack player fits this slot
     let pick = null;
-    if (stackSlotMap.length > 0 && slot !== 'P') {
-      const stackIdx = stackSlotMap.findIndex(p =>
-        positions.includes(p.pos) && p.salary <= maxBudget
-      );
-      if (stackIdx >= 0) {
-        pick = stackSlotMap.splice(stackIdx, 1)[0];
+    const needStack = sp === 'mlb' && slot !== 'P' && stackTeam;
+
+    if (needStack) {
+      const mustStack = stackCount < 4 && stackSlots < needMore; // must pick stack or can't reach 4
+      const wantStack = stackCount < 4; // still building toward 4
+
+      if (mustStack) {
+        // MUST pick stack team player — no fallback
+        pick = sorted.find(p =>
+          !used.has(p.name) && p.salary <= maxBudget &&
+          positions.includes(p.pos) && p.team === stackTeam
+        );
+      } else if (wantStack) {
+        // Prefer stack team, but allow fallback if none fits
+        pick = sorted.find(p =>
+          !used.has(p.name) && p.salary <= maxBudget &&
+          positions.includes(p.pos) && p.team === stackTeam
+        );
       }
     }
 
-    // Fall back to best available by edge score
+    // Best available fallback
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -3260,20 +3254,33 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
   }
 
   // ── SALARY UPGRADE PASS ───────────────────────────────────────────
+  // Replace cheaper players with higher-salary alternatives that score similarly.
+  // This fixes the "too much salary unused" problem while maintaining stack.
   for (let i = lineup.length-1; i >= 0; i--) {
-    if (salLeft < 300) break;
+    if (salLeft < 400) break;
     const cur  = lineup[i].player; if (!cur) continue;
     const slot = lineup[i].slot;
     const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
       : slot === 'G' ? G_POS : slot === 'F' ? F_POS
       : slot === 'UTIL' ? UTIL_POS : [slot];
+
+    // Prefer upgrading within stack team first to maintain the stack
+    const inStack = cur.team === stackTeam && slot !== 'P';
     const upgrade = sorted.find(p =>
       !used.has(p.name) &&
       p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
       positions.includes(p.pos) &&
-      p.edgeScore >= cur.edgeScore - 8
+      p.edgeScore >= cur.edgeScore - 5 &&
+      (!inStack || p.team === stackTeam) // stay within stack if already in it
+    ) || sorted.find(p =>
+      !used.has(p.name) &&
+      p.salary > cur.salary &&
+      p.salary <= cur.salary + salLeft - 200 &&
+      positions.includes(p.pos) &&
+      p.edgeScore >= cur.edgeScore - 5
     );
+
     if (upgrade) {
       salLeft += cur.salary - upgrade.salary;
       used.delete(cur.name); used.add(upgrade.name);
@@ -3282,70 +3289,6 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null) {
   }
 
   return lineup;
-}
-
-// Slate-relative position ceiling maxima — set each build
-let slatePosCeilMax = {};
-
-async function buildAndRender() {
-  setStatus('Building lineup...', 'var(--amber)');
-  await new Promise(r => setTimeout(r, 30));
-
-  try {
-    // Nash simulation — quick pass on top players
-    nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
-
-    // Monte Carlo — top 80 players only, 300 iterations
-    const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
-      .sort((a, b) => b.edgeScore - a.edgeScore).slice(0, 80);
-    const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
-
-    // Pass 1: compute ceilings (with stack boosts via Gumbel copula)
-    players = players.map(p => {
-      p._mcFirstPlaceProb = mcProbs[p.name] || 0;
-      const teammates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-      p._ceiling = calcPlayerCeiling(p, teammates);
-      return p;
-    });
-
-    // Build slate-relative position maxima
-    slatePosCeilMax = {};
-    players.filter(p => !p.isOut && p._ceiling > 0).forEach(p => {
-      const pos = p.pos || 'FLEX';
-      if (!slatePosCeilMax[pos] || p._ceiling > slatePosCeilMax[pos]) {
-        slatePosCeilMax[pos] = p._ceiling;
-      }
-    });
-
-    // Pass 2: re-score with slate-relative normalization
-    players = players.map(p => {
-      p.edgeScore = p.isOut ? 0 : calcEdgeScore(p);
-      return p;
-    });
-
-    lineup = optimize(players, sport);
-
-    const jsdScore = calcLineupJSDScore(lineup, players);
-    const valid   = lineup.filter(l => l.player);
-    const avgEdge = valid.length ? Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length) : 0;
-    const avgOwn  = valid.length ? valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length : 20;
-    const kelly   = multivariateKelly(avgEdge, avgOwn, 0.35);
-    const dna     = analyzeLineupDNA(lineup, sport);
-    const contest = recommendContest(avgEdge);
-
-    fetchLatestNews(sport).catch(() => {});
-
-    renderLineup(jsdScore, kelly, dna, contest);
-    renderStacks();
-    renderIntelLive();
-    if (currentScreen === 'signals') renderSignalDashboard();
-    setDot('ok');
-    setStatus('', '');
-  } catch(err) {
-    console.error('EdgeIQ buildAndRender error:', err);
-    setDot('error');
-    setStatus('Error building lineup — try uploading CSV again', 'var(--amber)');
-  }
 }
 
 function rebuildLineup() {
