@@ -3693,6 +3693,7 @@ async function buildAndRender() {
 
     while (attempts < 3) {
       const candidate = optimize(players, sport);
+      if (!candidate || !candidate.length) { attempts++; continue; }
       const candidateValid = candidate.filter(l => l.player);
       if (!candidateValid.length) { attempts++; continue; }
       const candidateScore = Math.round(
