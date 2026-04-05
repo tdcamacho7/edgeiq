@@ -2938,7 +2938,16 @@ const POS_AVG_MAP = {
 // Ownership multiplier: rewards uniqueness
 // 0% own  → 1.50x | 15% own → 1.30x | 30% own → 1.10x | 45%+ → 0.90x
 function ownershipMult(own) {
-  return Math.max(0.80, 1.50 - own * 0.014);
+  // Steeper curve rewards ultra-low ownership more aggressively
+  // 2% own → 1.65x | 7% own → 1.52x | 15% own → 1.32x | 25% own → 1.10x | 35%+ → 0.85x
+  // Previous: 2%→1.47, 7%→1.40, 25%→1.15 — not enough separation
+  if (own <= 3)  return 1.65;
+  if (own <= 7)  return 1.55;
+  if (own <= 12) return 1.42;
+  if (own <= 18) return 1.28;
+  if (own <= 25) return 1.10;
+  if (own <= 32) return 0.95;
+  return Math.max(0.75, 0.95 - (own - 32) * 0.02);
 }
 
 // Reliability: shrinks low-sample players toward position average
@@ -3121,19 +3130,26 @@ function optimize(all, sp) {
           }).sort((a,b)=>b[1]-a[1]);
         const stackTeam = validTeamRankings[0]?.[0] || null;
 
-        // ── BRING-BACK: 1 elite hitter from pitcher's opponent team ───
-        // Only if they score ≥ 88 edge (genuinely elite play, not just filling a slot)
-        // This adds game correlation: if Gore dominates CIN, the scoring environment
-        // favors NYY hitters in the same broadcast window — different game, same energy
-        // NOTE: bring-back is from a DIFFERENT game than the stack (adds true diversity)
-        const bringBackCandidates = hitters
-          .filter(h =>
-            blockedFromStack.has(h.team) === false && // not blocked themselves
-            h.team !== stackTeam &&                    // not duplicating the stack
-            h.edgeScore >= 88 &&                       // must be genuinely elite
-            h.salary >= 3500 &&                        // must be a real starter
-            h.projPts >= 10                            // must project meaningful points
-          ).sort((a,b) => b.edgeScore - a.edgeScore);
+        // ── BRING-BACK: Game-stack the OPPOSING team of our main stack ──
+        // Winner's structure: Bellinger(NYY) + Ramirez+Edwards(MIA) = both teams in MIA@NYY
+        // When a game has high total (O/U > 9.0), BOTH teams are likely to score.
+        // Stack one team's hitters → bring-back 1-2 from the opposing team.
+        // This captures upside whether your team or theirs blows up.
+        const stackTeamGameInfo = hitters.find(h => h.team === stackTeam)?.gameInfo || '';
+        const stackOpponent = hitters.find(h =>
+          h.gameInfo === stackTeamGameInfo && h.team !== stackTeam
+        )?.team || null;
+
+        // Bring-back from the DIRECT opponent of our stack team (game-correlated)
+        const bringBackCandidates = stackOpponent
+          ? hitters
+              .filter(h =>
+                h.team === stackOpponent &&
+                h.edgeScore >= 75 &&
+                h.salary >= 3200 &&
+                h.projPts >= 8
+              ).sort((a,b) => b.edgeScore - a.edgeScore)
+          : [];
         const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
@@ -3256,18 +3272,38 @@ function optimize(all, sp) {
       }
     }
 
-    // MLB team stack bonus: 4+ hitters from same team = massive ceiling boost
-    // Because when a team explodes, ALL their hitters score big together
+    // MLB stacking bonuses
     if (sp === 'mlb') {
       const teamCounts = {};
+      const teamGames = {};
       filledPlayers.filter(p => p.pos !== 'P').forEach(p => {
         teamCounts[p.team] = (teamCounts[p.team] || 0) + 1;
+        teamGames[p.team] = p.gameInfo || '';
       });
       const maxStack = Math.max(0, ...Object.values(teamCounts));
-      if (maxStack >= 4) corrBonus += 60;       // 4-man stack: huge bonus
-      else if (maxStack === 3) corrBonus += 25;  // 3-man stack: good
-      else if (maxStack === 2) corrBonus += 5;   // 2-man: minor
-      else corrBonus -= 30;                       // no stack: penalize
+
+      // Primary stack bonus
+      if (maxStack >= 4) corrBonus += 60;
+      else if (maxStack === 3) corrBonus += 25;
+      else if (maxStack === 2) corrBonus += 5;
+      else corrBonus -= 30;
+
+      // GAME-STACK BONUS: players from BOTH teams in same game
+      // Winner had Bellinger(NYY) + Ramirez+Edwards(MIA) in MIA@NYY (16 combined runs)
+      // When a game goes over, BOTH offenses benefit
+      const teams = Object.keys(teamCounts);
+      let gameStackBonus = 0;
+      for (let i = 0; i < teams.length; i++) {
+        for (let j = i+1; j < teams.length; j++) {
+          if (teamGames[teams[i]] && teamGames[teams[i]] === teamGames[teams[j]]) {
+            // Both teams in same game — reward this correlation
+            const combined = teamCounts[teams[i]] + teamCounts[teams[j]];
+            if (combined >= 3) gameStackBonus = Math.max(gameStackBonus, 25);
+            else if (combined === 2) gameStackBonus = Math.max(gameStackBonus, 10);
+          }
+        }
+      }
+      corrBonus += gameStackBonus;
     }
 
     // NFL QB-WR stack bonus
