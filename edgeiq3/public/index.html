@@ -694,9 +694,17 @@ async function handleCsv(input){
       } catch(e) {}
     }
 
-    // Active roster check removed — was causing hangs
-    // IL detection uses: ESPN injuries API + CSV status field + 🚫 ban button
-    const mlbActiveRosters = null;
+    // MLB starting lineup check — filters non-starters once lineups are posted
+    let mlbStartingLineups = null;
+    if (sport === 'mlb') {
+      mlbStartingLineups = await Promise.race([
+        fetchMLBStartingLineups(),
+        new Promise(res => setTimeout(() => res(null), 3000)) // 3s max
+      ]).catch(() => null);
+      if (mlbStartingLineups) {
+        setStatus(`${raw.length} players found · ${mlbStartingLineups.gamesWithLineups} lineups confirmed...`, 'var(--cyan)');
+      }
+    }
 
     // Apply all data to players
     const withData = raw.map(p => {
@@ -793,6 +801,46 @@ async function fetchMLBActiveRosters(teamAbbrevs) {
       }
     }
     return data.teamCount >= 2 ? active : null;
+  } catch(e) {
+    return null;
+  }
+}
+
+// Fetch confirmed MLB starting lineups from MLB Stats API (free, no key)
+// Returns Set of player names confirmed in today's starting lineups
+// Only available ~90 min before first pitch when lineups are posted
+async function fetchMLBStartingLineups() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const r = await fetch(
+      `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=lineups`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (!r.ok) return null;
+    const data = await r.json();
+    const confirmedStarters = new Set();
+    let gamesWithLineups = 0;
+
+    for (const date of (data.dates || [])) {
+      for (const game of (date.games || [])) {
+        const home = game.lineups?.homePlayers || [];
+        const away = game.lineups?.awayPlayers || [];
+        if (home.length + away.length > 0) {
+          gamesWithLineups++;
+          [...home, ...away].forEach(p => {
+            const name = (p.fullName || '').toLowerCase();
+            if (name) {
+              confirmedStarters.add(name);
+              // Also add last name for fuzzy matching
+              const parts = name.split(' ');
+              if (parts.length >= 2) confirmedStarters.add(parts[parts.length - 1]);
+            }
+          });
+        }
+      }
+    }
+    // Only return if we got lineups for at least 1 game (means they're posted)
+    return gamesWithLineups >= 1 ? { starters: confirmedStarters, gamesWithLineups } : null;
   } catch(e) {
     return null;
   }
@@ -3426,9 +3474,12 @@ function optimize(all, sp) {
 
   search(0, CAP, 0, [], new Set());
 
-  // If branch-and-bound found nothing (too restrictive), fall back to salary-maximizing greedy
+  // If branch-and-bound found nothing (too restrictive), fall back to greedyFillSlots
   if (!bestLineup) {
-    bestLineup = greedyOptimize(eligible, slots, sp);
+    const fallbackLineup = greedyFillSlots(eligible, slots, CAP, sp, null, null);
+    if (fallbackLineup?.filter(l => l.player).length >= slots.length - 1) {
+      bestLineup = fallbackLineup;
+    }
   }
 
   return bestLineup;
