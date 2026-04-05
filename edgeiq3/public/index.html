@@ -904,19 +904,22 @@ function parseCsv(text){
 
   return lines.slice(start+1).map(l=>{
     const v=l.split(',').map(c=>c.trim().replace(/"/g,''));
-    const name=(v[ni]||'').replace(/ \(.*\)/,'');
+    const rawName = v[ni] || '';
+    // DK appends injury flags to name: "Player Name (IL)", "Player Name (DTD)"
+    const injuryInName = rawName.match(/\(([^)]+)\)$/)?.[1]?.toLowerCase() || '';
+    const name = rawName.replace(/ \(.*\)/,'').trim();
     const salary=parseInt(v[si])||0;
     if(!name||salary<2000) return null;
     const gi2=v[gi]||'', myTeam=v[ti]||'';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
-    const status=statusI>=0?v[statusI]||'':'';
+    const status = statusI>=0 ? (v[statusI]||'') : injuryInName || '';
     const statusLow = (status||'').toLowerCase().trim();
-    // Also scan ALL columns for IL indicator — DK puts it in various places
+    // Check injury in name suffix "(IL)", "(O)", "(DTD)" + status column + all cols
+    const nameHasIL = ['il','il10','il60','o','out','ir'].includes(injuryInName);
     const allCols = v.join('|').toLowerCase();
-    const hasILAnywhere = allCols.includes('|il|') || allCols.includes(',il,') 
-      || allCols.startsWith('il|') || allCols.includes('injured list')
-      || allCols.includes('injured reserve');
+    const hasILAnywhere = nameHasIL || allCols.includes('|il|') || allCols.includes(',il,')
+      || allCols.includes('injured list') || allCols.includes('injured reserve');
     const isOut = hasILAnywhere || ['out','o','ir','il','il10','il60','il-10','il-60','injured list',
       'injured reserve','injured','inactive','na','sus','suspended',
       'did not play','dnp','scratched','out indefinitely'
@@ -929,9 +932,15 @@ function parseCsv(text){
     if (['SP','RP','P'].includes(rawPos)) rawPos = 'P';
     if (['CF','LF','RF'].includes(rawPos)) rawPos = 'OF';
     const pos = rawPos || 'FLEX';
-    // DK prices bench/non-starters at $2,000-3,200 range — filter them out
-    // Confirmed starting position players are almost always $3,300+
-    const isBenchPlayer = rawPos !== 'P' && salary > 0 && salary < 3300;
+    // Three signals for non-starters:
+    // 1. Very low salary ($3,300- for hitters) = bench/non-starter pricing
+    // 2. avgPts = 0 = never played this season = not in lineup
+    // 3. Injury in name "(IL)", "(O)" already caught above
+    const avgPtsVal = parseFloat(v[ai]) || 0;
+    const isBenchPlayer = rawPos !== 'P' && (
+      (salary > 0 && salary < 3300) ||  // cheap = bench
+      (avgPtsVal === 0 && salary < 4500) // never scored + mid salary = not starting
+    );
     const finalIsOut = isOut || isBenchPlayer;
     return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status,isOut:finalIsOut};
   }).filter(Boolean);
@@ -3701,9 +3710,14 @@ async function buildAndRender() {
       }));
       attempts++;
     }
-    lineup = bestLineupSoFar || optimize(players, sport);
+    lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // Show warning if we couldn't hit 97+
+    if (!lineup || !lineup.length) {
+      setDot('error');
+      setStatus('Not enough eligible players — check that lineups are posted on DK', 'var(--red)');
+      return;
+    }
     const finalValid = lineup.filter(l => l.player);
     const finalScore = finalValid.length
       ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
