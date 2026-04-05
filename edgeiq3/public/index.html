@@ -640,15 +640,43 @@ async function handleCsv(input){
     // Safe fetch: caps at 6s timeout AND swallows rejections → always resolves to {} on failure
     const safeTimeout = ms => new Promise(res => setTimeout(() => res(null), ms));
     const safeFetch = fn => Promise.race([
-      fn().catch(() => null),   // catch rejections → null
-      safeTimeout(6000)         // cap at 6 seconds
+      fn().catch(() => null),
+      safeTimeout(6000)
     ]).then(r => r || {});
 
-    const [injuryMap, ownershipData, vegasData] = await Promise.all([
-      safeFetch(() => fetchESPNInjuries(sport)),
-      safeFetch(() => fetchOwnershipFromProxy(sport)),
-      safeFetch(() => fetchVegasFromProxy(sport)),
-    ]);
+    // ── CACHE PROXY DATA (saves ScraperAPI credits on rebuilds) ──────
+    const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
+    const cacheKey = `edgeiq_cache_${sport}_${new Date().toDateString()}`;
+    let cachedProxyData = null;
+    try {
+      const stored = sessionStorage.getItem(cacheKey);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Date.now() - parsed.ts < CACHE_TTL) cachedProxyData = parsed;
+      }
+    } catch(e) {}
+
+    let injuryMap, ownershipData, vegasData;
+    if (cachedProxyData) {
+      // Use cached data — no ScraperAPI calls needed
+      injuryMap = cachedProxyData.injuryMap || {};
+      ownershipData = cachedProxyData.ownershipData || {};
+      vegasData = cachedProxyData.vegasData || {};
+      setStatus(`${raw.length} players found · using cached live data...`, 'var(--cyan)');
+    } else {
+      // Fresh fetch — hits ScraperAPI
+      [injuryMap, ownershipData, vegasData] = await Promise.all([
+        safeFetch(() => fetchESPNInjuries(sport)),
+        safeFetch(() => fetchOwnershipFromProxy(sport)),
+        safeFetch(() => fetchVegasFromProxy(sport)),
+      ]);
+      // Cache for this session
+      try {
+        sessionStorage.setItem(cacheKey, JSON.stringify({
+          ts: Date.now(), injuryMap, ownershipData, vegasData
+        }));
+      } catch(e) {}
+    }
 
     // Active roster check removed — was causing hangs
     // IL detection uses: ESPN injuries API + CSV status field + 🚫 ban button
@@ -3508,7 +3536,43 @@ async function buildAndRender() {
     // Pass 2: re-score
     players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
 
-    lineup = optimize(players, sport);
+    // ── 97+ SCORE GATE ────────────────────────────────────────────────
+    // Only accept lineups scoring 97+. Try up to 3 passes.
+    // Each pass slightly varies the MC boost to explore different combos.
+    const MIN_ACCEPTABLE_SCORE = 97;
+    let attempts = 0;
+    let bestLineupSoFar = null;
+    let bestScoreSoFar = 0;
+
+    while (attempts < 3) {
+      const candidate = optimize(players, sport);
+      const candidateValid = candidate.filter(l => l.player);
+      if (!candidateValid.length) { attempts++; continue; }
+      const candidateScore = Math.round(
+        candidateValid.reduce((s,l) => s + l.player.edgeScore, 0) / candidateValid.length
+      );
+      if (candidateScore > bestScoreSoFar) {
+        bestScoreSoFar = candidateScore;
+        bestLineupSoFar = candidate;
+      }
+      if (candidateScore >= MIN_ACCEPTABLE_SCORE) break;
+      // Below threshold — jitter MC probs slightly to explore alternatives
+      players = players.map(p => ({
+        ...p,
+        _mcFirstPlaceProb: Math.min(0.99, (p._mcFirstPlaceProb || 0) * (0.9 + Math.random() * 0.2))
+      }));
+      attempts++;
+    }
+    lineup = bestLineupSoFar || optimize(players, sport);
+
+    // Show warning if we couldn't hit 97+
+    const finalValid = lineup.filter(l => l.player);
+    const finalScore = finalValid.length
+      ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
+      : 0;
+    if (finalScore < MIN_ACCEPTABLE_SCORE) {
+      setStatus(`Best available: ${finalScore} edge — slate may not support 97+ tonight`, 'var(--amber)');
+    }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
     const valid   = lineup.filter(l => l.player);
