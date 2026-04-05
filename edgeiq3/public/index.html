@@ -3245,7 +3245,18 @@ function optimize(all, sp) {
     (p.projPts || 0) >= minPts(p) &&
     (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
-  const searchPool = viablePool.length >= slots.length + 3 ? viablePool : eligible;
+  // Never fall back to full eligible pool — that defeats all our filters.
+  // If viablePool is too small, relax thresholds incrementally but keep floor.
+  let searchPool = viablePool;
+  if (viablePool.length < slots.length + 2) {
+    // Relaxed pool: lower pts bar but keep salary floor (no bench players ever)
+    searchPool = eligible.filter(p =>
+      p.salary >= minSalaryFloor(p) &&
+      (p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 6 : 7) : 12) &&
+      p.edgeScore >= 55
+    );
+  }
+  if (searchPool.length < slots.length + 1) searchPool = viablePool.length ? viablePool : eligible.filter(p => p.edgeScore >= 40);
 
   // Rebuild slot pools from viable pool
   const slotPools = slots.map(slot => {
@@ -3482,11 +3493,11 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         // ALWAYS pick stack player when building toward 4-man stack
         // The +60 stack bonus outweighs individual edge score differences
         // Only skip if stack player is completely unavailable (injured/no player at position)
-        if (stackPick && stackPick.edgeScore >= 50) {
-          pick = stackPick; // force stack pick only if player is genuinely viable
+        if (stackPick && stackPick.edgeScore >= 60 && (stackPick.projPts || 0) >= 7) {
+          pick = stackPick; // only force stack if player is genuinely viable
         }
-        // If no viable stack player at this position (edge < 50),
-        // fall through to best available — partial stack beats bad-player stack
+        // If no viable stack player (edge < 60 or proj < 7),
+        // take best available — a partial stack beats a bad-player stack
       }
     }
 
@@ -3633,7 +3644,17 @@ async function buildAndRender() {
     const finalScore = finalValid.length
       ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
       : 0;
-    if (finalScore < MIN_ACCEPTABLE_SCORE) {
+
+    // Flag any individual weak players in final lineup
+    const weakPlayers = finalValid.filter(l =>
+      l.player.edgeScore < 60 ||
+      (l.player.projPts < 7 && l.player.pos !== 'P') ||
+      l.player.dvpLabel?.badge === 'bad matchup'
+    );
+    if (weakPlayers.length > 0) {
+      const names = weakPlayers.map(l => l.player.name).join(', ');
+      setStatus(`⚠️ Weak players in lineup: ${names} — consider rebuilding`, 'var(--amber)');
+    } else if (finalScore < MIN_ACCEPTABLE_SCORE) {
       setStatus(`Best available: ${finalScore} edge — slate may not support 97+ tonight`, 'var(--amber)');
     }
 
