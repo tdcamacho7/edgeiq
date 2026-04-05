@@ -243,20 +243,36 @@ input,button{font-family:var(--ui)}
   <!-- screens -->
   <div id="screen-lineup">
 
-    <!-- fetch box -->
+    <!-- fetch box — CSV first -->
     <div class="fetch-box">
-      <div class="fetch-label">Paste your DraftKings contest link</div>
-      <div class="fetch-input-row">
-        <input class="fetch-input" id="dk-url" type="url"
-          placeholder="draftkings.com/draft/contest/..."
-          autocomplete="off" autocorrect="off" spellcheck="false"
-          oninput="onUrlInput(this.value)">
-        <button class="fetch-btn" id="fetch-btn" onclick="fetchSlate()" disabled>Build</button>
-      </div>
       <div class="fetch-status" id="fetch-status"></div>
-      <div class="fetch-hint">
-        Open DraftKings → tap your contest → copy the link from the top of your browser → paste it here.
-      </div>
+
+      <!-- PRIMARY: CSV Upload -->
+      <label for="csv-upload-main" style="display:block;cursor:pointer">
+        <div style="background:var(--cyan);color:#0a0a0a;border-radius:14px;padding:16px 20px;text-align:center;font-weight:700;font-size:16px;letter-spacing:.02em">
+          📂 Upload DraftKings CSV
+        </div>
+        <div style="text-align:center;font-size:12px;color:var(--t3);margin-top:8px">
+          DraftKings → your contest → Export to CSV → upload here
+        </div>
+      </label>
+      <input type="file" id="csv-upload-main" accept=".csv" style="display:none" onchange="handleCsv(this)">
+
+      <!-- SECONDARY: URL paste (collapsed by default) -->
+      <details style="margin-top:12px">
+        <summary style="font-size:12px;color:var(--t3);cursor:pointer;user-select:none">
+          Or try pasting contest URL (may not work — DK blocks direct connections)
+        </summary>
+        <div style="margin-top:10px">
+          <div class="fetch-input-row">
+            <input class="fetch-input" id="dk-url" type="url"
+              placeholder="draftkings.com/draft/contest/..."
+              autocomplete="off" autocorrect="off" spellcheck="false"
+              oninput="onUrlInput(this.value)">
+            <button class="fetch-btn" id="fetch-btn" onclick="fetchSlate()" disabled>Build</button>
+          </div>
+        </div>
+      </details>
     </div>
 
     <!-- summary (hidden until lineup ready) -->
@@ -298,7 +314,7 @@ input,button{font-family:var(--ui)}
         <div class="empty">
           <div class="empty-icon">⚡</div>
           <div class="empty-title">Ready to build</div>
-          <div class="empty-desc">Paste your DraftKings contest link above and tap <strong>Build</strong>. Your optimal GPP lineup appears in seconds.</div>
+          <div class="empty-desc">Upload your DraftKings CSV above to build your optimal GPP lineup. Export CSV from the DraftKings contest lobby.</div>
         </div>
       </div>
       <div id="export-section" style="display:none">
@@ -852,14 +868,18 @@ function parseCsv(text){
       'injured reserve','injured','inactive','na','sus','suspended',
       'did not play','dnp','scratched','out indefinitely'
     ].includes(statusLow) || statusLow.startsWith('il') || statusLow.includes('injured list');
+    // Also treat extremely low salary non-pitchers as effectively unavailable
+    // DK prices confirmed non-starters at $2,000-2,700 minimum
+    // We use $2,800 as the cutoff to be safe
     // Normalize DK MLB position strings
     let rawPos = (v[pi]||'').split('/')[0].toUpperCase().trim();
-    // DK uses SP/RP for pitchers → normalize to P
     if (['SP','RP','P'].includes(rawPos)) rawPos = 'P';
-    // DK uses CF/LF/RF for outfield → normalize to OF
     if (['CF','LF','RF'].includes(rawPos)) rawPos = 'OF';
     const pos = rawPos || 'FLEX';
-    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status,isOut};
+    // DK prices bench/non-starters at $2,000-2,700 — filter them out
+    const isBenchPlayer = rawPos !== 'P' && salary > 0 && salary < 2900;
+    const finalIsOut = isOut || isBenchPlayer;
+    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status,isOut:finalIsOut};
   }).filter(Boolean);
 }
 
@@ -3214,7 +3234,14 @@ function optimize(all, sp) {
     if (sp === 'nfl') return 10;
     return 10;
   };
+  // MLB salary floors — DK prices non-starters at $2,000-2,700
+  const minSalaryFloor = (p) => {
+    if (sp === 'mlb') return p.pos === 'P' ? 5500 : 2900;
+    return 2000;
+  };
+
   const viablePool = eligible.filter(p =>
+    p.salary >= minSalaryFloor(p) &&
     (p.projPts || 0) >= minPts(p) &&
     (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
