@@ -668,9 +668,9 @@ async function handleCsv(input){
       const stored = sessionStorage.getItem(cacheKey);
       if (stored) {
         const parsed = JSON.parse(stored);
-        if (Date.now() - parsed.ts < CACHE_TTL) cachedProxyData = parsed;
+        if (parsed && Date.now() - (parsed.ts || 0) < CACHE_TTL) cachedProxyData = parsed;
       }
-    } catch(e) {}
+    } catch(e) { cachedProxyData = null; }
 
     let injuryMap, ownershipData, vegasData;
     if (cachedProxyData) {
@@ -3627,10 +3627,16 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 let slatePosCeilMax = {};
 
 async function buildAndRender() {
+  // Guard: don't run if no players loaded yet
+  if (!players || !players.length) {
+    setDot('');
+    setStatus('Upload a DraftKings CSV to build your lineup', 'var(--t3)');
+    return;
+  }
   setStatus('Building lineup...', 'var(--amber)');
   await new Promise(r => setTimeout(r, 30));
   try {
-    nashData = runNashSimulation(players.filter(p => !p.isOut).slice(0, 120), sport, 150);
+    nashData = runNashSimulation((players || []).filter(p => !p.isOut).slice(0, 120), sport, 150);
 
     const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
       .sort((a,b) => b.edgeScore - a.edgeScore).slice(0, 80);
@@ -4110,7 +4116,7 @@ function renderIntelLive() {
 }
 
 // Keep fetchIntel as alias for screen switching
-function fetchIntel() { renderIntelLive(); }
+function fetchIntel() { if (players && players.length) renderIntelLive(); }
 
 // ── PATTERNS ──────────────────────────────────────────────────────
 function loadPatterns() {
