@@ -912,7 +912,12 @@ function parseCsv(text){
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     const status=statusI>=0?v[statusI]||'':'';
     const statusLow = (status||'').toLowerCase().trim();
-    const isOut = ['out','o','ir','il','il10','il60','il-10','il-60','injured list',
+    // Also scan ALL columns for IL indicator — DK puts it in various places
+    const allCols = v.join('|').toLowerCase();
+    const hasILAnywhere = allCols.includes('|il|') || allCols.includes(',il,') 
+      || allCols.startsWith('il|') || allCols.includes('injured list')
+      || allCols.includes('injured reserve');
+    const isOut = hasILAnywhere || ['out','o','ir','il','il10','il60','il-10','il-60','injured list',
       'injured reserve','injured','inactive','na','sus','suspended',
       'did not play','dnp','scratched','out indefinitely'
     ].includes(statusLow) || statusLow.startsWith('il') || statusLow.includes('injured list');
@@ -924,8 +929,9 @@ function parseCsv(text){
     if (['SP','RP','P'].includes(rawPos)) rawPos = 'P';
     if (['CF','LF','RF'].includes(rawPos)) rawPos = 'OF';
     const pos = rawPos || 'FLEX';
-    // DK prices bench/non-starters at $2,000-2,700 — filter them out
-    const isBenchPlayer = rawPos !== 'P' && salary > 0 && salary < 2900;
+    // DK prices bench/non-starters at $2,000-3,200 range — filter them out
+    // Confirmed starting position players are almost always $3,300+
+    const isBenchPlayer = rawPos !== 'P' && salary > 0 && salary < 3300;
     const finalIsOut = isOut || isBenchPlayer;
     return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status,isOut:finalIsOut};
   }).filter(Boolean);
