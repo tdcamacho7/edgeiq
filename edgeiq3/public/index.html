@@ -1507,7 +1507,7 @@ function analyzeLineupDNA(lineup, sp) {
   // Winning GPP lineup patterns (from historical analysis):
 
   // 1. Production quality: every player must project above minimum viable threshold
-  const minPts = { nba: 18, nfl: 10, mlb: 8 }[sp] || 15;
+  const minPts = { nba: 18, nfl: 10, mlb: 10 }[sp] || 15;
   const lowCeilingPlayers = valid.filter(l => (l.player.projPts || 0) < minPts);
   if (lowCeilingPlayers.length > 0) {
     dnaScore -= 15;
