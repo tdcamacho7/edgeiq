@@ -3486,8 +3486,10 @@ function optimize(all, sp) {
           })
           .map(([team, t]) => {
             const viablePlayers = t.players.filter(p => p.edgeScore >= MIN_STACK_EDGE);
-            const top4avg = viablePlayers.sort((a,b)=>b.edgeScore-a.edgeScore)
-              .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, viablePlayers.length);
+            // Rank teams by composite score (edge + proj) so stacks have real upside
+            const compScore = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts||0) * 5.5) * 0.40;
+            const top4avg = viablePlayers.sort((a,b)=>compScore(b)-compScore(a))
+              .slice(0,4).reduce((s,p)=>s+compScore(p),0) / Math.min(4, viablePlayers.length);
             const coverage = Math.min(1.3, 1 + new Set(viablePlayers.map(p=>p.pos)).size * 0.05);
             return [team, top4avg * coverage];
           }).sort((a,b)=>b[1]-a[1]);
@@ -3788,7 +3790,14 @@ function optimize(all, sp) {
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
 function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringBackCandidate = null) {
-  const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
+  // Sort by composite value: 60% edge (ownership leverage) + 40% projection quality.
+  // Pure edge-sort picks low-projection players when edge scores tie at 99.
+  // Composite ensures Cam Smith (17.4 proj, 99 edge) beats Andy Pages (9.9 proj, 99 edge).
+  const playerValue = p => {
+    const projScore = Math.min(99, (p.projPts || 0) * (p.pos === 'P' ? 3.3 : 5.5));
+    return p.edgeScore * 0.60 + projScore * 0.40;
+  };
+  const sorted = [...pool].sort((a,b) => playerValue(b) - playerValue(a));
   const used   = new Set();
   let salLeft  = budget;
   const lineup = [];
@@ -4035,12 +4044,25 @@ async function buildAndRender(quickRebuild = false) {
     // Best qualifying lineup is presented; if none qualifies after 25 tries,
     // the best-scoring attempt is shown with an honest gap message.
 
-    const TARGET_SCORE   = 98;
+    // Adaptive target: start at 98, relax by 1 every 8 failed attempts
+    // Prevents the engine from burning all 25 attempts on an unachievable bar
+    // and then falling back to a worse lineup than it already found.
+    const BASE_TARGET    = 98;
     const MIN_INDIV_EDGE = 72;
     const MAX_ATTEMPTS   = 25;
 
+    // Composite score: 65% edge (ownership leverage) + 35% projection quality
+    // This is what we actually optimize for — not pure edge, not pure projection.
+    const compositeScore = (candidate) => {
+      const valid = candidate.filter(l => l.player);
+      if (!valid.length) return 0;
+      const avgEdge = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
+      const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
+      return avgEdge * 0.65 + Math.min(99, totalProj / 2) * 0.35;
+    };
+
     // Helper: run all pass/fail rules against a candidate lineup
-    function lineupPassesRules(candidate) {
+    function lineupPassesRules(candidate, targetScore) {
       const valid = candidate.filter(l => l.player);
       if (!valid.length) return false;
 
@@ -4056,9 +4078,9 @@ async function buildAndRender(quickRebuild = false) {
       // Rule 3: individual edge floor
       if (valid.some(l => l.player.edgeScore < MIN_INDIV_EDGE)) return false;
 
-      // Rule 4: average edge target
+      // Rule 4: average edge target (adaptive)
       const avg = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
-      if (avg < TARGET_SCORE) return false;
+      if (avg < targetScore) return false;
 
       // Rule 5: total projected points floor.
       const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
@@ -4090,45 +4112,47 @@ async function buildAndRender(quickRebuild = false) {
     }
 
     let bestLineupSoFar = null;
-    let bestScoreSoFar  = 0;
+    let bestCompSoFar   = 0;
     let bestCleanLineup = null;
-    let bestCleanScore  = 0;
+    let bestCleanComp   = 0;
     let qualifyingLineup = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS}`, 'var(--amber)');
-      // Yield to browser so status updates render
+      // Adaptive target: relax by 1 every 8 attempts so the engine finds something real
+      const TARGET_SCORE = Math.max(94, BASE_TARGET - Math.floor(attempt / 8));
+      setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS} (target: ${TARGET_SCORE})`, 'var(--amber)');
       await new Promise(r => setTimeout(r, 0));
 
       const candidate = optimize(players, sport);
       if (!candidate?.length) { attempt++; continue; }
 
       const candidateValid = candidate.filter(l => l.player);
-      const score = scoreCandidate(candidate);
+      const comp = compositeScore(candidate);  // 65% edge + 35% projection
 
-      // Track best regardless of rules (emergency fallback)
-      if (score > bestScoreSoFar) {
-        bestScoreSoFar  = score;
+      // Track best by composite score (not just edge) — emergency fallback
+      if (comp > bestCompSoFar) {
+        bestCompSoFar   = comp;
         bestLineupSoFar = candidate;
       }
-      // Also track best lineup that at minimum passes the hitter projection floor,
-      // so the fallback never shows a Carpenter-at-5.6 lineup even if 98 isn't hit.
+      // Track best clean lineup (every hitter ≥ 8 proj) by composite score
       const passesHitterFloor = candidateValid.every(l =>
         l.player.pos === 'P' || (l.player.projPts || 0) >= 8
       );
-      if (passesHitterFloor && score > (bestCleanScore || 0)) {
-        bestCleanScore   = score;
-        bestCleanLineup  = candidate;
+      if (passesHitterFloor && comp > bestCleanComp) {
+        bestCleanComp   = comp;
+        bestCleanLineup = candidate;
       }
 
       // If all rules pass — we're done
-      if (lineupPassesRules(candidate)) {
+      if (lineupPassesRules(candidate, TARGET_SCORE)) {
         qualifyingLineup = candidate;
-        console.log(`✅ Qualifying lineup found on attempt ${attempt + 1} — avg edge ${Math.round(score)}`);
+        const avgEdge = Math.round(candidateValid.reduce((s,l)=>s+l.player.edgeScore,0)/candidateValid.length);
+        const totalProj = Math.round(candidateValid.reduce((s,l)=>s+(l.player.projPts||0),0));
+        console.log(`✅ Qualifying lineup on attempt ${attempt+1} — edge ${avgEdge}, proj ${totalProj}`);
         break;
       }
 
-      console.log(`Attempt ${attempt + 1}: avg edge ${Math.round(score)} — retrying`);
+      console.log(`Attempt ${attempt + 1}: composite ${comp.toFixed(1)}, target edge ${TARGET_SCORE} — retrying`);
 
       // Jitter grows with each attempt to explore more of the solution space
       // Attempts 1-5: ±4-8 (nearby combos) | 6-15: ±10-20 (different stacks) | 16+: ±22-28 (wholesale change)
@@ -4166,10 +4190,11 @@ async function buildAndRender(quickRebuild = false) {
     );
 
     if (!qualifyingLineup) {
-      const bestValid = (bestLineupSoFar || []).filter(l => l.player);
-      const bestProj  = Math.round(bestValid.reduce((s,l) => s + (l.player.projPts||0), 0));
-      const gap       = TARGET_SCORE - Math.round(bestScoreSoFar);
-      setStatus(`Best available: ${Math.round(bestScoreSoFar)} edge / ${bestProj} proj pts — ${gap} pts below 97 target. Re-upload CSV closer to lock.`, 'var(--amber)');
+      const shownLineup = bestCleanLineup || bestLineupSoFar || [];
+      const shownValid  = shownLineup.filter(l => l.player);
+      const shownEdge   = shownValid.length ? Math.round(shownValid.reduce((s,l) => s + l.player.edgeScore, 0) / shownValid.length) : 0;
+      const shownProj   = Math.round(shownValid.reduce((s,l) => s + (l.player.projPts||0), 0));
+      setStatus(`Best available: ${shownEdge} edge / ${shownProj} proj pts — re-upload CSV closer to lock for better projections.`, 'var(--amber)');
     }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
