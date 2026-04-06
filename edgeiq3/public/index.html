@@ -923,17 +923,34 @@ function parseCsv(text){
     const gi2=v[gi]||'', myTeam=v[ti]||'';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
+    // Get status from dedicated status/injury column
     const status = statusI>=0 ? (v[statusI]||'') : injuryInName || '';
     const statusLow = (status||'').toLowerCase().trim();
-    // Check injury in name suffix "(IL)", "(O)", "(DTD)" + status column + all cols
-    const nameHasIL = ['il','il10','il60','o','out','ir'].includes(injuryInName);
-    const allCols = v.join('|').toLowerCase();
-    const hasILAnywhere = nameHasIL || allCols.includes('|il|') || allCols.includes(',il,')
-      || allCols.includes('injured list') || allCols.includes('injured reserve');
-    const isOut = hasILAnywhere || ['out','o','ir','il','il10','il60','il-10','il-60','injured list',
-      'injured reserve','injured','inactive','na','sus','suspended',
-      'did not play','dnp','scratched','out indefinitely'
-    ].includes(statusLow) || statusLow.startsWith('il') || statusLow.includes('injured list');
+
+    // OUT status list
+    const OUT_STATUSES = ['out','o','ir','il','il10','il60','il-10','il-60',
+      'injured list','injured reserve','injured','inactive','na','sus',
+      'suspended','did not play','dnp','scratched','out indefinitely','sspd'];
+
+    // Check 1: injury suffix in player name "(IL)", "(O)", "(OUT)"
+    const nameHasIL = OUT_STATUSES.includes(injuryInName) || injuryInName.startsWith('il');
+
+    // Check 2: status column explicitly set
+    const statusIsOut = OUT_STATUSES.includes(statusLow) || statusLow.startsWith('il');
+
+    // Check 3: scan EVERY column individually for IL/OUT markers
+    // (fixes broken pipe-delimited check — CSV is comma-separated)
+    const colHasIL = v.some(col => {
+      const c = col.toLowerCase().trim();
+      return OUT_STATUSES.includes(c) || (c === 'il') || (c === 'o' && col.trim().length === 1);
+    });
+
+    // Check 4: find the "Injury Indicator" column specifically by header index
+    const injColI = hdr.findIndex(h => h.includes('injury') && h.includes('indicator'));
+    const injIndicator = (injColI >= 0 ? v[injColI] || '' : '').toLowerCase().trim();
+    const injIndicatorOut = injIndicator.length > 0 && injIndicator !== 'none' && injIndicator !== '-';
+
+    const isOut = nameHasIL || statusIsOut || colHasIL || injIndicatorOut;
     // Also treat extremely low salary non-pitchers as effectively unavailable
     // DK prices confirmed non-starters at $2,000-2,700 minimum
     // We use $2,800 as the cutoff to be safe
@@ -948,17 +965,21 @@ function parseCsv(text){
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3300) ||  // cheap = bench
-      (avgPtsVal === 0 && salary < 4500) // never scored + mid salary = not starting
+      (salary > 0 && salary < 3300) ||         // cheap = bench
+      (avgPtsVal === 0 && salary < 4500)        // never scored = not starting
     );
+    // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
+    // Don't exclude but mark so calcEdgeScore caps them
+    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
     const finalIsOut = isOut || isBenchPlayer;
+    const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
     const isRainGame = gameInfoLow.includes('ppd') || gameInfoLow.includes('postponed') 
       || gameInfoLow.includes('suspended') || gameInfoLow.includes('cancelled');
     const finalStatus = isRainGame ? 'PPD' : status;
     const finalIsOutWithRain = finalIsOut || isRainGame;
-    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status:finalStatus,isOut:finalIsOutWithRain};
+    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:avgPtsVal,status:finalStatus,isOut:finalIsOutWithRain,terriblePitcher};
   }).filter(Boolean);
 }
 
@@ -3199,6 +3220,9 @@ function calcEdgeScore(p) {
   if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);
   else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
 
+  // Terrible pitcher (negative FPPG avg) — hard cap, never pick
+  if (p.terriblePitcher) score = Math.min(score, 30);
+
   // GPP PITCHER CHALK KILLER: pitchers above 25% own are terrible GPP plays
   // Burns at 41.8% — if he hits, everyone wins with you. Zero leverage.
   // Hard cap: >35% own pitcher → max 55 edge | >25% own → -20 penalty
@@ -3796,6 +3820,15 @@ async function buildAndRender() {
       : 0;
 
     // Flag any individual weak players in final lineup
+    // Check for OUT/IL players that slipped through all filters
+    const outPlayers = finalValid.filter(l => l.player.isOut);
+    if (outPlayers.length > 0) {
+      const names = outPlayers.map(l => l.player.name).join(', ');
+      setStatus(`🚨 OUT players in lineup: ${names} — remove before entering!`, 'var(--red)');
+      setDot('error');
+      return; // don't render a lineup with OUT players
+    }
+
     const weakPlayers = finalValid.filter(l =>
       l.player.edgeScore < 60 ||
       (l.player.projPts < 7 && l.player.pos !== 'P') ||
