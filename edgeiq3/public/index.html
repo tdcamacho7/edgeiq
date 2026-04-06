@@ -102,6 +102,8 @@ input,button{font-family:var(--ui)}
   display:flex;align-items:center;gap:12px;
 }
 .player-card.flagged{border-color:var(--amber);background:rgba(245,158,11,.05)}
+.scratch-btn{opacity:0;transition:opacity .15s;background:none;border:1px solid rgba(239,68,68,.3);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.7);padding:1px 5px;vertical-align:middle;line-height:1.4;white-space:nowrap;margin-left:4px}
+.player-card:hover .scratch-btn{opacity:1}
 .slot-pos{
   font-size:10px;font-weight:700;letter-spacing:.04em;
   padding:4px 7px;border-radius:6px;text-align:center;
@@ -1050,10 +1052,16 @@ function parseCsv(text){
       (salary > 0 && salary < 3300) ||         // cheap = bench
       (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
     );
-    // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
-    // Don't exclude but mark so calcEdgeScore caps them
-    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
-    const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
+    // Pitcher-specific exclusions (applied before MLB optimizer runs)
+    // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
+    // avgPts === 0 = no history this season = not in rotation.
+    const isBadPitcher = rawPos === 'P' && (
+      salary < 5500 ||          // below DK starter floor
+      avgPtsVal === 0           // never scored = not a starter
+    );
+    // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
+    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
+    const finalIsOut = isOut || isBenchPlayer || isBadPitcher || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
@@ -3335,7 +3343,11 @@ function optimize(all, sp) {
   // The stack team is chosen by which team's hitters have the most
   // viable DK slots and highest combined edge scores.
   if (sp === 'mlb') {
-    const pitchers    = eligible.filter(p => p.pos === 'P').sort((a,b) => b.edgeScore - a.edgeScore);
+    // Hard gates: salary floor $5,500 and must have scored at least once (avgPts > 0).
+    // Same rules as parseCsv — belt-and-suspenders in case CSV wasn't re-uploaded.
+    const pitchers    = eligible
+      .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0)
+      .sort((a,b) => b.edgeScore - a.edgeScore);
     const hitters     = eligible.filter(p => p.pos !== 'P');
     const hitterSlots = slots.filter(s => s !== 'P');
 
@@ -3349,6 +3361,20 @@ function optimize(all, sp) {
     });
     // stackTeam is determined inside the pitcher loop (depends on which pitchers are picked)
     let bestMLBScore = -1, bestMLBLineup = null;
+    if (!pitchers.length) {
+      // No valid pitchers — means all pitchers in CSV have 0 avgPts or sub-$5,500 salary.
+      // This can happen with very early-season CSVs before pitchers have logged innings.
+      // In that case, relax to allow pitchers with salary >= 5500 regardless of avgPts.
+      const fallbackPitchers = eligible
+        .filter(p => p.pos === 'P' && p.salary >= 5500)
+        .sort((a,b) => b.edgeScore - a.edgeScore);
+      if (fallbackPitchers.length) {
+        console.warn('No pitchers with avgPts > 0 — using salary-only filter (early season slate)');
+        pitchers.push(...fallbackPitchers);
+      } else {
+        return null; // truly no pitchers available
+      }
+    }
     const topPitchers = pitchers.slice(0, 8);
 
     for (let i = 0; i < topPitchers.length; i++) {
@@ -4129,8 +4155,7 @@ function renderLineup(entropyScore, kelly, dna, contest) {
       <div class="player-info">
         <div class="player-name">
           ${p.name} ${chips}
-          <button onclick="markPlayerOut('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
-            style="background:none;border:1px solid rgba(239,68,68,.25);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.6);margin-left:5px;padding:1px 4px;vertical-align:middle;line-height:1.4;letter-spacing:.02em"
+          <button class="scratch-btn" onclick="markPlayerOut('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
             title="Mark ${p.name} as scratched — removes from lineup immediately">✕ scratch</button>
           <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
             style="background:none;border:none;cursor:pointer;font-size:11px;opacity:0.3;margin-left:2px;padding:0;vertical-align:middle"
