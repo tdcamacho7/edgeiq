@@ -815,6 +815,10 @@ async function fetchVegasFromProxy(sp) {
     const r = await fetch(`/api/proxy?dgId=0&sport=${sp}&action=vegas`, { signal: AbortSignal.timeout(8000) });
     if (!r.ok) return {};
     const data = await r.json();
+    // Cache props alongside odds so enrich() can use both without a second round-trip
+    if (data.props && Object.keys(data.props).length) {
+      window._cachedProps = data.props;
+    }
     return data.odds || {};
   } catch(e) { return {}; }
 }
