@@ -653,7 +653,7 @@ async function handleCsv(input){
 
   const reader=new FileReader();
   reader.onload= async e=>{
-    const raw=parseCsv(e.target.result);
+    let raw=parseCsv(e.target.result);
     if(!raw.length){ setStatus('Could not read CSV — try re-downloading from DraftKings','var(--red)'); setDot('error'); return; }
 
     setStatus(`${raw.length} players found · fetching live data...`,'var(--amber)');
