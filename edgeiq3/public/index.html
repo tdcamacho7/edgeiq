@@ -3908,7 +3908,15 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         && hitterOk(p) && !teamFull(p.team)
       );
     }
-    // Last resort: relax proj floor too (rare — only on very thin slates)
+    // Last resort: keep hitter proj floor even here — bad matchup still blocked
+    // If truly nothing exists, accept anything above 8 pts (never go below)
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && !teamFull(p.team) && (p.pos === 'P' || (p.projPts||0) >= 8)
+      );
+    }
+    // Absolute floor: take anything that fits salary + team cap (thin slate safety)
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -4261,10 +4269,12 @@ function markPlayerOut(name) {
   players = players.map(p =>
     p.name.toLowerCase() === n ? { ...p, isOut: true, edgeScore: 0 } : p
   );
-  // Persist to localStorage so scratch survives page refresh and CSV re-upload
   localStorage.setItem('edgeiq_scratched', JSON.stringify([...manualOutNames]));
-  setStatus(`🚨 ${name} marked OUT — rebuilding...`, 'var(--red)');
-  buildAndRender(true); // quickRebuild=true: skip proxy calls, reuse signals
+  setStatus(`🚨 ${name} scratched — finding replacement...`, 'var(--red)');
+  // Use full rebuild (not quick) when scratching — salary needs to reflow
+  // to find a proper replacement. Quick rebuild reuses signals that may 
+  // have locked the scratched player's salary slot.
+  buildAndRender(false);
 }
 
 function isManuallyOut(name) {
