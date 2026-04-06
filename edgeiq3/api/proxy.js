@@ -38,6 +38,34 @@ export default async function handler(req, res) {
     });
   }
 
+  // ── VEGAS ODDS ACTION ─────────────────────────────────────────────
+  // Client calls /api/proxy?dgId=0&sport=mlb&action=vegas
+  // Previously: no handler → fell through to DK scraper path → 502 every time
+  // Vegas weights were dead, engine ran on defaults, same lineup every build
+  if (action === 'vegas') {
+    const sp = sport || 'mlb';
+    const [vegasData, propsData] = await Promise.allSettled([
+      fetchVegasOdds(sp),
+      fetchPlayerProps(sp),
+    ]);
+    const odds  = vegasData.status  === 'fulfilled' ? vegasData.value  : {};
+    const props = propsData.status  === 'fulfilled' ? propsData.value  : {};
+    return res.status(200).json({
+      success: true,
+      odds,
+      props,
+      gamesWithOdds: Math.floor(Object.keys(odds).filter(k => !k.includes('_total')).length / 2),
+      hasOddsKey: !!oddsKey,
+    });
+  }
+
+  // ── PROPS ACTION ──────────────────────────────────────────────────
+  if (action === 'props') {
+    const sp = sport || 'mlb';
+    const props = await fetchPlayerProps(sp).catch(() => ({}));
+    return res.status(200).json({ success: true, props });
+  }
+
   // ── FETCH OWNERSHIP FROM ALL FREE SOURCES ────────────────────────
   // Rotowire: free JSON endpoint, no ScraperAPI needed
   async function fetchRotowireOwnership(sp) {
@@ -556,7 +584,8 @@ export default async function handler(req, res) {
     return res.json({ success: true, activeNames, teamCount: teams.length });
   }
 
-  if (!dgId) return res.status(400).json({ error: 'No ID provided' });
+  // Guard: action-only requests (dgId=0 or missing) should never reach DK scraping
+  if (!dgId || dgId === '0') return res.status(400).json({ error: 'No ID provided' });
 
   let draftGroupId = dgId;
   try {
