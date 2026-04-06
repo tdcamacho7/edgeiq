@@ -721,6 +721,9 @@ async function handleCsv(input){
     }
 
     // Apply all data to players
+    // Apply persisted scratches immediately so scratched players never enter the pipeline
+    raw = raw.map(p => isManuallyOut(p.name) ? { ...p, isOut: true } : p);
+
     let withData = raw.map(p => {
       // Injury status from ESPN
       const espnStatus = injuryMap[p.name.toLowerCase()] ||
@@ -3790,6 +3793,7 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   let salLeft  = budget;
   const lineup = [];
   const MIN    = 2500;
+  const DK_MAX_PER_TEAM = 5; // DraftKings rule: max 5 players from same team
 
   // ── IDENTIFY STACK TEAM ───────────────────────────────────────────
   // Best team = highest avg edge score among top-4 hitters at 3+ positions
@@ -3832,12 +3836,18 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     const mustStack = needStack && stackCount < 4 && stackSlots < needMore;
     const wantStack = needStack && stackCount < 4;
 
+    // Count how many players per team are already in the lineup
+    const teamCount = {};
+    lineup.forEach(l => { if (l.player?.team) teamCount[l.player.team] = (teamCount[l.player.team] || 0) + 1; });
+    const teamFull = t => (teamCount[t] || 0) >= DK_MAX_PER_TEAM;
+
     if (needStack) {
       if (mustStack || wantStack) {
         // Find best stack team player at this position
         const stackPick = sorted.find(p =>
           !used.has(p.name) && p.salary <= maxBudget &&
-          positions.includes(p.pos) && p.team === stackTeam
+          positions.includes(p.pos) && p.team === stackTeam &&
+          !teamFull(p.team)
         );
         // ALWAYS pick stack player when building toward 4-man stack
         // The +60 stack bonus outweighs individual edge score differences
@@ -3859,7 +3869,8 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       const isBringBackSlot = ['OF','FLEX','UTIL'].includes(slot);
       if (stackDone && isBringBackSlot && positions.includes(bringBackCandidate.pos)
           && bringBackCandidate.salary <= maxBudget
-          && bringBackCandidate.edgeScore >= 75) {
+          && bringBackCandidate.edgeScore >= 75
+          && !teamFull(bringBackCandidate.team)) {  // DK team cap
         pick = bringBackCandidate;
       }
     }
@@ -3869,13 +3880,22 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     const EDGE_FLOOR = 72;
     if (!pick) {
       pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) && p.edgeScore >= EDGE_FLOOR
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && p.edgeScore >= EDGE_FLOOR && !teamFull(p.team)  // DK team cap
       );
     }
-    // If nothing meets the floor, relax and take best available (salary and constraints are hard; edge is soft)
+    // If nothing meets the floor, relax edge but still enforce DK team cap
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && !teamFull(p.team)  // DK team cap is always hard
+      );
+    }
+    // Absolute last resort: ignore edge floor only (team cap still applies)
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && !teamFull(p.team)
       );
     }
 
@@ -3901,19 +3921,28 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 
     // Prefer upgrading within stack team first to maintain the stack
     const inStack = cur.team === stackTeam && slot !== 'P';
+    // Recount team usage for upgrade pass (excluding current player being replaced)
+    const upgTeamCount = {};
+    lineup.forEach((l, li) => {
+      if (li !== i && l.player?.team) upgTeamCount[l.player.team] = (upgTeamCount[l.player.team] || 0) + 1;
+    });
+    const upgTeamFull = t => (upgTeamCount[t] || 0) >= DK_MAX_PER_TEAM;
+
     const upgrade = sorted.find(p =>
       !used.has(p.name) &&
       p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
       positions.includes(p.pos) &&
       p.edgeScore >= cur.edgeScore - 5 &&
-      (!inStack || p.team === stackTeam) // stay within stack if already in it
+      !upgTeamFull(p.team) &&          // DK team cap
+      (!inStack || p.team === stackTeam)
     ) || sorted.find(p =>
       !used.has(p.name) &&
       p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
       positions.includes(p.pos) &&
-      p.edgeScore >= cur.edgeScore - 5
+      p.edgeScore >= cur.edgeScore - 5 &&
+      !upgTeamFull(p.team)             // DK team cap
     );
 
     if (upgrade) {
@@ -4029,11 +4058,18 @@ async function buildAndRender(quickRebuild = false) {
       if (avg < TARGET_SCORE) return false;
 
       // Rule 5: total projected points floor.
-      // Prevents high-edge/low-projection lineups (1%-own pitchers with 9pt ceilings).
-      // MLB winning scores are typically 120-160 pts — floor at 130 ensures real upside.
       const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
       const MIN_TOTAL_PROJ = sport === 'mlb' ? 130 : sport === 'nba' ? 280 : 140;
-      return totalProj >= MIN_TOTAL_PROJ;
+      if (totalProj < MIN_TOTAL_PROJ) return false;
+
+      // Rule 6: DraftKings team cap — max 5 players from any single team
+      const teamCounts = {};
+      for (const l of valid) {
+        const t = l.player.team || '';
+        teamCounts[t] = (teamCounts[t] || 0) + 1;
+        if (teamCounts[t] > 5) return false;
+      }
+      return true;
     }
 
     function scoreCandidate(candidate) {
@@ -4160,7 +4196,8 @@ function excludePlayer(name) {
 }
 
 // Manual OUT list — applied during CSV parse
-let manualOutNames = new Set();
+// Persist scratched players across sessions — Paredes stays out until manually cleared
+let manualOutNames = new Set(JSON.parse(localStorage.getItem('edgeiq_scratched') || '[]'));
 
 // Persist manual OUTs across CSV re-uploads (not page refresh — that clears the slate)
 function markPlayerOut(name) {
@@ -4171,6 +4208,8 @@ function markPlayerOut(name) {
   players = players.map(p =>
     p.name.toLowerCase() === n ? { ...p, isOut: true, edgeScore: 0 } : p
   );
+  // Persist to localStorage so scratch survives page refresh and CSV re-upload
+  localStorage.setItem('edgeiq_scratched', JSON.stringify([...manualOutNames]));
   setStatus(`🚨 ${name} marked OUT — rebuilding...`, 'var(--red)');
   buildAndRender(true); // quickRebuild=true: skip proxy calls, reuse signals
 }
@@ -4187,6 +4226,18 @@ function clearExclusions() {
   excludedPlayers.clear();
   localStorage.removeItem('edgeiq_banned');
   setStatus('All bans cleared — re-upload CSV to rebuild', 'var(--cyan)');
+}
+
+function clearScratches() {
+  manualOutNames.clear();
+  localStorage.removeItem('edgeiq_scratched');
+  // Re-enable scratched players in the active pool
+  players = players.map(p => {
+    if (isManuallyOut(p.name)) return { ...p, isOut: false };
+    return p;
+  });
+  setStatus('Scratches cleared — rebuilding...', 'var(--cyan)');
+  buildAndRender(true);
 }
 
 // ── RENDER LINEUP ─────────────────────────────────────────────────
@@ -4284,8 +4335,11 @@ function renderLineup(entropyScore, kelly, dna, contest) {
   // Show a persistent warning so user always checks DK before submitting.
   const verifyBanner = `
     <div id="verify-banner" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:11px">
-      <div style="font-weight:700;color:var(--amber);margin-bottom:5px">⚠️ Verify before submitting</div>
-      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Game-day scratches aren't caught by any free API — use the <b style="color:var(--red)">✕ scratch</b> button to remove them.</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+        <div style="font-weight:700;color:var(--amber)">⚠️ Verify before submitting</div>
+        ${manualOutNames.size > 0 ? `<button onclick="clearScratches()" style="background:none;border:1px solid rgba(245,158,11,.4);border-radius:4px;cursor:pointer;font-size:9px;color:var(--amber);padding:2px 6px">Clear ${manualOutNames.size} scratch${manualOutNames.size>1?'es':''}</button>` : ''}
+      </div>
+      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Game-day scratches aren't caught by any free API — use the <b style="color:var(--red)">✕ scratch</b> button to remove them. Scratches persist until cleared.</div>
     </div>`;
   const existingBanner = document.getElementById('verify-banner');
   if (!existingBanner) {
