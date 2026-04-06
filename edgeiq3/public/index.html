@@ -732,6 +732,15 @@ async function handleCsv(input){
     const ownCount  = withData.filter(p=>p.fpOwnership!=null).length;
     const vegasCount= withData.filter(p=>p.vegasImplied!=null).length;
 
+    // Fetch weather BEFORE enrich — weatherCache must be populated
+    // so calcWeatherPenalty works when enrich() runs
+    setStatus(`${withData.length} players · fetching weather...`, 'var(--amber)');
+    await Promise.race([
+      fetchWeatherData(withData, sport),
+      new Promise(r => setTimeout(r, 4000))
+    ]).catch(() => {});
+    const weatherTeams = Object.keys(weatherCache).length;
+
     players = enrich(withData);
     buildAndRender();
 
@@ -739,6 +748,7 @@ async function handleCsv(input){
       `${outCount} OUT filtered`,
       ownCount > 0 ? `${ownCount} real ownership%` : 'ownership estimated',
       vegasCount > 0 ? `${vegasCount} Vegas lines` : null,
+      weatherTeams > 0 ? `${weatherTeams} weather feeds` : null,
     ].filter(Boolean).join(' · ');
 
     setStatus(`${players.length} players · ${sources}`,'var(--green)');
