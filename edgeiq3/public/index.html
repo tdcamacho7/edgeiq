@@ -942,7 +942,13 @@ function parseCsv(text){
       (avgPtsVal === 0 && salary < 4500) // never scored + mid salary = not starting
     );
     const finalIsOut = isOut || isBenchPlayer;
-    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status,isOut:finalIsOut};
+    // Flag rain/PPD games — DK sometimes includes PPD in game info
+    const gameInfoLow = gi2.toLowerCase();
+    const isRainGame = gameInfoLow.includes('ppd') || gameInfoLow.includes('postponed') 
+      || gameInfoLow.includes('suspended') || gameInfoLow.includes('cancelled');
+    const finalStatus = isRainGame ? 'PPD' : status;
+    const finalIsOutWithRain = finalIsOut || isRainGame;
+    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:parseFloat(v[ai])||0,status:finalStatus,isOut:finalIsOutWithRain};
   }).filter(Boolean);
 }
 
@@ -3021,16 +3027,19 @@ const POS_AVG_MAP = {
 // Ownership multiplier: rewards uniqueness
 // 0% own  → 1.50x | 15% own → 1.30x | 30% own → 1.10x | 45%+ → 0.90x
 function ownershipMult(own) {
-  // Steeper curve rewards ultra-low ownership more aggressively
-  // 2% own → 1.65x | 7% own → 1.52x | 15% own → 1.32x | 25% own → 1.10x | 35%+ → 0.85x
-  // Previous: 2%→1.47, 7%→1.40, 25%→1.15 — not enough separation
-  if (own <= 3)  return 1.65;
-  if (own <= 7)  return 1.55;
+  // Ultra-steep curve — maximum separation between chalk and contrarian
+  // 1% own → 1.80x | 5% own → 1.65x | 10% own → 1.48x | 20% own → 1.20x
+  // 30% own → 0.95x | 40%+ own → 0.75x
+  if (own <= 1)  return 1.80;
+  if (own <= 3)  return 1.72;
+  if (own <= 5)  return 1.65;
+  if (own <= 8)  return 1.55;
   if (own <= 12) return 1.42;
-  if (own <= 18) return 1.28;
-  if (own <= 25) return 1.10;
-  if (own <= 32) return 0.95;
-  return Math.max(0.75, 0.95 - (own - 32) * 0.02);
+  if (own <= 18) return 1.25;
+  if (own <= 25) return 1.08;
+  if (own <= 32) return 0.92;
+  if (own <= 40) return 0.80;
+  return 0.70; // 40%+ chalk = basically useless in GPP
 }
 
 // Reliability: shrinks low-sample players toward position average
@@ -3133,11 +3142,18 @@ function calcEdgeScore(p) {
     score = Math.max(10, score - 15); // -15 points for questionable players
   }
 
-  // DvP matchup — soft penalties only (no hard caps)
-  // Hard caps excluded players from stack building even when needed
-  // Soft penalties let the optimizer still use them when required (e.g. stack completion)
-  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);  // -20 penalty
-  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);  // -10 penalty
+  // DvP matchup penalties
+  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);
+  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
+
+  // GPP PITCHER CHALK KILLER: pitchers above 25% own are terrible GPP plays
+  // Burns at 41.8% — if he hits, everyone wins with you. Zero leverage.
+  // Hard cap: >35% own pitcher → max 55 edge | >25% own → -20 penalty
+  if (pos === 'P') {
+    if (own > 35) score = Math.min(55, score);       // extreme chalk — hard cap
+    else if (own > 25) score = Math.max(10, score - 20); // high chalk — heavy penalty
+    else if (own > 18) score = Math.max(10, score - 8);  // moderate chalk — soft penalty
+  }
 
   return Math.max(10, Math.min(99, score));
 }
@@ -3560,11 +3576,13 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         // ALWAYS pick stack player when building toward 4-man stack
         // The +60 stack bonus outweighs individual edge score differences
         // Only skip if stack player is completely unavailable (injured/no player at position)
-        if (stackPick && stackPick.edgeScore >= 60 && (stackPick.projPts || 0) >= 7) {
-          pick = stackPick; // only force stack if player is genuinely viable
+        // C slot has naturally lower scores — use lower threshold for catchers
+        const stackMinEdge = positions.includes('C') ? 50 : 60;
+        const stackMinPts  = positions.includes('C') ? 6  : 7;
+        if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || 0) >= stackMinPts) {
+          pick = stackPick;
         }
-        // If no viable stack player (edge < 60 or proj < 7),
-        // take best available — a partial stack beats a bad-player stack
+        // If no viable stack player, take best available
       }
     }
 
