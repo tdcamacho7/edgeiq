@@ -4103,6 +4103,7 @@ async function buildAndRender(quickRebuild = false) {
       const candidate = optimize(players, sport);
       if (!candidate?.length) { attempt++; continue; }
 
+      const candidateValid = candidate.filter(l => l.player);
       const score = scoreCandidate(candidate);
 
       // Track best regardless of rules (emergency fallback)
