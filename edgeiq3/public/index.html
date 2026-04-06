@@ -1267,57 +1267,100 @@ const MLB_STADIUM_CITIES = {
 };
 
 function calcWeatherPenalty(player, sp) {
-  if (sp === 'nba') return 0; // always indoors
-  if (sp === 'nfl' && DOME_TEAMS.has(player.team)) return 0;
+  if (sp === 'nba') return 0;
+  if (DOME_TEAMS.has(player.team)) return 0;
 
   const cached = weatherCache[player.team];
   if (!cached) return 0;
-  if (cached.isIndoor) return 0;
 
   let penalty = 0;
-  // Wind > 15mph: passing game suppressed
-  if (cached.windSpeed > 15) {
-    if (['QB','WR','TE'].includes(player.pos)) penalty -= Math.round((cached.windSpeed - 15) * 0.4);
-  }
-  // Wind > 20mph: all offense suppressed
-  if (cached.windSpeed > 20) penalty -= 3;
-  // Heavy precipitation: further suppression
-  if (cached.precipitation > 0.3) penalty -= 4;
-  // Extreme cold (<20°F): passing game affected
-  if (cached.temp < 20) penalty -= 3;
-  // MLB: wind blowing OUT is a BOOST for hitters
-  if (sp === 'mlb' && cached.windDirection === 'out' && cached.windSpeed > 8) {
-    if (player.pos !== 'P') penalty += Math.round(cached.windSpeed * 0.3);
-    else penalty -= Math.round(cached.windSpeed * 0.2);
+  const pos = player.pos || '';
+
+  // ── RAIN / STORM ──────────────────────────────────────────────────
+  if (cached.isStorm) {
+    // Heavy rain = game may be delayed/cancelled = avoid entirely
+    penalty -= 15; // very heavy penalty — don't play rain games in DFS
+  } else if (cached.isRaining) {
+    // Light rain: hurts offense, especially power
+    penalty -= 6;
+    if (sp === 'mlb' && pos === 'P') penalty += 3; // pitchers benefit from rain
   }
 
-  return Math.max(-12, Math.min(8, penalty));
+  // ── WIND ─────────────────────────────────────────────────────────
+  if (sp === 'mlb') {
+    if (cached.windDirection === 'out' && cached.windSpeed > 8) {
+      // Wind blowing OUT = hitter boost (more HRs)
+      if (pos !== 'P') penalty += Math.min(8, Math.round(cached.windSpeed * 0.35));
+      else penalty -= Math.round(cached.windSpeed * 0.25); // bad for pitchers
+    } else if (cached.windDirection === 'in' && cached.windSpeed > 10) {
+      // Wind blowing IN = pitcher boost
+      if (pos === 'P') penalty += Math.min(6, Math.round(cached.windSpeed * 0.25));
+      else penalty -= Math.round(cached.windSpeed * 0.2);
+    }
+  }
+
+  if (sp === 'nfl') {
+    if (cached.windSpeed > 20) penalty -= 5;
+    else if (cached.windSpeed > 15) {
+      if (['QB','WR','TE'].includes(pos)) penalty -= Math.round((cached.windSpeed-15) * 0.5);
+    }
+    if (cached.precipitation > 0.5) penalty -= 4;
+    if (cached.temp < 20) penalty -= 3;
+  }
+
+  return Math.max(-15, Math.min(8, penalty));
 }
 
 async function fetchWeatherData(playerList, sp) {
-  if (sp === 'nba') return;
-  const weatherKey = ''; // OpenWeatherMap key — add to Vercel env as WEATHER_KEY
-  if (!weatherKey) return;
+  if (sp === 'nba') return; // always indoors
 
   const teamsToFetch = [...new Set(playerList.map(p => p.team))].filter(t => !DOME_TEAMS.has(t));
-  for (const team of teamsToFetch.slice(0, 5)) {
+  
+  // Use wttr.in — completely FREE, no API key needed
+  // Returns JSON weather data for any city
+  const fetches = teamsToFetch.slice(0, 8).map(async team => {
+    if (DOME_TEAMS.has(team)) return;
     const city = MLB_STADIUM_CITIES[team] || team;
     try {
       const r = await fetch(
-        `https://api.openweathermap.org/data/2.5/weather?q=${city}&appid=${weatherKey}&units=imperial`,
-        { signal: AbortSignal.timeout(5000) }
+        `https://wttr.in/${encodeURIComponent(city)}?format=j1`,
+        { signal: AbortSignal.timeout(4000) }
       );
-      if (!r.ok) continue;
+      if (!r.ok) return;
       const data = await r.json();
+      const cur = data.current_condition?.[0];
+      if (!cur) return;
+
+      const tempF      = parseFloat(cur.temp_F || 72);
+      const windMph    = parseFloat(cur.windspeedMiles || 0);
+      const windDirDeg = parseFloat(cur.winddirDegree || 180);
+      const precipMm   = parseFloat(cur.precipMM || 0);
+      const weatherCode= parseInt(cur.weatherCode || 113);
+      
+      // Weather codes: 113=clear, 116=partly cloudy, 119=cloudy
+      // 176+=light rain, 200+=rain, 263+=heavy rain, 299+=storm
+      const isRaining  = weatherCode >= 176 || precipMm > 0.5;
+      const isStorm    = weatherCode >= 299 || precipMm > 2;
+      
+      // Wind direction relative to typical stadium orientation
+      // This is simplified — ideally we'd know each park's orientation
+      // For now: wind coming from West (225-315°) tends to blow OUT in most parks
+      const windOut = windDirDeg >= 225 && windDirDeg <= 315;
+
       weatherCache[team] = {
-        temp: data.main?.temp || 72,
-        windSpeed: data.wind?.speed || 0,
-        windDirection: data.wind?.deg > 180 ? 'out' : 'in', // simplified
-        precipitation: data.rain?.['1h'] || 0,
+        temp: tempF,
+        windSpeed: windMph,
+        windDirection: windOut ? 'out' : 'in',
+        precipitation: precipMm,
         isIndoor: false,
+        isRaining,
+        isStorm,
+        weatherCode,
       };
-    } catch(e) { continue; }
-  }
+    } catch(e) { /* silently skip — don't let weather crash lineup build */ }
+  });
+
+  await Promise.allSettled(fetches);
 }
 
 // ── INJURY HISTORY / RECURRENCE RISK ─────────────────────────────
