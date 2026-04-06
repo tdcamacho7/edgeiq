@@ -3928,7 +3928,14 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         && !teamFull(p.team) && p.dvpLabel?.badge !== 'bad matchup'
       );
     }
-    // Absolute emergency: take anything (thin slate with only bad matchup left)
+    // Absolute emergency: still block bad matchup — a scratched slot is better than a bad matchup
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && !teamFull(p.team) && p.dvpLabel?.badge !== 'bad matchup'
+      );
+    }
+    // True absolute last (only if ALL remaining players have bad matchup — extremely rare)
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -4006,6 +4013,11 @@ async function buildAndRender(quickRebuild = false) {
     setDot('');
     setStatus('Upload a DraftKings CSV to build your lineup', 'var(--t3)');
     return;
+  }
+  const scratchCount = manualOutNames.size;
+  if (scratchCount > 6) {
+    setStatus(`⚠️ ${scratchCount} players scratched — player pool is depleted. Clear scratches and re-scratch only OUT players.`, 'var(--red)');
+    await new Promise(r => setTimeout(r, 2000));
   }
   setStatus(quickRebuild ? 'Rebuilding lineup...' : 'Building lineup...', 'var(--amber)');
   await new Promise(r => setTimeout(r, 30));
@@ -4160,9 +4172,12 @@ async function buildAndRender(quickRebuild = false) {
         bestLineupSoFar = candidate;
       }
       // Track best clean lineup (every hitter ≥ 8 proj) by composite score
-      const passesHitterFloor = candidateValid.every(l =>
-        l.player.pos === 'P' || (l.player.projPts || 0) >= 8
-      );
+      const passesHitterFloor = candidateValid.every(l => {
+        if (l.player.pos === 'P') return true;
+        if ((l.player.projPts || 0) < 11) return false;           // same as lineupPassesRules
+        if (l.player.dvpLabel?.badge === 'bad matchup') return false; // same as lineupPassesRules
+        return true;
+      });
       if (passesHitterFloor && comp > bestCleanComp) {
         bestCleanComp   = comp;
         bestCleanLineup = candidate;
