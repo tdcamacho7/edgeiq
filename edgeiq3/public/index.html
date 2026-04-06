@@ -4035,7 +4035,7 @@ async function buildAndRender(quickRebuild = false) {
     // Best qualifying lineup is presented; if none qualifies after 25 tries,
     // the best-scoring attempt is shown with an honest gap message.
 
-    const TARGET_SCORE   = 97;
+    const TARGET_SCORE   = 98;
     const MIN_INDIV_EDGE = 72;
     const MAX_ATTEMPTS   = 25;
 
@@ -4091,6 +4091,8 @@ async function buildAndRender(quickRebuild = false) {
 
     let bestLineupSoFar = null;
     let bestScoreSoFar  = 0;
+    let bestCleanLineup = null;
+    let bestCleanScore  = 0;
     let qualifyingLineup = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -4107,6 +4109,15 @@ async function buildAndRender(quickRebuild = false) {
       if (score > bestScoreSoFar) {
         bestScoreSoFar  = score;
         bestLineupSoFar = candidate;
+      }
+      // Also track best lineup that at minimum passes the hitter projection floor,
+      // so the fallback never shows a Carpenter-at-5.6 lineup even if 98 isn't hit.
+      const passesHitterFloor = candidateValid.every(l =>
+        l.player.pos === 'P' || (l.player.projPts || 0) >= 8
+      );
+      if (passesHitterFloor && score > (bestCleanScore || 0)) {
+        bestCleanScore   = score;
+        bestCleanLineup  = candidate;
       }
 
       // If all rules pass — we're done
@@ -4140,7 +4151,7 @@ async function buildAndRender(quickRebuild = false) {
     });
 
     // Use qualifying lineup if found, otherwise best we got
-    lineup = qualifyingLineup || bestLineupSoFar || [];
+    lineup = qualifyingLineup || bestCleanLineup || bestLineupSoFar || [];
 
     if (!lineup.length) {
       setDot('error');
