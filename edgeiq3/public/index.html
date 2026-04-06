@@ -971,6 +971,11 @@ function parseCsv(text){
   let start=0;
   for(let i=0;i<lines.length;i++){ if(lines[i].includes('Salary')&&lines[i].includes('Position')){ start=i; break; } }
   const hdr=lines[start].split(',').map(h=>h.trim().replace(/"/g,'').toLowerCase().replace(/ /g,'_'));
+  // DEBUG: log all column headers so we can see exactly what DK CSV contains
+  console.log('DK CSV columns:', hdr.join(' | '));
+  // Also log first 2 player rows to see injury indicator values
+  if(lines[start+1]) console.log('Row 1:', lines[start+1]);
+  if(lines[start+2]) console.log('Row 2:', lines[start+2]);
   const ni=hdr.findIndex(h=>h==='name'||h==='nickname');
   const pi=hdr.findIndex(h=>h==='position');
   const si=hdr.findIndex(h=>h==='salary');
