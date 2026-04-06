@@ -39,7 +39,36 @@ export default async function handler(req, res) {
   }
 
   // ── FETCH OWNERSHIP FROM ALL FREE SOURCES ────────────────────────
+  // Rotowire: free JSON endpoint, no ScraperAPI needed
+  async function fetchRotowireOwnership(sp) {
+    const path = sp === 'mlb' ? 'mlb' : sp === 'nba' ? 'nba' : 'nfl';
+    try {
+      const r = await fetch(
+        `https://www.rotowire.com/daily/tables/optimizer-${path}.php`,
+        { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } }
+      );
+      if (!r.ok) return {};
+      const data = await r.json();
+      const map = {};
+      (Array.isArray(data) ? data : data.players || Object.values(data) || []).forEach(p => {
+        const name = (p.player_name || p.name || p.playerName || '').toLowerCase().trim();
+        const own  = parseFloat(p.owned || p.ownership || p.own_pct || p.percentDrafted || 0);
+        if (name && own > 0) {
+          map[name] = own;
+          const last = name.split(' ').pop();
+          if (last.length > 3) map[last] = own;
+        }
+      });
+      return map;
+    } catch(e) { return {}; }
+  }
+
   async function fetchAllOwnership(sp) {
+    // Try Rotowire first — free, no ScraperAPI credits
+    const rotowire = await fetchRotowireOwnership(sp).catch(() => ({}));
+    if (Object.keys(rotowire).length > 15) return rotowire;
+
+    // Fall back to ScraperAPI sources
     const sources = await Promise.allSettled([
       fetchFantasyProsOwnership(sp),
       fetchRotogrindersOwnership(sp),
