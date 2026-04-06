@@ -3412,11 +3412,17 @@ function optimize(all, sp) {
   // The stack team is chosen by which team's hitters have the most
   // viable DK slots and highest combined edge scores.
   if (sp === 'mlb') {
-    // Hard gates: salary floor $5,500 and must have scored at least once (avgPts > 0).
-    // Same rules as parseCsv — belt-and-suspenders in case CSV wasn't re-uploaded.
+    // Pitcher gates:
+    //   - salary >= $5,500 (DK starter floor)
+    //   - avgPts > 0 (has scored this season = in rotation)
+    //   - projPts >= 14 (projects a meaningful fantasy score — 9.6 pt pitchers are not GPP plays)
+    // Sort by blended score: 60% edge (ownership-adjusted upside) + 40% projection quality.
+    // Prevents ownership multiplier from floating bad-projection pitchers to the top.
+    const PITCHER_MIN_PROJ = 14;
+    const pitcherBlend = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts / 30) * 99) * 0.40;
     const pitchers    = eligible
-      .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0)
-      .sort((a,b) => b.edgeScore - a.edgeScore);
+      .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0 && (p.projPts || 0) >= PITCHER_MIN_PROJ)
+      .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
     const hitters     = eligible.filter(p => p.pos !== 'P');
     const hitterSlots = slots.filter(s => s !== 'P');
 
@@ -3435,8 +3441,8 @@ function optimize(all, sp) {
       // This can happen with very early-season CSVs before pitchers have logged innings.
       // In that case, relax to allow pitchers with salary >= 5500 regardless of avgPts.
       const fallbackPitchers = eligible
-        .filter(p => p.pos === 'P' && p.salary >= 5500)
-        .sort((a,b) => b.edgeScore - a.edgeScore);
+        .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.projPts || 0) >= PITCHER_MIN_PROJ)
+        .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
       if (fallbackPitchers.length) {
         console.warn('No pitchers with avgPts > 0 — using salary-only filter (early season slate)');
         pitchers.push(...fallbackPitchers);
@@ -4008,7 +4014,14 @@ async function buildAndRender() {
 
       // Rule 4: average edge target
       const avg = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
-      return avg >= TARGET_SCORE;
+      if (avg < TARGET_SCORE) return false;
+
+      // Rule 5: total projected points floor.
+      // Prevents high-edge/low-projection lineups (1%-own pitchers with 9pt ceilings).
+      // MLB winning scores are typically 120-160 pts — floor at 130 ensures real upside.
+      const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
+      const MIN_TOTAL_PROJ = sport === 'mlb' ? 130 : sport === 'nba' ? 280 : 140;
+      return totalProj >= MIN_TOTAL_PROJ;
     }
 
     function scoreCandidate(candidate) {
@@ -4082,8 +4095,10 @@ async function buildAndRender() {
     );
 
     if (!qualifyingLineup) {
-      const gap = TARGET_SCORE - Math.round(bestScoreSoFar);
-      setStatus(`Best available: ${Math.round(bestScoreSoFar)} avg edge — ${gap} pts below 97 target. Re-upload CSV closer to lock for better projections.`, 'var(--amber)');
+      const bestValid = (bestLineupSoFar || []).filter(l => l.player);
+      const bestProj  = Math.round(bestValid.reduce((s,l) => s + (l.player.projPts||0), 0));
+      const gap       = TARGET_SCORE - Math.round(bestScoreSoFar);
+      setStatus(`Best available: ${Math.round(bestScoreSoFar)} edge / ${bestProj} proj pts — ${gap} pts below 97 target. Re-upload CSV closer to lock.`, 'var(--amber)');
     }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
