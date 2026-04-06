@@ -3875,23 +3875,26 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       }
     }
 
-    // Best available fallback — enforce edge floor of 72 to prevent weak players dragging avg down
-    // Exception: if budget is very tight or pool is tiny, relax the floor
-    const EDGE_FLOOR = 72;
+    // Best available fallback
+    // Hard floors: edge >= 72, hitters must project >= 8 pts, DK team cap
+    const EDGE_FLOOR    = 72;
+    const HITTER_PROJ   = 8; // Carpenter at 5.6 pts is not a GPP play regardless of ownership
+    const hitterOk = p => p.pos === 'P' || (p.projPts || 0) >= HITTER_PROJ;
+
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && p.edgeScore >= EDGE_FLOOR && !teamFull(p.team)  // DK team cap
+        && p.edgeScore >= EDGE_FLOOR && hitterOk(p) && !teamFull(p.team)
       );
     }
-    // If nothing meets the floor, relax edge but still enforce DK team cap
+    // Relax edge floor but keep projection and team cap
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team)  // DK team cap is always hard
+        && hitterOk(p) && !teamFull(p.team)
       );
     }
-    // Absolute last resort: ignore edge floor only (team cap still applies)
+    // Last resort: relax proj floor too (rare — only on very thin slates)
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -4059,10 +4062,18 @@ async function buildAndRender(quickRebuild = false) {
 
       // Rule 5: total projected points floor.
       const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
-      const MIN_TOTAL_PROJ = sport === 'mlb' ? 130 : sport === 'nba' ? 280 : 140;
+      const MIN_TOTAL_PROJ = sport === 'mlb' ? 155 : sport === 'nba' ? 280 : 140;
       if (totalProj < MIN_TOTAL_PROJ) return false;
 
-      // Rule 6: DraftKings team cap — max 5 players from any single team
+      // Rule 6: per-player projection floor for hitters
+      // Low-own hitters get 99 edge via ownership multiplier but project 5-9 pts — garbage GPP plays.
+      // Pitchers already have a 14pt floor at the pool level; this covers hitters.
+      const HITTER_MIN_PROJ = sport === 'mlb' ? 8 : 0;
+      for (const l of valid) {
+        if (l.player.pos !== 'P' && (l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
+      }
+
+      // Rule 7: DraftKings team cap — max 5 players from any single team
       const teamCounts = {};
       for (const l of valid) {
         const t = l.player.team || '';
@@ -4339,7 +4350,8 @@ function renderLineup(entropyScore, kelly, dna, contest) {
         <div style="font-weight:700;color:var(--amber)">⚠️ Verify before submitting</div>
         ${manualOutNames.size > 0 ? `<button onclick="clearScratches()" style="background:none;border:1px solid rgba(245,158,11,.4);border-radius:4px;cursor:pointer;font-size:9px;color:var(--amber);padding:2px 6px">Clear ${manualOutNames.size} scratch${manualOutNames.size>1?'es':''}</button>` : ''}
       </div>
-      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Game-day scratches aren't caught by any free API — use the <b style="color:var(--red)">✕ scratch</b> button to remove them. Scratches persist until cleared.</div>
+      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Use <b style="color:var(--red)">✕ scratch</b> to remove them — persists until cleared.</div>
+      ${manualOutNames.size > 0 ? `<div style="margin-top:6px;font-size:10px;color:var(--red)">Currently scratched: ${[...manualOutNames].filter(n => n.length > 4).join(', ')}</div>` : ''}
     </div>`;
   const existingBanner = document.getElementById('verify-banner');
   if (!existingBanner) {
