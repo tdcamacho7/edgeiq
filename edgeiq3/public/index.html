@@ -751,6 +751,8 @@ async function handleCsv(input){
       if (injRes.ok) {
         const injData = await injRes.json();
         if (injData.success && Object.keys(injData.outPlayers || {}).length > 0) {
+          // Cache globally so post-build sweep and future rebuilds can re-check
+          window._injuryCache = { ...(window._injuryCache || {}), ...injData.outPlayers };
           const outMap = injData.outPlayers;
           let injExclusions = 0;
           withData = withData.map(p => {
@@ -1041,9 +1043,12 @@ function parseCsv(text){
     // 2. avgPts = 0 = never played this season = not in lineup
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
+    // avgPts === 0 means DK has zero-projected this player — strong OUT signal at any salary.
+    // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
+    // Exception: keep high-salary stars ($6,000+) since they could be newly added.
     const isBenchPlayer = rawPos !== 'P' && (
       (salary > 0 && salary < 3300) ||         // cheap = bench
-      (avgPtsVal === 0 && salary < 4500)        // never scored = not starting
+      (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
     );
     // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
     // Don't exclude but mark so calcEdgeScore caps them
@@ -3915,6 +3920,24 @@ async function buildAndRender() {
       ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
       : 0;
 
+    // ── POST-BUILD INJURY SWEEP ───────────────────────────────────────
+    // Cross-check every lineup player against the live injury cache.
+    // Catches same-day scratches that slipped through CSV parsing.
+    // injuryCache is populated by the injury_check proxy call.
+    if (window._injuryCache && Object.keys(window._injuryCache).length) {
+      lineup = lineup.map(l => {
+        if (!l.player || l.player.isOut) return l;
+        const nameLow = l.player.name.toLowerCase();
+        const last = nameLow.split(' ').pop();
+        const hit = window._injuryCache[nameLow] || window._injuryCache[last];
+        if (hit) {
+          console.warn(`POST-BUILD OUT sweep caught: ${l.player.name} (${hit.status} via ${hit.source})`);
+          return { ...l, player: { ...l.player, isOut: true, edgeScore: 0 } };
+        }
+        return l;
+      });
+    }
+
     // Flag any individual weak players in final lineup
     // HARD BLOCK: refuse to render lineup if any OUT player slipped through
     const outPlayers = finalValid.filter(l => l.player.isOut || l.player.edgeScore === 0);
@@ -4007,6 +4030,19 @@ function excludePlayer(name) {
 // Manual OUT list — applied during CSV parse
 let manualOutNames = new Set();
 
+// Persist manual OUTs across CSV re-uploads (not page refresh — that clears the slate)
+function markPlayerOut(name) {
+  if (!name) return;
+  const n = name.toLowerCase().trim();
+  manualOutNames.add(n);
+  manualOutNames.add(n.split(' ').pop());
+  // Immediately zero out this player and rebuild
+  players = players.map(p =>
+    p.name.toLowerCase() === n ? { ...p, isOut: true, edgeScore: 0 } : p
+  );
+  setStatus(`🚨 ${name} marked OUT — rebuilding...`, 'var(--red)');
+  rebuildLineup();
+}
 
 function isManuallyOut(name) {
   if (!name) return false;
@@ -4072,13 +4108,27 @@ function renderLineup(entropyScore, kelly, dna, contest) {
 
     const dvpRankText = p.dvpRank ? `#${p.dvpRank} vs ${p.pos}` : '';
 
+    // Warn if DK's own avgPts is suspiciously low vs engine projection — possible same-day scratch
+    // If avgPts from CSV == 0 or <2 but engine projects >8, player may be OUT
+    const dkAvg = p.avgPts || 0;
+    const projDivergence = dkAvg > 0 && p.projPts > dkAvg * 3;
+    const possiblyOut = dkAvg === 0 && p.projPts > 5 && p.pos !== 'P';
+    const divergenceWarn = possiblyOut
+      ? `<div style="font-size:10px;color:var(--red);margin-top:2px">⚠️ DK shows 0 pts — verify not OUT</div>`
+      : projDivergence
+      ? `<div style="font-size:10px;color:var(--amber);margin-top:2px">⚠️ DK avg ${dkAvg.toFixed(1)} — verify status</div>`
+      : '';
+
     return `<div class="player-card">
       <div class="slot-pos pos-${l.slot}">${l.slot}</div>
       <div class="player-info">
         <div class="player-name">
           ${p.name} ${chips}
-          <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}')" 
-            style="background:none;border:none;cursor:pointer;font-size:12px;opacity:0.4;margin-left:4px;padding:0;vertical-align:middle" 
+          <button onclick="markPlayerOut('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
+            style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.35);border-radius:4px;cursor:pointer;font-size:10px;color:var(--red);margin-left:5px;padding:1px 5px;vertical-align:middle;line-height:1.4"
+            title="Mark ${p.name} as OUT — rebuilds lineup immediately">OUT</button>
+          <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
+            style="background:none;border:none;cursor:pointer;font-size:11px;opacity:0.3;margin-left:2px;padding:0;vertical-align:middle"
             title="Ban ${p.name} from future lineups">🚫</button>
         </div>
         <div class="player-meta">
@@ -4086,6 +4136,7 @@ function renderLineup(entropyScore, kelly, dna, contest) {
           ${p.opp?`<span style="color:${p.dvpLabel?.color||'var(--t2)'}">${p.dvpLabel?.label||p.opp}</span>`:''}
           ${dvpRankText?`<span style="font-size:10px;color:var(--t3)">${dvpRankText}</span>`:''}
         </div>
+        ${divergenceWarn}
       </div>
       <div class="player-right">
         <div class="player-pts" title="Ceiling: ${(p._ceiling||p.projPts).toFixed(1)}">${p.projPts.toFixed(1)}<span style="font-size:9px;color:var(--green);margin-left:3px">↑${(p._ceiling||p.projPts).toFixed(0)}</span></div>
