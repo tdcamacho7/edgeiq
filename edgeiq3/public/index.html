@@ -716,7 +716,7 @@ async function handleCsv(input){
     }
 
     // Apply all data to players
-    const withData = raw.map(p => {
+    let withData = raw.map(p => {
       // Injury status from ESPN
       const espnStatus = injuryMap[p.name.toLowerCase()] ||
                          injuryMap[p.name.toLowerCase().split(' ').pop()];
@@ -3915,11 +3915,6 @@ async function buildAndRender() {
       setStatus('Not enough eligible players — check that lineups are posted on DK', 'var(--red)');
       return;
     }
-    const finalValid = lineup.filter(l => l.player);
-    const finalScore = finalValid.length
-      ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
-      : 0;
-
     // ── POST-BUILD INJURY SWEEP ───────────────────────────────────────
     // Cross-check every lineup player against the live injury cache.
     // Catches same-day scratches that slipped through CSV parsing.
@@ -3932,11 +3927,21 @@ async function buildAndRender() {
         const hit = window._injuryCache[nameLow] || window._injuryCache[last];
         if (hit) {
           console.warn(`POST-BUILD OUT sweep caught: ${l.player.name} (${hit.status} via ${hit.source})`);
+          // Zero out in global players array so HARD BLOCK rebuild excludes them too
+          players = players.map(p =>
+            p.name.toLowerCase() === nameLow ? { ...p, isOut: true, edgeScore: 0 } : p
+          );
           return { ...l, player: { ...l.player, isOut: true, edgeScore: 0 } };
         }
         return l;
       });
     }
+
+    const finalValid = lineup.filter(l => l.player);
+    const finalScore = finalValid.length
+      ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
+      : 0;
+
 
     // Flag any individual weak players in final lineup
     // HARD BLOCK: refuse to render lineup if any OUT player slipped through
@@ -4125,8 +4130,8 @@ function renderLineup(entropyScore, kelly, dna, contest) {
         <div class="player-name">
           ${p.name} ${chips}
           <button onclick="markPlayerOut('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
-            style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.35);border-radius:4px;cursor:pointer;font-size:10px;color:var(--red);margin-left:5px;padding:1px 5px;vertical-align:middle;line-height:1.4"
-            title="Mark ${p.name} as OUT — rebuilds lineup immediately">OUT</button>
+            style="background:none;border:1px solid rgba(239,68,68,.25);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.6);margin-left:5px;padding:1px 4px;vertical-align:middle;line-height:1.4;letter-spacing:.02em"
+            title="Mark ${p.name} as scratched — removes from lineup immediately">✕ scratch</button>
           <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
             style="background:none;border:none;cursor:pointer;font-size:11px;opacity:0.3;margin-left:2px;padding:0;vertical-align:middle"
             title="Ban ${p.name} from future lineups">🚫</button>
