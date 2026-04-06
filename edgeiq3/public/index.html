@@ -3878,13 +3878,26 @@ async function buildAndRender() {
         bestLineupSoFar = candidate;
       }
       if (candidateScore >= MIN_ACCEPTABLE_SCORE) break;
-      // Below threshold — jitter MC probs slightly to explore alternatives
+      // Jitter edgeScore so greedyFillSlots actually explores different combos each attempt.
+      // Jittering only _mcFirstPlaceProb does nothing — greedy selection is driven by edgeScore.
+      // ±4 pts of noise swaps borderline players without destroying lineup quality.
+      // Save original scores so jitter doesn't compound across attempts.
       players = players.map(p => ({
         ...p,
+        edgeScore: Math.min(99, Math.max(0, (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * 8 - 4))),
+        _baseEdgeScore: p._baseEdgeScore ?? p.edgeScore,
         _mcFirstPlaceProb: Math.min(0.99, (p._mcFirstPlaceProb || 0) * (0.9 + Math.random() * 0.2))
       }));
       attempts++;
     }
+    // Restore original edgeScores — jitter was only for exploration, not final selection
+    players = players.map(p => {
+      if (p._baseEdgeScore !== undefined) {
+        const { _baseEdgeScore, ...rest } = p;
+        return { ...rest, edgeScore: _baseEdgeScore };
+      }
+      return p;
+    });
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // Show warning if we couldn't hit 97+
@@ -4431,6 +4444,12 @@ function var_(n) { const m={green:'var(--green)',amber:'var(--amber)',red:'var(-
 
 // ── AUTO REFRESH ──────────────────────────────────────────────────
 let autoRefreshTimer = null;
+let _lastPlayerPoolHash = '';
+
+function _hashPlayerPool(playerList) {
+  // Fingerprint the pool by name+isOut+salary so we only rebuild when data changes.
+  return playerList.map(p => `${p.name}:${p.isOut?1:0}:${p.salary}`).sort().join('|');
+}
 
 function startAutoRefresh() {
   stopAutoRefresh();
@@ -4441,18 +4460,24 @@ function startAutoRefresh() {
     if (!dgId) return;
     try {
       const r = await fetch(`/api/proxy?dgId=${dgId}&sport=${sport}`, {signal:AbortSignal.timeout(25000)});
+      if (!r.ok) { console.warn('Auto-refresh proxy error', r.status); return; }
       const json = await r.json();
       if (json.success && json.players?.length) {
         const newPlayers = enrich(parse(json.players));
+        const newHash = _hashPlayerPool(newPlayers);
+        if (newHash === _lastPlayerPoolHash) {
+          // Data hasn't changed — update timestamp but skip expensive rebuild
+          setStatus(`Checked · no changes · ${new Date().toLocaleTimeString()}`, 'var(--green)');
+          return;
+        }
+        _lastPlayerPoolHash = newHash;
         const prevOut = players.filter(p=>p.isOut).map(p=>p.name);
         const newOut  = newPlayers.filter(p=>p.isOut).map(p=>p.name);
         const justOut = newOut.filter(n=>!prevOut.includes(n));
         players = newPlayers;
         setStatus('Building lineup...', 'var(--amber)');
-  // Use setTimeout so status update renders before blocking computation
-  await new Promise(resolve => setTimeout(resolve, 20));
-
-  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
         lineup = optimize(players, sport);
         renderLineup(calcEntropyScore(lineup, nashData));
         renderIntelLive();
@@ -4462,7 +4487,7 @@ function startAutoRefresh() {
           setStatus(`Auto-updated · ${new Date().toLocaleTimeString()}`, 'var(--green)');
         }
       }
-    } catch(e) { /* silent */ }
+    } catch(e) { console.warn('Auto-refresh failed:', e.message); }
   }, 5*60*1000);
 }
 
