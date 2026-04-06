@@ -641,38 +641,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ── PATH B: playerIds from CSV → query DK player details API ──
-    // No draftGroupId needed. DK exposes per-player injury status via:
-    // api.draftkings.com/players/v1/playerdetails?playerIds=ID1,ID2,...
-    const rawIds = (req.query.playerIds || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (rawIds.length > 0) {
-      try {
-        // Batch into groups of 50 (API limit)
-        const allPlayers = [];
-        for (let i = 0; i < Math.min(rawIds.length, 150); i += 50) {
-          const batch = rawIds.slice(i, i + 50);
-          const url = `https://api.draftkings.com/players/v1/playerdetails?playerIds=${batch.join(',')}`;
-          try {
-            const r = await fetchDirect(url, 6000);
-            if (!r.ok) continue;
-            const data = await r.json();
-            const players = data?.playerDetails || data?.players || data?.data?.playerDetails || [];
-            allPlayers.push(...players);
-          } catch(e) { continue; }
-        }
-        if (allPlayers.length > 0) {
-          const statusMap = buildStatusMap(allPlayers);
-          return res.status(200).json({
-            success: true, outPlayers: statusMap,
-            count: Object.keys(statusMap).length,
-            source: 'DraftKings player API',
-            totalPlayers: allPlayers.length,
-          });
-        }
-      } catch(e) {}
-    }
-
-    return res.status(200).json({ success: true, outPlayers: {}, count: 0, source: 'DraftKings API (no data)' });
+    return res.status(200).json({ success: true, outPlayers: {}, count: 0, source: 'DraftKings API (no draftGroupId)' });
   }
 
   // Guard: action-only requests (dgId=0 or missing) should never reach DK scraping
