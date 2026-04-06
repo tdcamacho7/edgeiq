@@ -3424,7 +3424,11 @@ function optimize(all, sp) {
     const PITCHER_MIN_PROJ = 14;
     const pitcherBlend = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts / 30) * 99) * 0.40;
     const pitchers    = eligible
-      .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0 && (p.projPts || 0) >= PITCHER_MIN_PROJ)
+      .filter(p =>
+        p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0 &&
+        (p.projPts || 0) >= PITCHER_MIN_PROJ &&
+        p.dvpLabel?.badge !== 'bad matchup'  // never use bad matchup pitchers
+      )
       .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
     const hitters     = eligible.filter(p => p.pos !== 'P');
     const hitterSlots = slots.filter(s => s !== 'P');
@@ -3908,15 +3912,23 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         && hitterOk(p) && !teamFull(p.team)
       );
     }
-    // Last resort: keep hitter proj floor even here — bad matchup still blocked
-    // If truly nothing exists, accept anything above 8 pts (never go below)
+    // Last resort: bad matchup is always blocked, keep 8pt floor
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team) && (p.pos === 'P' || (p.projPts||0) >= 8)
+        && !teamFull(p.team)
+        && p.dvpLabel?.badge !== 'bad matchup'
+        && (p.pos === 'P' || (p.projPts||0) >= 8)
       );
     }
-    // Absolute floor: take anything that fits salary + team cap (thin slate safety)
+    // True last resort: relax proj floor but never take bad matchup
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        && !teamFull(p.team) && p.dvpLabel?.badge !== 'bad matchup'
+      );
+    }
+    // Absolute emergency: take anything (thin slate with only bad matchup left)
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -4270,11 +4282,8 @@ function markPlayerOut(name) {
     p.name.toLowerCase() === n ? { ...p, isOut: true, edgeScore: 0 } : p
   );
   localStorage.setItem('edgeiq_scratched', JSON.stringify([...manualOutNames]));
-  setStatus(`🚨 ${name} scratched — finding replacement...`, 'var(--red)');
-  // Use full rebuild (not quick) when scratching — salary needs to reflow
-  // to find a proper replacement. Quick rebuild reuses signals that may 
-  // have locked the scratched player's salary slot.
-  buildAndRender(false);
+  setStatus(`🚨 ${name} scratched — rebuilding...`, 'var(--red)');
+  buildAndRender(true);
 }
 
 function isManuallyOut(name) {
