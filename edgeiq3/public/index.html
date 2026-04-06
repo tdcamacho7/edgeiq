@@ -680,9 +680,16 @@ async function handleCsv(input){
       vegasData = cachedProxyData.vegasData || {};
       setStatus(`${raw.length} players found · using cached live data...`, 'var(--cyan)');
     } else {
-      // Fresh fetch — hits ScraperAPI
-      [injuryMap, ownershipData, vegasData] = await Promise.all([
-        safeFetch(() => fetchESPNInjuries(sport)),
+      // ESPN injuries FIRST — 8s timeout, must complete before enrich
+      // This is the critical gate that catches Snell/Paredes type situations
+      setStatus(`${raw.length} players found · checking injuries...`, 'var(--amber)');
+      injuryMap = await Promise.race([
+        fetchESPNInjuries(sport).catch(() => ({})),
+        new Promise(r => setTimeout(() => r({}), 8000))
+      ]);
+
+      // Ownership + Vegas in parallel
+      [ownershipData, vegasData] = await Promise.all([
         safeFetch(() => fetchOwnershipFromProxy(sport)),
         safeFetch(() => fetchVegasFromProxy(sport)),
       ]);
@@ -858,44 +865,70 @@ async function fetchMLBStartingLineups() {
 
 // Fetch live injury data from ESPN free public API — no key needed
 async function fetchESPNInjuries(sp) {
-  const sportPaths = {
-    nba: 'basketball/nba',
-    nfl: 'football/nfl',
-    mlb: 'baseball/mlb',
-  };
+  const sportPaths = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' };
   const path = sportPaths[sp] || 'basketball/nba';
+  const map = {};
+
+  // Helper: add player to injury map with all name variants
+  function addToMap(name, status) {
+    if (!name || !status) return;
+    const n = name.toLowerCase().trim();
+    map[n] = status;
+    const parts = n.split(' ');
+    const last = parts[parts.length - 1];
+    if (last.length > 3) map[last] = status;
+    if (parts.length >= 2) map[`${parts[0][0]} ${last}`] = status;
+    if (parts.length >= 2) map[`${parts[0]} ${last}`] = status;
+  }
+
+  // SOURCE 1: ESPN injuries endpoint (active injuries)
   try {
     const r = await fetch(
       `https://site.api.espn.com/apis/site/v2/sports/${path}/injuries`,
       { signal: AbortSignal.timeout(6000) }
     );
-    if (!r.ok) return {};
-    const data = await r.json();
-    const map = {};
-    // ESPN returns array of teams with injured players
-    const teams = data?.injuries || [];
-    for (const team of teams) {
-      for (const injury of (team.injuries || [])) {
-        const name = injury?.athlete?.displayName || injury?.athlete?.fullName || '';
-        // Capture all possible status fields ESPN returns
-        const status = injury?.status || injury?.type?.description || 
-                        injury?.details?.type || injury?.longComment || '';
-        if (name && status) {
-          map[name.toLowerCase()] = status;
-          // Also index by last name for fuzzy matching
-          const lastName = name.toLowerCase().split(' ').pop();
-          if (lastName.length > 3 && !map[lastName]) map[lastName] = status;
-          // Also index first + last initial (e.g. "k stowers" for "kyle stowers")
-          const parts = name.toLowerCase().split(' ');
-          if (parts.length >= 2) map[`${parts[0][0]} ${parts[parts.length-1]}`] = status;
+    if (r.ok) {
+      const data = await r.json();
+      for (const team of (data?.injuries || [])) {
+        for (const injury of (team.injuries || [])) {
+          const name = injury?.athlete?.displayName || '';
+          const status = injury?.status || injury?.type?.description || injury?.details?.type || '';
+          addToMap(name, status);
         }
       }
     }
-    // Also try ESPN scoreboard roster to catch IL players not in injuries endpoint
-    return map;
-  } catch(e) {
-    return {};
+  } catch(e) {}
+
+  // SOURCE 2: ESPN scoreboard — catches players marked OUT/IL in game rosters
+  // This is the key one — it shows who is actually in/out for TODAY's games
+  if (sp === 'mlb') {
+    try {
+      const today = new Date().toISOString().slice(0,10).replace(/-/g,'');
+      const r2 = await fetch(
+        `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=${today}`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+      if (r2.ok) {
+        const d2 = await r2.json();
+        for (const event of (d2?.events || [])) {
+          for (const comp of (event?.competitions || [])) {
+            for (const team of (comp?.competitors || [])) {
+              for (const roster of (team?.roster || [])) {
+                const name = roster?.athlete?.displayName || '';
+                const status = roster?.status?.type?.name || roster?.athlete?.status || '';
+                // Mark anyone not ACTIVE as potentially out
+                if (status && status.toLowerCase() !== 'active') {
+                  addToMap(name, status);
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch(e) {}
   }
+
+  return map;
 }
 
 function parseCsv(text){
@@ -3396,9 +3429,15 @@ function optimize(all, sp) {
     if (sp === 'mlb') return p.pos === 'P' ? 5500 : 2900;
     return 2000;
   };
+  // Pitchers with 0 or negative FPPG avg have never performed — exclude from optimizer
+  const hasValidHistory = (p) => {
+    if (p.pos !== 'P') return true;
+    return (p.avgPts || 0) > 2; // pitchers must avg > 2 DK pts (very lenient)
+  };
 
   const viablePool = eligible.filter(p =>
     p.salary >= minSalaryFloor(p) &&
+    hasValidHistory(p) &&           // pitchers must have > 2 FPPG history
     (p.projPts || 0) >= minPts(p) &&
     (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
