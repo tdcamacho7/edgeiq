@@ -6,6 +6,7 @@ export default async function handler(req, res) {
 
   const { dgId, sport, action } = req.query;
   const scraperKey = process.env.SCRAPER_API_KEY;
+  const beeKey    = process.env.SCRAPINGBEE_API_KEY;
   const oddsKey   = process.env.ODDS_API_KEY;
 
   // ── FETCH HELPERS ────────────────────────────────────────────────
@@ -22,10 +23,22 @@ export default async function handler(req, res) {
   }
 
   async function fetchScraper(url, render = false, timeout = 20000) {
-    if (!scraperKey) return fetchDirect(url, timeout);
-    const credits = render ? '&render=true' : '';
-    const proxyUrl = `http://api.scraperapi.com?api_key=${scraperKey}&url=${encodeURIComponent(url)}${credits}`;
-    return fetch(proxyUrl, { signal: AbortSignal.timeout(Math.min(timeout, 12000)) });
+    // Priority: ScraperAPI → ScrapingBee → direct fetch
+    // ScraperAPI: nearly depleted — use sparingly
+    // ScrapingBee: 1,000 free credits/month, same capability
+    if (scraperKey) {
+      const credits = render ? '&render=true' : '';
+      const proxyUrl = `http://api.scraperapi.com?api_key=${scraperKey}&url=${encodeURIComponent(url)}${credits}`;
+      return fetch(proxyUrl, { signal: AbortSignal.timeout(Math.min(timeout, 12000)) });
+    }
+    if (beeKey) {
+      // ScrapingBee API — render=true uses a real Chrome browser (costs more credits)
+      const renderJs = render ? 'true' : 'false';
+      const proxyUrl = `https://app.scrapingbee.com/api/v1/?api_key=${beeKey}&url=${encodeURIComponent(url)}&render_js=${renderJs}&block_ads=true`;
+      return fetch(proxyUrl, { signal: AbortSignal.timeout(Math.min(timeout, 15000)) });
+    }
+    // No scraper key — try direct (DK will likely block, but works for open APIs)
+    return fetchDirect(url, timeout);
   }
 
   // ── OWNERSHIP ACTION ─────────────────────────────────────────────
