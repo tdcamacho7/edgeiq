@@ -258,6 +258,7 @@ input,button{font-family:var(--ui)}
         </div>
         <div style="text-align:center;font-size:12px;color:var(--t3);margin-top:8px">
           DraftKings → your contest → Export to CSV → upload here
+          <br><span style="color:var(--amber);font-size:11px">⚡ Paste contest URL above first for live OUT detection</span>
         </div>
       </label>
       <input type="file" id="csv-upload-main" accept=".csv" style="display:none" onchange="handleCsv(this)">
@@ -777,6 +778,46 @@ async function handleCsv(input){
       }
     } catch(e) {
       console.log('Injury check skipped:', e.message);
+    }
+
+    // ── DK LIVE STATUS CHECK ───────────────────────────────────────────
+    // Uses DK's own draftables API to catch game-day scratches (OUT badge)
+    // that ESPN injury API misses. Requires draftGroupId from URL field.
+    // No ScraperAPI credits used — DK's JSON endpoint is public.
+    try {
+      const dkUrl = document.getElementById('dk-url')?.value?.trim() || '';
+      const dkDgId = extractId(dkUrl);
+      if (dkDgId) {
+        const dkRes = await Promise.race([
+          fetch(`/api/proxy?action=dk_status&dgId=${dkDgId}&sport=${sport}`),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 7000))
+        ]);
+        if (dkRes.ok) {
+          const dkData = await dkRes.json();
+          if (dkData.success && Object.keys(dkData.outPlayers || {}).length > 0) {
+            // Merge into global injury cache for post-build sweep
+            window._injuryCache = { ...(window._injuryCache || {}), ...dkData.outPlayers };
+            let dkExclusions = 0;
+            withData = withData.map(p => {
+              if (p.isOut) return p;
+              const nameLow = p.name.toLowerCase();
+              const last = nameLow.split(' ').pop();
+              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last];
+              if (hit) {
+                dkExclusions++;
+                return { ...p, isOut: true, status: hit.status };
+              }
+              return p;
+            });
+            if (dkExclusions > 0) {
+              setStatus(`${dkExclusions} game-day scratch(es) caught via DK · rebuilding...`, 'var(--red)');
+              console.log(`DK status check: ${dkExclusions} players marked OUT (${dkData.totalPlayers} total)`);
+            }
+          }
+        }
+      }
+    } catch(e) {
+      console.log('DK status check skipped:', e.message);
     }
 
     // Fetch weather BEFORE enrich
