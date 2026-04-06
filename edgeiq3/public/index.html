@@ -102,8 +102,8 @@ input,button{font-family:var(--ui)}
   display:flex;align-items:center;gap:12px;
 }
 .player-card.flagged{border-color:var(--amber);background:rgba(245,158,11,.05)}
-.scratch-btn{opacity:0;transition:opacity .15s;background:none;border:1px solid rgba(239,68,68,.3);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.7);padding:1px 5px;vertical-align:middle;line-height:1.4;white-space:nowrap;margin-left:4px}
-.player-card:hover .scratch-btn{opacity:1}
+.scratch-btn{opacity:.55;transition:opacity .15s;background:none;border:1px solid rgba(239,68,68,.35);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.8);padding:1px 5px;vertical-align:middle;line-height:1.4;white-space:nowrap;margin-left:4px}
+.scratch-btn:hover{opacity:1;background:rgba(239,68,68,.12)}
 .slot-pos{
   font-size:10px;font-weight:700;letter-spacing:.04em;
   padding:4px 7px;border-radius:6px;text-align:center;
@@ -4248,6 +4248,22 @@ function renderLineup(entropyScore, kelly, dna, contest) {
     </div>`;
   }).join('');
 
+  // ── VERIFICATION BANNER ──────────────────────────────────────────
+  // Game-day scratches (like Paredes resting) are NOT in any free API.
+  // Show a persistent warning so user always checks DK before submitting.
+  const verifyBanner = `
+    <div id="verify-banner" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:11px">
+      <div style="font-weight:700;color:var(--amber);margin-bottom:5px">⚠️ Verify before submitting</div>
+      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Game-day scratches aren't caught by any free API — use the <b style="color:var(--red)">✕ scratch</b> button to remove them.</div>
+    </div>`;
+  const existingBanner = document.getElementById('verify-banner');
+  if (!existingBanner) {
+    const lineupEl = document.getElementById('lineup-list');
+    if (lineupEl && !document.getElementById('verify-banner')) {
+      lineupEl.insertAdjacentHTML('beforebegin', verifyBanner);
+    }
+  }
+
   // Kelly + DNA + Contest recommendation panel
   const kellyEl = document.getElementById('export-section');
 
@@ -4578,6 +4594,14 @@ function saveHistory() {
 function exportLineup() {
   const valid = lineup.filter(l=>l.player);
   if (!valid.length) return;
+
+  // Confirmation gate: force user to verify player statuses before export.
+  // Game-day scratches are invisible to automated checks — this is the safety net.
+  const names = valid.map(l => l.player.name).join('\n• ');
+  const confirmed = window.confirm(
+    `Before submitting to DraftKings:\n\nVerify NONE of these players show an OUT badge in DK:\n\n• ${names}\n\nIf any show OUT, close this and tap ✕ scratch on that player.\n\nAll active? Click OK to export.`
+  );
+  if (!confirmed) return;
   const rows = ['Position,Name,Salary,ProjectedPts,EdgeScore,OwnershipPct,Fatigue,CircadianScore',
     ...valid.map(l=>`${l.slot},${l.player.name},${l.player.salary},${l.player.projPts},${l.player.edgeScore},${l.player.projOwn},${l.player.fatigue},${l.player.circadian}`)];
   const blob = new Blob([rows.join('\n')], {type:'text/csv'});
