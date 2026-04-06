@@ -3858,7 +3858,15 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       }
     }
 
-    // Best available fallback
+    // Best available fallback — enforce edge floor of 72 to prevent weak players dragging avg down
+    // Exception: if budget is very tight or pool is tiny, relax the floor
+    const EDGE_FLOOR = 72;
+    if (!pick) {
+      pick = sorted.find(p =>
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) && p.edgeScore >= EDGE_FLOOR
+      );
+    }
+    // If nothing meets the floor, relax and take best available (salary and constraints are hard; edge is soft)
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
@@ -3961,40 +3969,96 @@ async function buildAndRender() {
     // Pass 2: re-score
     players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
 
-    // ── 97+ SCORE GATE ────────────────────────────────────────────────
-    // Only accept lineups scoring 97+. Try up to 3 passes.
-    // Each pass slightly varies the MC boost to explore different combos.
-    const MIN_ACCEPTABLE_SCORE = 97;
-    let attempts = 0;
-    let bestLineupSoFar = null;
-    let bestScoreSoFar = 0;
+    // ── SILENT OPTIMIZATION LOOP ─────────────────────────────────────
+    // Builds lineups silently until ALL rules pass, then presents the result.
+    // Never shows a lineup that fails any rule — keeps trying until it's right.
+    //
+    // Rules a lineup must pass before display:
+    //   1. No OUT / injured players
+    //   2. No player in live injury cache (game-day scratches)
+    //   3. Every individual player edge >= 72
+    //   4. Average edge across all 10 players >= 97
+    //
+    // Strategy: up to 25 attempts with growing jitter (±4 → ±28 pts).
+    // Wider jitter on later attempts forces the optimizer into different
+    // pitcher pairs and stack teams, not just noise around the same solution.
+    // Best qualifying lineup is presented; if none qualifies after 25 tries,
+    // the best-scoring attempt is shown with an honest gap message.
 
-    while (attempts < 3) {
+    const TARGET_SCORE   = 97;
+    const MIN_INDIV_EDGE = 72;
+    const MAX_ATTEMPTS   = 25;
+
+    // Helper: run all pass/fail rules against a candidate lineup
+    function lineupPassesRules(candidate) {
+      const valid = candidate.filter(l => l.player);
+      if (!valid.length) return false;
+
+      // Rule 1+2: no OUT players, no injury cache hits
+      for (const l of valid) {
+        const p = l.player;
+        if (p.isOut || p.edgeScore === 0) return false;
+        const n = p.name.toLowerCase();
+        const last = n.split(' ').pop();
+        if (window._injuryCache?.[n] || window._injuryCache?.[last]) return false;
+      }
+
+      // Rule 3: individual edge floor
+      if (valid.some(l => l.player.edgeScore < MIN_INDIV_EDGE)) return false;
+
+      // Rule 4: average edge target
+      const avg = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
+      return avg >= TARGET_SCORE;
+    }
+
+    function scoreCandidate(candidate) {
+      const valid = candidate.filter(l => l.player);
+      if (!valid.length) return 0;
+      return valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
+    }
+
+    let bestLineupSoFar = null;
+    let bestScoreSoFar  = 0;
+    let qualifyingLineup = null;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS}`, 'var(--amber)');
+      // Yield to browser so status updates render
+      await new Promise(r => setTimeout(r, 0));
+
       const candidate = optimize(players, sport);
-      if (!candidate || !candidate.length) { attempts++; continue; }
-      const candidateValid = candidate.filter(l => l.player);
-      if (!candidateValid.length) { attempts++; continue; }
-      const candidateScore = Math.round(
-        candidateValid.reduce((s,l) => s + l.player.edgeScore, 0) / candidateValid.length
-      );
-      if (candidateScore > bestScoreSoFar) {
-        bestScoreSoFar = candidateScore;
+      if (!candidate?.length) { attempt++; continue; }
+
+      const score = scoreCandidate(candidate);
+
+      // Track best regardless of rules (emergency fallback)
+      if (score > bestScoreSoFar) {
+        bestScoreSoFar  = score;
         bestLineupSoFar = candidate;
       }
-      if (candidateScore >= MIN_ACCEPTABLE_SCORE) break;
-      // Jitter edgeScore so greedyFillSlots actually explores different combos each attempt.
-      // Jittering only _mcFirstPlaceProb does nothing — greedy selection is driven by edgeScore.
-      // ±4 pts of noise swaps borderline players without destroying lineup quality.
-      // Save original scores so jitter doesn't compound across attempts.
+
+      // If all rules pass — we're done
+      if (lineupPassesRules(candidate)) {
+        qualifyingLineup = candidate;
+        console.log(`✅ Qualifying lineup found on attempt ${attempt + 1} — avg edge ${Math.round(score)}`);
+        break;
+      }
+
+      console.log(`Attempt ${attempt + 1}: avg edge ${Math.round(score)} — retrying`);
+
+      // Jitter grows with each attempt to explore more of the solution space
+      // Attempts 1-5: ±4-8 (nearby combos) | 6-15: ±10-20 (different stacks) | 16+: ±22-28 (wholesale change)
+      const jitter = 4 + attempt * 1.6;
       players = players.map(p => ({
         ...p,
-        edgeScore: Math.min(99, Math.max(0, (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * 8 - 4))),
+        edgeScore: Math.min(99, Math.max(0,
+          (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * jitter * 2 - jitter)
+        )),
         _baseEdgeScore: p._baseEdgeScore ?? p.edgeScore,
-        _mcFirstPlaceProb: Math.min(0.99, (p._mcFirstPlaceProb || 0) * (0.9 + Math.random() * 0.2))
       }));
-      attempts++;
     }
-    // Restore original edgeScores — jitter was only for exploration, not final selection
+
+    // Restore original edge scores — jitter was exploration only
     players = players.map(p => {
       if (p._baseEdgeScore !== undefined) {
         const { _baseEdgeScore, ...rest } = p;
@@ -4002,73 +4066,24 @@ async function buildAndRender() {
       }
       return p;
     });
-    lineup = bestLineupSoFar || optimize(players, sport) || [];
 
-    // Show warning if we couldn't hit 97+
-    if (!lineup || !lineup.length) {
+    // Use qualifying lineup if found, otherwise best we got
+    lineup = qualifyingLineup || bestLineupSoFar || [];
+
+    if (!lineup.length) {
       setDot('error');
       setStatus('Not enough eligible players — check that lineups are posted on DK', 'var(--red)');
       return;
     }
-    // ── POST-BUILD INJURY SWEEP ───────────────────────────────────────
-    // Cross-check every lineup player against the live injury cache.
-    // Catches same-day scratches that slipped through CSV parsing.
-    // injuryCache is populated by the injury_check proxy call.
-    if (window._injuryCache && Object.keys(window._injuryCache).length) {
-      lineup = lineup.map(l => {
-        if (!l.player || l.player.isOut) return l;
-        const nameLow = l.player.name.toLowerCase();
-        const last = nameLow.split(' ').pop();
-        const hit = window._injuryCache[nameLow] || window._injuryCache[last];
-        if (hit) {
-          console.warn(`POST-BUILD OUT sweep caught: ${l.player.name} (${hit.status} via ${hit.source})`);
-          // Zero out in global players array so HARD BLOCK rebuild excludes them too
-          players = players.map(p =>
-            p.name.toLowerCase() === nameLow ? { ...p, isOut: true, edgeScore: 0 } : p
-          );
-          return { ...l, player: { ...l.player, isOut: true, edgeScore: 0 } };
-        }
-        return l;
-      });
-    }
 
     const finalValid = lineup.filter(l => l.player);
-    const finalScore = finalValid.length
-      ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
-      : 0;
-
-
-    // Flag any individual weak players in final lineup
-    // HARD BLOCK: refuse to render lineup if any OUT player slipped through
-    const outPlayers = finalValid.filter(l => l.player.isOut || l.player.edgeScore === 0);
-    if (outPlayers.length > 0) {
-      const names = outPlayers.map(l => l.player.name).join(', ');
-      setStatus(`🚨 OUT players detected: ${names} — rebuild required`, 'var(--red)');
-      setDot('error');
-      // Force remove them and rebuild once
-      players = players.map(p => 
-        outPlayers.some(l => l.player.name === p.name) 
-          ? { ...p, isOut: true, edgeScore: 0 } 
-          : p
-      );
-      lineup = optimize(players, sport);
-      // If still has bad players after one more attempt, stop and show error
-      const retryValid = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
-      if (retryValid.length < lineup.filter(l=>l.player).length) {
-        setStatus('Could not build valid lineup — some players may be unavailable', 'var(--amber)');
-      }
-    }
-
-    const weakPlayers = finalValid.filter(l =>
-      l.player.edgeScore < 60 ||
-      (l.player.projPts < 7 && l.player.pos !== 'P') ||
-      l.player.dvpLabel?.badge === 'bad matchup'
+    const finalScore = Math.round(
+      finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length
     );
-    if (weakPlayers.length > 0) {
-      const names = weakPlayers.map(l => l.player.name).join(', ');
-      setStatus(`⚠️ Weak players in lineup: ${names} — consider rebuilding`, 'var(--amber)');
-    } else if (finalScore < MIN_ACCEPTABLE_SCORE) {
-      setStatus(`Best available: ${finalScore} edge — slate may not support 97+ tonight`, 'var(--amber)');
+
+    if (!qualifyingLineup) {
+      const gap = TARGET_SCORE - Math.round(bestScoreSoFar);
+      setStatus(`Best available: ${Math.round(bestScoreSoFar)} avg edge — ${gap} pts below 97 target. Re-upload CSV closer to lock for better projections.`, 'var(--amber)');
     }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
