@@ -247,6 +247,8 @@ input,button{font-family:var(--ui)}
     <div class="fetch-box">
       <div class="fetch-status" id="fetch-status"></div>
 
+
+
       <!-- PRIMARY: CSV Upload -->
       <label for="csv-upload-main" style="display:block;cursor:pointer">
         <div style="background:var(--cyan);color:#0a0a0a;border-radius:14px;padding:16px 20px;text-align:center;font-weight:700;font-size:16px;letter-spacing:.02em">
@@ -718,7 +720,7 @@ async function handleCsv(input){
       // Injury status from ESPN
       const espnStatus = injuryMap[p.name.toLowerCase()] ||
                          injuryMap[p.name.toLowerCase().split(' ').pop()];
-      const isOut = p.isOut || (espnStatus && ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes(espnStatus.toLowerCase().trim()));
+      const isOut = p.isOut || isManuallyOut(p.name) || (espnStatus && ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes(espnStatus.toLowerCase().trim()));
 
       // Real ownership from scraped sources
       const fpOwnership = fuzzyMatchOwnership(p.name, ownershipData);
@@ -739,8 +741,45 @@ async function handleCsv(input){
     const ownCount  = withData.filter(p=>p.fpOwnership!=null).length;
     const vegasCount= withData.filter(p=>p.vegasImplied!=null).length;
 
-    // Fetch weather BEFORE enrich — weatherCache must be populated
-    // so calcWeatherPenalty works when enrich() runs
+    // ── ACTIVE ROSTER CHECK (the authoritative source for who can play) ──
+    // MLB Stats API via our proxy — if player not on 26-man roster, they CANNOT play
+    if (sport === 'mlb') {
+      setStatus(`${withData.length} players · confirming active rosters...`, 'var(--amber)');
+      try {
+        const teams = [...new Set(withData.map(p => p.team).filter(Boolean))].join(',');
+        const rosterRes = await Promise.race([
+          fetch(`/api/proxy?action=mlb_rosters&teams=${encodeURIComponent(teams)}`),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))
+        ]);
+        if (rosterRes.ok) {
+          const rosterData = await rosterRes.json();
+          if (rosterData.success && rosterData.activeNames?.length > 10) {
+            const activeSet = new Set(rosterData.activeNames);
+            let rosterExclusions = 0;
+            withData = withData.map(p => {
+              if (p.isOut) return p; // already marked out
+              const nameLow = p.name.toLowerCase();
+              const lastName = nameLow.split(' ').pop();
+              const firstLast = nameLow.split(' ').length >= 2
+                ? `${nameLow[0]}. ${nameLow.split(' ').slice(1).join(' ')}` : '';
+              const onRoster = activeSet.has(nameLow) || activeSet.has(lastName) 
+                || (firstLast && activeSet.has(firstLast));
+              // Only exclude if salary > $3,000 (real starter price range)
+              if (!onRoster && p.salary > 3000) {
+                rosterExclusions++;
+                return { ...p, isOut: true, status: 'Not on active roster' };
+              }
+              return p;
+            });
+            console.log(`Roster check: ${rosterExclusions} players excluded as not on 26-man roster`);
+          }
+        }
+      } catch(e) {
+        console.log('Roster check skipped:', e.message);
+      }
+    }
+
+    // Fetch weather BEFORE enrich
     setStatus(`${withData.length} players · fetching weather...`, 'var(--amber)');
     await Promise.race([
       fetchWeatherData(withData, sport),
@@ -1004,7 +1043,7 @@ function parseCsv(text){
     // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
     // Don't exclude but mark so calcEdgeScore caps them
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
-    const finalIsOut = isOut || isBenchPlayer;
+    const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
@@ -3934,6 +3973,18 @@ function excludePlayer(name) {
   });
   buildAndRender();
   setStatus(`🚫 ${name} banned — rebuilding without them`, 'var(--amber)');
+}
+
+// Manual OUT list — applied during CSV parse
+let manualOutNames = new Set();
+
+
+function isManuallyOut(name) {
+  if (!name) return false;
+  const n = name.toLowerCase();
+  const last = n.split(' ').pop();
+  return manualOutNames.has(n) || manualOutNames.has(last) ||
+    [...manualOutNames].some(m => n.includes(m) || m.includes(last));
 }
 
 function clearExclusions() {
