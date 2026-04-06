@@ -781,28 +781,46 @@ async function handleCsv(input){
     }
 
     // ── DK LIVE STATUS CHECK ───────────────────────────────────────────
-    // Uses DK's own draftables API to catch game-day scratches (OUT badge)
-    // that ESPN injury API misses. Requires draftGroupId from URL field.
-    // No ScraperAPI credits used — DK's JSON endpoint is public.
+    // Primary: use DK player IDs from the CSV to query DK's player API directly.
+    // No draftGroupId needed — each player row has a numeric DK ID.
+    // Fallback: if URL is filled, use draftGroupId to get all statuses at once.
+    // This catches game-day scratches that ESPN/MLB Transactions always miss.
     try {
+      setStatus(`${withData.length} players · checking DK live statuses...`, 'var(--amber)');
+      
+      // Collect DK player IDs from the parsed CSV
+      const csvPlayerIds = withData
+        .filter(p => p.dkId && p.dkId.length > 3)
+        .map(p => p.dkId);
+      
+      // Prefer draftGroupId (one call, all players) over individual IDs (many calls)
       const dkUrl = document.getElementById('dk-url')?.value?.trim() || '';
       const dkDgId = extractId(dkUrl);
-      if (dkDgId) {
+      
+      const statusParam = dkDgId
+        ? `dgId=${dkDgId}`
+        : csvPlayerIds.length
+        ? `dgId=0&playerIds=${csvPlayerIds.slice(0, 150).join(',')}`
+        : null;
+
+      if (statusParam) {
         const dkRes = await Promise.race([
-          fetch(`/api/proxy?action=dk_status&dgId=${dkDgId}&sport=${sport}`),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 7000))
+          fetch(`/api/proxy?action=dk_status&sport=${sport}&${statusParam}`),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
         ]);
         if (dkRes.ok) {
           const dkData = await dkRes.json();
           if (dkData.success && Object.keys(dkData.outPlayers || {}).length > 0) {
-            // Merge into global injury cache for post-build sweep
             window._injuryCache = { ...(window._injuryCache || {}), ...dkData.outPlayers };
             let dkExclusions = 0;
             withData = withData.map(p => {
               if (p.isOut) return p;
               const nameLow = p.name.toLowerCase();
               const last = nameLow.split(' ').pop();
-              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last];
+              // Also match by DK player ID for exact matching
+              const idKey = p.dkId ? `id:${p.dkId}` : null;
+              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last]
+                       || (idKey && dkData.outPlayers[idKey]);
               if (hit) {
                 dkExclusions++;
                 return { ...p, isOut: true, status: hit.status };
@@ -810,8 +828,10 @@ async function handleCsv(input){
               return p;
             });
             if (dkExclusions > 0) {
-              setStatus(`${dkExclusions} game-day scratch(es) caught via DK · rebuilding...`, 'var(--red)');
-              console.log(`DK status check: ${dkExclusions} players marked OUT (${dkData.totalPlayers} total)`);
+              console.log(`DK live status: ${dkExclusions} game-day scratch(es) removed`);
+              setStatus(`🚨 ${dkExclusions} game-day scratch(es) caught via DK live data`, 'var(--red)');
+            } else {
+              console.log(`DK live status: checked ${dkData.totalPlayers || 0} players, all clear`);
             }
           }
         }
@@ -1033,6 +1053,7 @@ function parseCsv(text){
   const ai=hdr.findIndex(h=>h.includes('avg'));
   // DraftKings sometimes includes injury status in the CSV
   const statusI=hdr.findIndex(h=>h.includes('status')||h.includes('injury'));
+  const idI=hdr.findIndex(h=>h==='id');  // DK player ID column (used for live status check)
 
   return lines.slice(start+1).map(l=>{
     const v=l.split(',').map(c=>c.trim().replace(/"/g,''));
@@ -1043,6 +1064,7 @@ function parseCsv(text){
     const salary=parseInt(v[si])||0;
     if(!name||salary<2000) return null;
     const gi2=v[gi]||'', myTeam=v[ti]||'';
+    const dkId = idI >= 0 ? (v[idI]||'').replace(/\D/g,'') : '';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     // Get status from dedicated status/injury column
@@ -1110,7 +1132,7 @@ function parseCsv(text){
       || gameInfoLow.includes('suspended') || gameInfoLow.includes('cancelled');
     const finalStatus = isRainGame ? 'PPD' : status;
     const finalIsOutWithRain = finalIsOut || isRainGame;
-    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:avgPtsVal,status:finalStatus,isOut:finalIsOutWithRain,terriblePitcher};
+    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:avgPtsVal,status:finalStatus,isOut:finalIsOutWithRain,terriblePitcher,dkId};
   }).filter(Boolean);
 }
 
@@ -3374,7 +3396,22 @@ function score(p) { return calcEdgeScore(p); }
 function optimize(all, sp) {
   if (!all || !all.length) return [];
   const slots = SLOTS[sp];
-  const eligible = all.filter(p => !p.isOut && p.edgeScore > 0);
+  // Final safety net: re-apply injury cache and manual OUT list at optimize time.
+  // This catches any player that slipped through earlier checks.
+  const eligible = all.filter(p => {
+    if (p.isOut || p.edgeScore <= 0) return false;
+    if (isManuallyOut(p.name)) return false;
+    // Re-check against live DK injury cache (populated by dk_status call)
+    if (window._injuryCache) {
+      const n = p.name.toLowerCase();
+      const last = n.split(' ').pop();
+      const idKey = p.dkId ? `id:${p.dkId}` : null;
+      if (window._injuryCache[n] || window._injuryCache[last] || (idKey && window._injuryCache[idKey])) {
+        return false;
+      }
+    }
+    return true;
+  });
 
   // ── MLB: TWO-PHASE OPTIMIZER ─────────────────────────────────────
   // Phase 1: Independently find best 2 pitchers
