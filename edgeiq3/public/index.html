@@ -741,42 +741,38 @@ async function handleCsv(input){
     const ownCount  = withData.filter(p=>p.fpOwnership!=null).length;
     const vegasCount= withData.filter(p=>p.vegasImplied!=null).length;
 
-    // ── ACTIVE ROSTER CHECK (the authoritative source for who can play) ──
-    // MLB Stats API via our proxy — if player not on 26-man roster, they CANNOT play
-    if (sport === 'mlb') {
-      setStatus(`${withData.length} players · confirming active rosters...`, 'var(--amber)');
-      try {
-        const teams = [...new Set(withData.map(p => p.team).filter(Boolean))].join(',');
-        const rosterRes = await Promise.race([
-          fetch(`/api/proxy?action=mlb_rosters&teams=${encodeURIComponent(teams)}`),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))
-        ]);
-        if (rosterRes.ok) {
-          const rosterData = await rosterRes.json();
-          if (rosterData.success && rosterData.activeNames?.length > 10) {
-            const activeSet = new Set(rosterData.activeNames);
-            let rosterExclusions = 0;
-            withData = withData.map(p => {
-              if (p.isOut) return p; // already marked out
-              const nameLow = p.name.toLowerCase();
-              const lastName = nameLow.split(' ').pop();
-              const firstLast = nameLow.split(' ').length >= 2
-                ? `${nameLow[0]}. ${nameLow.split(' ').slice(1).join(' ')}` : '';
-              const onRoster = activeSet.has(nameLow) || activeSet.has(lastName) 
-                || (firstLast && activeSet.has(firstLast));
-              // Only exclude if salary > $3,000 (real starter price range)
-              if (!onRoster && p.salary > 3000) {
-                rosterExclusions++;
-                return { ...p, isOut: true, status: 'Not on active roster' };
-              }
-              return p;
-            });
-            console.log(`Roster check: ${rosterExclusions} players excluded as not on 26-man roster`);
-          }
+    // ── INJURY CHECK — 3 sources via proxy (ESPN + MLB Transactions + Sleeper) ──
+    setStatus(`${withData.length} players · checking injuries...`, 'var(--amber)');
+    try {
+      const injRes = await Promise.race([
+        fetch(`/api/proxy?action=injury_check&sp=${sport}`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
+      ]);
+      if (injRes.ok) {
+        const injData = await injRes.json();
+        if (injData.success && Object.keys(injData.outPlayers || {}).length > 0) {
+          const outMap = injData.outPlayers;
+          let injExclusions = 0;
+          withData = withData.map(p => {
+            if (p.isOut) return p;
+            const nameLow = p.name.toLowerCase();
+            const lastName = nameLow.split(' ').pop();
+            // Check all name variants
+            const injEntry = outMap[nameLow] || outMap[lastName] ||
+              outMap[`${nameLow.split(' ')[0]} ${lastName}`];
+            if (injEntry) {
+              injExclusions++;
+              return { ...p, isOut: true, status: injEntry.status };
+            }
+            return p;
+          });
+          console.log(`Injury check: ${injExclusions} players excluded (${injData.count} total out)`);
+          const sources = injData.sources?.join(', ') || '';
+          setStatus(`${withData.length} players · ${injExclusions} OUT confirmed via ${sources}`, 'var(--amber)');
         }
-      } catch(e) {
-        console.log('Roster check skipped:', e.message);
       }
+    } catch(e) {
+      console.log('Injury check skipped:', e.message);
     }
 
     // Fetch weather BEFORE enrich
@@ -3898,13 +3894,24 @@ async function buildAndRender() {
       : 0;
 
     // Flag any individual weak players in final lineup
-    // Check for OUT/IL players that slipped through all filters
-    const outPlayers = finalValid.filter(l => l.player.isOut);
+    // HARD BLOCK: refuse to render lineup if any OUT player slipped through
+    const outPlayers = finalValid.filter(l => l.player.isOut || l.player.edgeScore === 0);
     if (outPlayers.length > 0) {
       const names = outPlayers.map(l => l.player.name).join(', ');
-      setStatus(`🚨 OUT players in lineup: ${names} — remove before entering!`, 'var(--red)');
+      setStatus(`🚨 OUT players detected: ${names} — rebuild required`, 'var(--red)');
       setDot('error');
-      return; // don't render a lineup with OUT players
+      // Force remove them and rebuild once
+      players = players.map(p => 
+        outPlayers.some(l => l.player.name === p.name) 
+          ? { ...p, isOut: true, edgeScore: 0 } 
+          : p
+      );
+      lineup = optimize(players, sport);
+      // If still has bad players after one more attempt, stop and show error
+      const retryValid = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
+      if (retryValid.length < lineup.filter(l=>l.player).length) {
+        setStatus('Could not build valid lineup — some players may be unavailable', 'var(--amber)');
+      }
     }
 
     const weakPlayers = finalValid.filter(l =>
