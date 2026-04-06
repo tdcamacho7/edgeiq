@@ -448,6 +448,94 @@ export default async function handler(req, res) {
   }
 
   // ── RESOLVE CONTEST ID → DRAFT GROUP ID ──────────────────────────
+  // ── INJURY STATUS CHECK ACTION ──────────────────────────────────────
+  // Fetches from 3 sources and returns definitive OUT/IL player list
+  if (action === 'injury_check') {
+    const sp = req.query.sp || 'mlb';
+    const outPlayers = {};  // name.toLowerCase() -> { status, source }
+
+    // SOURCE 1: ESPN Injuries API
+    try {
+      const sportPath = sp === 'mlb' ? 'baseball/mlb' : sp === 'nba' ? 'basketball/nba' : 'football/nfl';
+      const r = await fetch(
+        `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/injuries`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (r.ok) {
+        const data = await r.json();
+        for (const team of (data?.injuries || [])) {
+          for (const inj of (team.injuries || [])) {
+            const name = (inj?.athlete?.displayName || '').toLowerCase();
+            const status = inj?.status || inj?.type?.description || '';
+            const OUT_STATUSES = ['out','ir','il','injured reserve','injured list',
+              'day-to-day','doubtful','inactive','suspended'];
+            if (name && OUT_STATUSES.some(s => status.toLowerCase().includes(s))) {
+              outPlayers[name] = { status, source: 'ESPN' };
+            }
+          }
+        }
+      }
+    } catch(e) {}
+
+    // SOURCE 2: MLB Transactions API (IL placements in last 7 days)
+    if (sp === 'mlb') {
+      try {
+        const today = new Date();
+        const weekAgo = new Date(today - 7*24*60*60*1000);
+        const fmt = d => d.toISOString().slice(0,10).replace(/-/g,'');
+        const r = await fetch(
+          `https://statsapi.mlb.com/api/v1/transactions?sportId=1&startDate=${fmt(weekAgo)}&endDate=${fmt(today)}&limit=200`,
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (r.ok) {
+          const data = await r.json();
+          for (const tx of (data?.transactions || [])) {
+            const desc = (tx?.description || '').toLowerCase();
+            const name = (tx?.player?.fullName || '').toLowerCase();
+            // IL placements, activated = no longer out
+            if (name && (desc.includes('placed') && (desc.includes('il') || desc.includes('injured list')))) {
+              if (!outPlayers[name]) {
+                outPlayers[name] = { status: 'IL', source: 'MLB Transactions' };
+              }
+            }
+            // Remove from out if activated
+            if (name && desc.includes('activated')) {
+              delete outPlayers[name];
+            }
+          }
+        }
+      } catch(e) {}
+    }
+
+    // SOURCE 3: Sleeper API player stats (status field)
+    try {
+      const sleeperSport = sp === 'mlb' ? 'baseball' : sp === 'nba' ? 'basketball' : 'football';
+      const r = await fetch(
+        `https://api.sleeper.app/v1/players/${sleeperSport}`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+      if (r.ok) {
+        const data = await r.json();
+        for (const [id, player] of Object.entries(data)) {
+          const status = (player?.injury_status || player?.status || '').toLowerCase();
+          const name = (player?.full_name || player?.name || '').toLowerCase();
+          if (name && ['out','ir','pup','nfi','susp'].some(s => status.includes(s))) {
+            if (!outPlayers[name]) {
+              outPlayers[name] = { status: player.injury_status || status, source: 'Sleeper' };
+            }
+          }
+        }
+      }
+    } catch(e) {}
+
+    return res.json({
+      success: true,
+      outPlayers,
+      count: Object.keys(outPlayers).length,
+      sources: ['ESPN', 'MLB Transactions', 'Sleeper']
+    });
+  }
+
   // ── MLB ACTIVE ROSTERS ACTION ──────────────────────────────────────
   if (action === 'mlb_rosters') {
     const teams = (req.query.teams || '').split(',').filter(Boolean);
