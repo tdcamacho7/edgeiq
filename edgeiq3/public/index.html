@@ -3887,8 +3887,13 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     // Best available fallback
     // Hard floors: edge >= 72, hitters must project >= 8 pts, DK team cap
     const EDGE_FLOOR    = 72;
-    const HITTER_PROJ   = 8; // Carpenter at 5.6 pts is not a GPP play regardless of ownership
-    const hitterOk = p => p.pos === 'P' || (p.projPts || 0) >= HITTER_PROJ;
+    const HITTER_PROJ   = 11; // minimum projected DK pts for any hitter slot
+    const hitterOk = p => {
+      if (p.pos === 'P') return true;
+      if ((p.projPts || 0) < HITTER_PROJ) return false;
+      if (p.dvpLabel?.badge === 'bad matchup') return false; // never pick bad matchup hitters
+      return true;
+    };
 
     if (!pick) {
       pick = sorted.find(p =>
@@ -4084,15 +4089,15 @@ async function buildAndRender(quickRebuild = false) {
 
       // Rule 5: total projected points floor.
       const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
-      const MIN_TOTAL_PROJ = sport === 'mlb' ? 155 : sport === 'nba' ? 280 : 140;
+      const MIN_TOTAL_PROJ = sport === 'mlb' ? 160 : sport === 'nba' ? 280 : 140;
       if (totalProj < MIN_TOTAL_PROJ) return false;
 
-      // Rule 6: per-player projection floor for hitters
-      // Low-own hitters get 99 edge via ownership multiplier but project 5-9 pts — garbage GPP plays.
-      // Pitchers already have a 14pt floor at the pool level; this covers hitters.
-      const HITTER_MIN_PROJ = sport === 'mlb' ? 8 : 0;
+      // Rule 6: per-player projection floor + no bad matchup hitters
+      const HITTER_MIN_PROJ = sport === 'mlb' ? 11 : 0;
       for (const l of valid) {
-        if (l.player.pos !== 'P' && (l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
+        if (l.player.pos === 'P') continue;
+        if ((l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
+        if (l.player.dvpLabel?.badge === 'bad matchup') return false;
       }
 
       // Rule 7: DraftKings team cap — max 5 players from any single team
