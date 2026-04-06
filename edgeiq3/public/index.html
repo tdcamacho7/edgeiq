@@ -595,6 +595,8 @@ async function fetchSlate(){
     }).catch(()=>{});
 
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
+    // Save the REAL draftGroupId (not contest ID) — used by CSV injury check
+    if (json.draftGroupId) localStorage.setItem(`edgeiq_dgrid_${sport}`, json.draftGroupId);
     buildAndRender();
     startAutoRefresh();
 
@@ -781,35 +783,26 @@ async function handleCsv(input){
     }
 
     // ── DK LIVE STATUS CHECK ───────────────────────────────────────────
-    // Primary: use DK player IDs from the CSV to query DK's player API directly.
-    // No draftGroupId needed — each player row has a numeric DK ID.
-    // Fallback: if URL is filled, use draftGroupId to get all statuses at once.
-    // This catches game-day scratches that ESPN/MLB Transactions always miss.
+    // Catches game-day scratches that ESPN/MLB Transactions always miss.
+    // Uses the REAL draftGroupId (not contest ID) to call DK's draftables API.
+    // Priority: (1) cached draftGroupId from last URL fetch, (2) URL field parse.
+    // First URL fetch saves draftGroupId to localStorage — reused for all future CSVs.
     try {
-      setStatus(`${withData.length} players · checking DK live statuses...`, 'var(--amber)');
-      
-      // Collect DK player IDs from the parsed CSV
-      const csvPlayerIds = withData
-        .filter(p => p.dkId && p.dkId.length > 3)
-        .map(p => p.dkId);
-      
-      // Prefer draftGroupId (one call, all players) over individual IDs (many calls)
-      const dkUrl = document.getElementById('dk-url')?.value?.trim() || '';
-      const dkDgId = extractId(dkUrl);
-      
-      const statusParam = dkDgId
-        ? `dgId=${dkDgId}`
-        : csvPlayerIds.length
-        ? `dgId=0&playerIds=${csvPlayerIds.slice(0, 150).join(',')}`
-        : null;
+      const cachedDgRid = localStorage.getItem(`edgeiq_dgrid_${sport}`) || '';
+      const dkUrlField  = document.getElementById('dk-url')?.value?.trim() || '';
+      const parsedId    = extractId(dkUrlField);
+      // Use cached real draftGroupId first (most reliable), fall back to URL parse
+      const draftGroupId = cachedDgRid || parsedId || '';
 
-      if (statusParam) {
+      if (draftGroupId) {
+        setStatus(`${withData.length} players · checking DK live statuses...`, 'var(--amber)');
         const dkRes = await Promise.race([
-          fetch(`/api/proxy?action=dk_status&sport=${sport}&${statusParam}`),
+          fetch(`/api/proxy?action=dk_status&dgId=${draftGroupId}&sport=${sport}`),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
         ]);
         if (dkRes.ok) {
           const dkData = await dkRes.json();
+          console.log(`DK status: source=${dkData.source}, out=${dkData.count}, total=${dkData.totalPlayers}`);
           if (dkData.success && Object.keys(dkData.outPlayers || {}).length > 0) {
             window._injuryCache = { ...(window._injuryCache || {}), ...dkData.outPlayers };
             let dkExclusions = 0;
@@ -817,10 +810,7 @@ async function handleCsv(input){
               if (p.isOut) return p;
               const nameLow = p.name.toLowerCase();
               const last = nameLow.split(' ').pop();
-              // Also match by DK player ID for exact matching
-              const idKey = p.dkId ? `id:${p.dkId}` : null;
-              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last]
-                       || (idKey && dkData.outPlayers[idKey]);
+              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last];
               if (hit) {
                 dkExclusions++;
                 return { ...p, isOut: true, status: hit.status };
@@ -828,13 +818,14 @@ async function handleCsv(input){
               return p;
             });
             if (dkExclusions > 0) {
-              console.log(`DK live status: ${dkExclusions} game-day scratch(es) removed`);
-              setStatus(`🚨 ${dkExclusions} game-day scratch(es) caught via DK live data`, 'var(--red)');
-            } else {
-              console.log(`DK live status: checked ${dkData.totalPlayers || 0} players, all clear`);
+              setStatus(`🚨 ${dkExclusions} game-day scratch(es) caught via DK`, 'var(--red)');
             }
+          } else if (dkData.totalPlayers > 0) {
+            console.log(`DK status: all ${dkData.totalPlayers} players active`);
           }
         }
+      } else {
+        console.warn('DK status check skipped — no draftGroupId. Do a URL fetch once to enable this check.');
       }
     } catch(e) {
       console.log('DK status check skipped:', e.message);
