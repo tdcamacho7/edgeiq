@@ -584,6 +584,60 @@ export default async function handler(req, res) {
     return res.json({ success: true, activeNames, teamCount: teams.length });
   }
 
+  // ── DK LIVE STATUS ACTION ────────────────────────────────────────
+  // Fetches player injury status directly from DK's own draftables API.
+  // No ScraperAPI needed — DK's JSON API is public and fast.
+  // Called after CSV upload to catch same-day game-day scratches (OUT badge)
+  // that don't appear in ESPN injuries or MLB Transactions.
+  if (action === 'dk_status') {
+    const draftGrpId = dgId;
+    if (!draftGrpId || draftGrpId === '0') {
+      return res.status(400).json({ error: 'draftGroupId required for dk_status' });
+    }
+    const endpoints = [
+      `https://api.draftkings.com/draftgroups/v1/draftgroups/${draftGrpId}/draftables?format=json`,
+      `https://api.draftkings.com/lineups/v1/getavailableplayers?draftGroupId=${draftGrpId}`,
+    ];
+    for (const url of endpoints) {
+      try {
+        // Try direct first (no ScraperAPI) — DK's JSON API often works without it
+        let r = await fetchDirect(url, 6000);
+        if (!r.ok && scraperKey) r = await fetchScraper(url, false, 10000);
+        if (!r.ok) continue;
+        const data = await r.json();
+        const players = data?.draftables || data?.playerList || data?.data?.draftables || [];
+        if (!players.length) continue;
+
+        const statusMap = {};
+        const OUT_DK = ['out','o','ir','il','injured reserve','injured list',
+          'day-to-day','doubtful','inactive','suspended','na'];
+
+        for (const p of players) {
+          const name = (p.displayName || p.playerName || '').toLowerCase().trim();
+          const id   = String(p.draftableId || p.playerId || p.id || '');
+          const rawStatus = (
+            p.playerGameAttribute?.injuryStatus ||
+            p.status || p.injuryStatus || ''
+          ).toLowerCase().trim();
+          const isOut = OUT_DK.includes(rawStatus) || rawStatus.startsWith('il');
+          if (name && isOut) {
+            statusMap[name] = { status: rawStatus, source: 'DraftKings', id };
+            const last = name.split(' ').pop();
+            if (last.length > 2) statusMap[last] = { status: rawStatus, source: 'DraftKings', id };
+          }
+        }
+        return res.status(200).json({
+          success: true,
+          outPlayers: statusMap,
+          count: Object.keys(statusMap).length,
+          source: 'DraftKings API',
+          totalPlayers: players.length,
+        });
+      } catch(e) { continue; }
+    }
+    return res.status(200).json({ success: true, outPlayers: {}, count: 0, source: 'DraftKings API (no data)' });
+  }
+
   // Guard: action-only requests (dgId=0 or missing) should never reach DK scraping
   if (!dgId || dgId === '0') return res.status(400).json({ error: 'No ID provided' });
 
