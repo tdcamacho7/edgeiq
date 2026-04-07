@@ -1048,6 +1048,7 @@ function parseCsv(text){
   // DraftKings sometimes includes injury status in the CSV
   const statusI=hdr.findIndex(h=>h.includes('status')||h.includes('injury'));
   const idI=hdr.findIndex(h=>h==='id');  // DK player ID column (used for live status check)
+  const rosterI=hdr.findIndex(h=>h==='roster_position');  // SUB = spot/emergency starter
 
   return lines.slice(start+1).map(l=>{
     const v=l.split(',').map(c=>c.trim().replace(/"/g,''));
@@ -1059,6 +1060,10 @@ function parseCsv(text){
     if(!name||salary<2000) return null;
     const gi2=v[gi]||'', myTeam=v[ti]||'';
     const dkId = idI >= 0 ? (v[idI]||'').replace(/\D/g,'') : '';
+    const rosterPos = rosterI >= 0 ? (v[rosterI]||'').trim().toUpperCase() : '';
+    // SUB = DK's emergency/spot starter badge — 50%+ blowup rate in MLB
+    // These pitchers are not in the normal rotation and routinely score <5 pts
+    const isSubPitcher = rawPos === 'P' && rosterPos === 'SUB';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     // Get status from dedicated status/injury column
@@ -3515,14 +3520,32 @@ function optimize(all, sp) {
               .filter(h =>
                 h.team === stackOpponent &&
                 h.edgeScore >= 75 &&
-                h.salary >= 3200 &&
-                h.projPts >= 8
+                h.salary >= 3500 &&
+                h.projPts >= 11 &&          // raised from 8 — Moniak-type busts eliminated
+                (h.avgPts || 0) >= 9 &&     // must have a real hit history, not just proj
+                h.dvpLabel?.badge !== 'bad matchup'
               ).sort((a,b) => b.edgeScore - a.edgeScore)
           : [];
         const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
-        const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
+        // Anti-correlation: if a pitcher is elite (proj >= 22), their game's hitters
+        // tend to score less — pitchers dominate → fewer runs → hitters bust.
+        // Nimmo in TEX/SEA 1-2 game is the textbook example.
+        // Penalize hitters from the same game as a high-proj pitcher we're using.
+        const elitePitcherGames = new Set();
+        [p1, p2].forEach(pitcher => {
+          if ((pitcher.projPts || 0) >= 22 && pitcher.gameInfo) {
+            elitePitcherGames.add(pitcher.gameInfo);
+          }
+        });
+        const availHitters = hitters.filter(h => !usedPitchers.has(h.name)).map(h => {
+          // If hitter is in a game where our pitcher is elite, reduce their effective edge
+          if (elitePitcherGames.has(h.gameInfo) && h.team !== stackTeam) {
+            return { ...h, edgeScore: Math.max(0, h.edgeScore - 15) };
+          }
+          return h;
+        });
 
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
