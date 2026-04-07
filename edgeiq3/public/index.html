@@ -1061,9 +1061,6 @@ function parseCsv(text){
     const gi2=v[gi]||'', myTeam=v[ti]||'';
     const dkId = idI >= 0 ? (v[idI]||'').replace(/\D/g,'') : '';
     const rosterPos = rosterI >= 0 ? (v[rosterI]||'').trim().toUpperCase() : '';
-    // SUB = DK's emergency/spot starter badge — 50%+ blowup rate in MLB
-    // These pitchers are not in the normal rotation and routinely score <5 pts
-    const isSubPitcher = rawPos === 'P' && rosterPos === 'SUB';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     // Get status from dedicated status/injury column
@@ -1117,9 +1114,12 @@ function parseCsv(text){
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
     // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
     // avgPts === 0 = no history this season = not in rotation.
+    // SUB badge = DK emergency/spot starter — 50%+ blowup rate, block entirely
+    const isSubPitcher = rawPos === 'P' && rosterPos === 'SUB';
     const isBadPitcher = rawPos === 'P' && (
       salary < 5500 ||          // below DK starter floor
-      avgPtsVal === 0           // never scored = not a starter
+      avgPtsVal === 0 ||         // never scored = not a starter
+      isSubPitcher               // emergency starter — Painter/Mize type busts
     );
     // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
