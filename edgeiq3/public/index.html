@@ -842,7 +842,7 @@ async function handleCsv(input){
     ]).catch(() => {});
     const weatherTeams = Object.keys(weatherCache).length;
 
-    players = enrich(withData);
+    players = applyBuzzMultiplier(enrich(withData));
     buildAndRender();
 
     const sources = [
@@ -880,6 +880,25 @@ async function fetchVegasFromProxy(sp) {
     }
     return data.odds || {};
   } catch(e) { return {}; }
+}
+
+// ── BUZZ MULTIPLIER ──────────────────────────────────────────────
+// Hot players in elite matchups at low salary get massively under-projected ownership.
+// Queen at 14% projected → 53.7% actual is the textbook case.
+// When a player is hot + elite matchup + price < $6,500, inflate projected own by 2x
+// so the engine correctly discounts them as chalk traps.
+function applyBuzzMultiplier(players) {
+  return players.map(p => {
+    const isHot = p.recentFormData?.trend === 'hot';
+    const isElite = p.dvpLabel?.badge === 'elite matchup';
+    const isCheap = (p.salary || 0) < 6500;
+    const isBuzz = isHot && isElite && isCheap;
+    if (isBuzz && (p.projOwn || 0) < 20) {
+      // Inflate projected ownership — engine will correctly penalize via ownershipMult
+      return { ...p, projOwn: Math.min(35, (p.projOwn || 10) * 2.2), _buzzInflated: true };
+    }
+    return p;
+  });
 }
 
 // Fuzzy match player name to ownership map
@@ -1108,7 +1127,7 @@ function parseCsv(text){
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3300) ||         // cheap = bench
+      (salary > 0 && salary < 3800) ||         // cheap = bench/filler — raised from 3300 based on bust history
       (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
     );
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
@@ -1869,7 +1888,19 @@ function analyzeLineupDNA(lineup, sp) {
     }
   }
 
-  // 5. MLB: 4+ hitters from same team
+  // 5. MLB: game concentration check
+    const gameGroups = {};
+    valid.filter(l => l.player.pos !== 'P').forEach(l => {
+      const g = l.player.gameInfo || '';
+      gameGroups[g] = (gameGroups[g] || 0) + 1;
+    });
+    const maxGameCount = Math.max(0, ...Object.values(gameGroups));
+    if (maxGameCount >= 6) {
+      dnaScore -= 5;
+      warnings.push(`${maxGameCount} hitters from one game — high variance, one bad game ends the lineup`);
+    }
+
+  // 5b. MLB: 4+ hitters from same team
   if (sp === 'mlb') {
     const teamCounts = {};
     valid.filter(l => l.player.pos !== 'P').forEach(l => {
@@ -2639,8 +2670,19 @@ function enrich(raw) {
     // Use Kalman-filtered projection as our best estimate
     // Kalman = optimal linear estimator combining all sources (Bayesian, Vegas, recent form)
     p._bayesianMean = bayesianMean;    // stored for reference
-    p._kalmanProjection = kalmanProjection; // ← THIS is what ceiling calc should use
+    p._kalmanProjection = kalmanProjection; // ← THIS is what ceiling calc uses
     p._projSigma = projSigma;
+
+    // CRITICAL: Feed Kalman back into projPts so displayed projection
+    // reflects ALL data sources, not just Sleeper/DK avg alone.
+    // This is the engine's OWN projection — not any single website's number.
+    // Weight: 60% Kalman (combined sources) + 40% original (DK avg / Sleeper)
+    // Blend prevents overfit to any single sharp signal.
+    const engineProj = Math.round(
+      (kalmanProjection * 0.60 + projPts * 0.40) * 10
+    ) / 10;
+    // Replace projPts with engine-blended projection going forward
+    // (flatBoost signals will still be applied on top)
 
     // ── TIER 1 SIGNALS ──
     const recentForm   = calcRecentForm(p);
@@ -2699,7 +2741,8 @@ function enrich(raw) {
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
                       weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
                       Math.round(coachBoost * 0.4); // 40% of coach signal into proj pts
-    const adjProjPts = Math.max(0, Math.round((projPts + flatBoost) * 10) / 10);
+    // Use engineProj (Kalman-blended) as base, then apply signal boosts on top
+    const adjProjPts = Math.max(0, Math.round((engineProj + flatBoost) * 10) / 10);
 
     const enriched = {
       ...p,
@@ -3340,7 +3383,10 @@ function calcEdgeScore(p) {
 
   const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
 
-  let score = Math.min(99, Math.round(rawScore + mcBoost));
+  // Remove hard 99 cap — let scores spread naturally up to 120
+  // This makes the score meaningful: 99 = genuinely elite, not just "hit the wall"
+  // Lineup qualifying threshold is now set dynamically based on slate distribution
+  let score = Math.min(120, Math.round(rawScore + mcBoost));
 
   // ── DEAD SIGNAL RECOVERY ──────────────────────────────────────────
   // Bias correction: historical engine error → adjust forward
@@ -4104,11 +4150,22 @@ async function buildAndRender(quickRebuild = false) {
     // Best qualifying lineup is presented; if none qualifies after 25 tries,
     // the best-scoring attempt is shown with an honest gap message.
 
-    // Adaptive target: start at 98, relax by 1 every 8 failed attempts
-    // Prevents the engine from burning all 25 attempts on an unachievable bar
-    // and then falling back to a worse lineup than it already found.
-    const BASE_TARGET    = 98;
-    const MIN_INDIV_EDGE = 72;
+    // Dynamic target: use the 85th percentile edge score of the eligible player pool
+    // This means we always target the top 15% of tonight's slate specifically,
+    // rather than a fixed number that may be easy or impossible depending on the slate.
+    // Floor at 95 (always a good lineup), ceiling at 108 (only on elite slates).
+    const eligibleScores = players
+      .filter(p => !p.isOut && p.edgeScore > 0)
+      .map(p => p.edgeScore)
+      .sort((a,b) => a - b);
+    const p85idx = Math.floor(eligibleScores.length * 0.85);
+    const slateP85 = eligibleScores[p85idx] || 95;
+    const BASE_TARGET = Math.min(108, Math.max(95, Math.round(slateP85)));
+    console.log(`Slate 85th percentile edge: ${slateP85.toFixed(1)} → target: ${BASE_TARGET}`);
+    // Individual floor: 70th percentile of the slate (no player below median quality)
+    const p70idx = Math.floor(eligibleScores.length * 0.70);
+    const slateP70 = eligibleScores[p70idx] || 80;
+    const MIN_INDIV_EDGE = Math.min(88, Math.max(75, Math.round(slateP70)));
     const MAX_ATTEMPTS   = 25;
 
     // Composite score: 65% edge (ownership leverage) + 35% projection quality
