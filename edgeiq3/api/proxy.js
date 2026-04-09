@@ -502,8 +502,14 @@ export default async function handler(req, res) {
       if (!name || !status) return;
       const n = name.toLowerCase().trim();
       outPlayers[n] = { status, source };
+      // Store first+last variant for names like "José Abreu" → "jose abreu"
+      // but NOT last-name-only keys — those cause cross-sport false positives
+      // (273 ESPN injuries: "Smith" blocks all "Smiths" across every sport)
       const parts = n.split(' ');
-      if (parts.length >= 2) outPlayers[`${parts[0]} ${parts[parts.length-1]}`] = { status, source };
+      if (parts.length >= 2) {
+        const firstLast = `${parts[0]} ${parts[parts.length-1]}`;
+        if (firstLast !== n) outPlayers[firstLast] = { status, source };
+      }
     }
 
     // Run all 3 sources in parallel with tight 4s timeouts
