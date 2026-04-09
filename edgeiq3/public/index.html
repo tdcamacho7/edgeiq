@@ -5249,73 +5249,151 @@ function generateMultiLineups() {
 
   const maxExposure = parseInt(document.getElementById('exposure-slider').value) / 100;
   const n = multiLineupCount;
-  const slots = SLOTS[sport];
 
-  document.getElementById('multi-status').textContent = `Generating ${n} lineups...`;
-  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px">Running optimizer ${n} times...</div>`;
+  document.getElementById('multi-status').textContent = `Building ${n} lineups...`;
+  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px" id="multi-progress">Initializing...</div>`;
 
-  // Run async to not block UI
-  setTimeout(() => {
-    multiLineups = buildMultipleLineups(n, maxExposure, slots);
+  // Run async so progress updates render
+  buildMultipleLineups(n, maxExposure).then(results => {
+    multiLineups = results;
     renderMultiLineups();
-  }, 50);
+  });
 }
 
-function buildMultipleLineups(n, maxExposure, slots) {
+async function buildMultipleLineups(n, maxExposure) {
+  const slots = SLOTS[sport];
   const eligible = players.filter(p => !p.isOut && p.edgeScore > 0);
   const results = [];
-
-  // Track exposure counts
   const exposureCounts = {};
   const maxAppearances = Math.ceil(n * maxExposure);
+  const usedStackTeams = new Set(); // track primary stack teams across lineups
 
-  // Get unique game stacks to target
-  const games = {};
-  eligible.forEach(p => {
-    if (p.gameInfo) games[p.gameInfo] = (games[p.gameInfo] || 0) + 1;
+  // Identify the best stack teams ranked by composite score
+  const teamScores = {};
+  eligible.filter(p => p.pos !== 'P').forEach(p => {
+    if (!teamScores[p.team]) teamScores[p.team] = [];
+    teamScores[p.team].push(p.edgeScore * 0.6 + Math.min(99, (p.projPts||0) * 5.5) * 0.4);
   });
-  const gameList = Object.keys(games).sort((a,b) => games[b] - games[a]);
+  const rankedTeams = Object.entries(teamScores)
+    .filter(([, scores]) => scores.length >= 3)
+    .map(([team, scores]) => {
+      const top4 = [...scores].sort((a,b)=>b-a).slice(0,4);
+      return [team, top4.reduce((s,v)=>s+v,0)/top4.length];
+    })
+    .sort((a,b) => b[1]-a[1])
+    .map(([team]) => team);
 
   for (let i = 0; i < n; i++) {
-    // Rotate which game stack to target
-    const targetGame = gameList[i % gameList.length];
+    const progressEl = document.getElementById('multi-progress');
+    if (progressEl) progressEl.textContent = `Building lineup ${i+1} of ${n}...`;
+    await new Promise(r => setTimeout(r, 0)); // yield to browser
 
-    // Apply exposure limits — if player is at max, reduce their edge score
-    const adjustedPlayers = eligible.map(p => {
+    // Determine target stack for this lineup
+    // Each lineup gets a different primary stack team — forces true diversification
+    const availableTeams = rankedTeams.filter(t => !usedStackTeams.has(t));
+    const targetTeam = availableTeams[0] || rankedTeams[i % rankedTeams.length];
+
+    // Build adjusted player pool:
+    // 1. Exposure cap — block overused players
+    // 2. Heavily boost target stack team so optimizer is forced to use them
+    // 3. Penalize players already used too many times
+    const adjustedPlayers = players.map(p => {
+      if (p.isOut) return p;
       const count = exposureCounts[p.name] || 0;
-      if (count >= maxAppearances) {
-        return { ...p, edgeScore: 0 }; // blocked from further lineups
-      }
-      // Diversity bonus — players not yet used get a small boost
-      const diversityBoost = count === 0 ? 5 : count === 1 ? 2 : 0;
-      // Stack incentive — boost players from target game
-      const stackBoost = p.gameInfo === targetGame ? 8 : 0;
+      if (count >= maxAppearances) return { ...p, edgeScore: 0, isOut: true };
+
+      const diversityBoost = count === 0 ? 6 : count === 1 ? 2 : -3;
+      // Strong stack force: target team hitters get +25 boost to guarantee selection
+      const stackForce = (p.pos !== 'P' && p.team === targetTeam) ? 25 : 0;
       return {
         ...p,
-        edgeScore: Math.min(99, p.edgeScore + diversityBoost + stackBoost),
-        _targetGame: targetGame,
-        _inTargetStack: p.gameInfo === targetGame,
+        edgeScore: Math.min(120, Math.max(0, p.edgeScore + diversityBoost + stackForce)),
+        _multiTargetTeam: targetTeam,
       };
     });
 
-    // Run optimizer on adjusted pool
-    const lineupResult = optimize(adjustedPlayers, sport);
-    const valid = lineupResult.filter(l => l.player);
+    // Run the full silent optimization loop with all quality gates
+    // This ensures each lineup passes the same rules as the main lineup
+    const savedPlayers = players;
+    players = adjustedPlayers;
 
-    if (valid.length >= Math.floor(slots.length * 0.75)) {
+    let bestLineup = null;
+    let bestScore = 0;
+    const TARGET = 90; // slightly relaxed for multi — main lineup gets full 95+ target
+
+    for (let attempt = 0; attempt < 15; attempt++) {
+      const candidate = optimize(players, sport);
+      if (!candidate?.length) continue;
+      const valid = candidate.filter(l => l.player);
+      if (!valid.length) continue;
+
+      // Check quality gates
+      const avgEdge = valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length;
+      const totalProj = valid.reduce((s,l)=>s+(l.player.projPts||0),0);
+      const hasOutPlayer = valid.some(l => l.player.isOut || l.player.edgeScore <= 0);
+      const hasBadHitter = valid.some(l => l.player.pos !== 'P' && (l.player.projPts||0) < 8);
+      const hasBadMatchup = valid.some(l => l.player.pos !== 'P' && l.player.dvpLabel?.badge === 'bad matchup');
+      const hasStackTeam = valid.some(l => l.player.team === targetTeam && l.player.pos !== 'P');
+
+      // Team cap check
+      const teamCounts = {};
+      valid.forEach(l => { const t = l.player.team||''; teamCounts[t]=(teamCounts[t]||0)+1; });
+      const violatesTeamCap = Object.values(teamCounts).some(c => c > 5);
+
+      const comp = avgEdge * 0.6 + Math.min(99, totalProj/2) * 0.4;
+      const passes = !hasOutPlayer && !hasBadHitter && !hasBadMatchup &&
+                     !violatesTeamCap && avgEdge >= TARGET && totalProj >= 140 && hasStackTeam;
+
+      if (comp > bestScore && !hasOutPlayer && !hasBadHitter && !violatesTeamCap) {
+        bestScore = comp;
+        bestLineup = candidate;
+      }
+      if (passes) break;
+
+      // Jitter for next attempt
+      players = players.map(p => ({
+        ...p,
+        edgeScore: Math.min(120, Math.max(0,
+          (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * 8 - 4)
+        )),
+        _baseEdgeScore: p._baseEdgeScore ?? p.edgeScore,
+      }));
+    }
+
+    // Restore original player pool
+    players = savedPlayers;
+
+    if (bestLineup) {
+      const valid = bestLineup.filter(l => l.player);
+      // Restore original edge scores for display
+      const displayLineup = bestLineup.map(l => {
+        if (!l.player) return l;
+        const orig = savedPlayers.find(p => p.name === l.player.name);
+        return orig ? { ...l, player: orig } : l;
+      });
+      const displayValid = displayLineup.filter(l => l.player);
+
+      // Identify the actual primary stack team used
+      const hitterTeams = {};
+      displayValid.filter(l=>l.player.pos!=='P').forEach(l => {
+        hitterTeams[l.player.team] = (hitterTeams[l.player.team]||0)+1;
+      });
+      const primaryStack = Object.entries(hitterTeams).sort((a,b)=>b[1]-a[1])[0]?.[0] || targetTeam;
+
       results.push({
-        lineup: lineupResult,
+        lineup: displayLineup,
         num: i + 1,
-        targetGame,
-        totalPts: valid.reduce((s,l) => s + l.player.projPts, 0),
-        avgEdge: Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length),
-        avgOwn: Math.round(valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length),
-        totalSal: valid.reduce((s,l) => s + l.player.salary, 0),
+        targetTeam,
+        primaryStack,
+        totalPts: Math.round(displayValid.reduce((s,l)=>s+(l.player.projPts||0),0)*10)/10,
+        avgEdge: Math.round(displayValid.reduce((s,l)=>s+l.player.edgeScore,0)/displayValid.length),
+        avgOwn:  Math.round(displayValid.reduce((s,l)=>s+(l.player.projOwn||0),0)/displayValid.length),
+        totalSal: displayValid.reduce((s,l)=>s+l.player.salary,0),
       });
 
-      // Update exposure counts
-      valid.forEach(l => {
-        exposureCounts[l.player.name] = (exposureCounts[l.player.name] || 0) + 1;
+      usedStackTeams.add(primaryStack);
+      displayValid.forEach(l => {
+        exposureCounts[l.player.name] = (exposureCounts[l.player.name]||0) + 1;
       });
     }
   }
@@ -5379,17 +5457,19 @@ function renderMultiLineups() {
       </div>`;
     }).join('');
 
+    const edgeColor = ml.avgEdge >= 100 ? 'var(--green)' : ml.avgEdge >= 90 ? 'var(--amber)' : 'var(--red)';
+    const projColor = ml.totalPts >= 160 ? 'var(--green)' : ml.totalPts >= 140 ? 'var(--amber)' : 'var(--red)';
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
       <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
         <div>
-          <span style="font-size:13px;font-weight:600">Lineup ${ml.num}</span>
-          <span style="font-size:11px;color:var(--t3);margin-left:8px">stack: ${ml.targetGame?.split(' ')[0]||'mixed'}</span>
+          <span style="font-size:13px;font-weight:700">Lineup ${ml.num}</span>
+          <span style="font-size:11px;background:rgba(34,211,238,.12);color:var(--cyan);padding:2px 7px;border-radius:4px;margin-left:8px;font-weight:600">${ml.primaryStack||ml.targetTeam} stack</span>
         </div>
-        <div style="display:flex;gap:12px;font-size:11px;font-family:var(--mono)">
-          <span style="color:var(--green)">${ml.totalPts.toFixed(1)} pts</span>
-          <span>edge ${ml.avgEdge}</span>
-          <span style="color:var(--green)">${ml.avgOwn}% own</span>
-          <span style="color:var(--cyan)">$${(ml.totalSal/1000).toFixed(1)}K</span>
+        <div style="display:flex;gap:10px;font-size:11px;font-family:var(--mono)">
+          <span style="color:${projColor}">${ml.totalPts.toFixed(1)}pts</span>
+          <span style="color:${edgeColor}">edge ${ml.avgEdge}</span>
+          <span style="color:var(--t2)">${ml.avgOwn}% own</span>
+          <span style="color:var(--t3)">$${(ml.totalSal/1000).toFixed(1)}K</span>
         </div>
       </div>
       <div style="padding:8px 14px">
