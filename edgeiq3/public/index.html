@@ -1140,15 +1140,15 @@ function parseCsv(text){
       rosterPos === 'RP' ||        // DK marks true relievers as RP in CSV
       rosterPos.includes('RP')     // any RP designation
     );
-    // Spot starters (SUB badge) tend to have low avgPts relative to their salary
-    // A $7,200 pitcher with avgPts < 12 = not a real rotation starter
-    // Real starters at $7,000+ avg 18-25+ pts; spot starters avg 8-14 pts
+    // Spot starters: only block clear non-starters
+    // Must have BOTH low avgPts AND low salary to be a spot starter
+    // A $7,200 pitcher averaging 12pts might just be a streaky real starter
     const salaryToPtsRatio = salary > 0 ? avgPtsVal / (salary / 1000) : 0;
     const isSpotStarter = rawPos === 'P' &&
       salary >= 5500 &&           // has starter salary
-      avgPtsVal > 0 &&            // has some history (not new)
-      avgPtsVal < 14 &&           // but well below true starter average
-      salary < 8000;              // not a proven ace (aces are $8000+)
+      avgPtsVal > 0 &&            // has some history
+      avgPtsVal < 10 &&           // clearly below starter average (raised from 14)
+      salary < 7000;              // only at low-end starter price
     // True new call-ups: in rotation but 0 DK history — caught by avgPts=0 gate
     const isSubPitcher = isReliever || (rosterPos === 'SUB') || isSpotStarter;
     const isBadPitcher = rawPos === 'P' && (
@@ -4269,7 +4269,8 @@ async function buildAndRender(quickRebuild = false) {
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       // Adaptive target: relax by 1 every 8 attempts so the engine finds something real
-      const TARGET_SCORE = Math.max(94, BASE_TARGET - Math.floor(attempt / 8));
+      // Relax 2pts every 3 attempts — reaches realistic floor by attempt 12
+      const TARGET_SCORE = Math.max(82, BASE_TARGET - Math.floor(attempt / 3) * 2);
       setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS} (target: ${TARGET_SCORE})`, 'var(--amber)');
       await new Promise(r => setTimeout(r, 0));
 
@@ -4281,8 +4282,11 @@ async function buildAndRender(quickRebuild = false) {
 
       // Track best by composite score — emergency fallback
       // Apply minimum proj floor even here so bestLineupSoFar is never garbage
+      // Fallback only requires no OUT players and basic viability
+      // Proj floor is intentionally loose here — we'd rather show something
+      // than show "not enough eligible players"
       const fallbackProjOk = candidateValid.every(l => {
-        const minP = sport === 'mlb' ? 8 : sport === 'nba' ? 15 : 8;
+        const minP = sport === 'mlb' ? 5 : sport === 'nba' ? 12 : 5;
         return l.player.pos === 'P' || (l.player.projPts || 0) >= minP;
       });
       const noOutInFallback = candidateValid.every(l => !l.player.isOut && l.player.edgeScore > 0);
@@ -4336,6 +4340,19 @@ async function buildAndRender(quickRebuild = false) {
     });
 
     // Use qualifying lineup if found, otherwise best we got
+    // Final fallback: if all quality gates failed, use absolute best attempt
+    // (no proj floors, just no OUT players) rather than showing error
+    if (!bestLineupSoFar) {
+      const lastResort = optimize(players, sport);
+      if (lastResort?.length) {
+        const lrValid = lastResort.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
+        if (lrValid.length >= (SLOTS[sport]?.length || 8) - 1) {
+          bestLineupSoFar = lastResort;
+          console.warn('Using last-resort lineup — all quality gates failed on this slate');
+        }
+      }
+    }
+
     lineup = qualifyingLineup || bestCleanLineup || bestLineupSoFar || [];
 
     if (!lineup.length) {
