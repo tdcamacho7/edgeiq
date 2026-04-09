@@ -4271,6 +4271,18 @@ async function buildAndRender(quickRebuild = false) {
         teamCounts[t] = (teamCounts[t] || 0) + 1;
         if (teamCounts[t] > 5) return false;
       }
+
+      // Rule 8: Game concentration — max 6 hitters from same game
+      // 7+ from one game = catastrophic single-point-of-failure exposure
+      if (sport === 'mlb') {
+        const gameCounts = {};
+        for (const l of valid) {
+          if (l.player.pos === 'P') continue;
+          const g = l.player.gameInfo || '';
+          gameCounts[g] = (gameCounts[g] || 0) + 1;
+          if (gameCounts[g] > 6) return false;
+        }
+      }
       return true;
     }
 
@@ -4993,18 +5005,14 @@ Be concise. Use bullet points. Flag ONLY real concerns, not general advice.
 If the lineup looks clean, say so clearly. Max 150 words.`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }]
-      })
+    // Route through proxy — browser can't call Anthropic API directly (CORS + key security)
+    const encodedPrompt = encodeURIComponent(JSON.stringify({ prompt }));
+    const response = await fetch(`/api/proxy?action=ai_validate&lineup=${encodedPrompt}`, {
+      signal: AbortSignal.timeout(25000)
     });
 
     const data = await response.json();
-    const text = data.content?.find(c => c.type === 'text')?.text || 'No response';
+    const text = data.text || 'No response';
 
     // Parse response into structured display
     const hasWarnings = /scratch|out|sub|risk|concern|flag|avoid|worry|caution|check/i.test(text);
