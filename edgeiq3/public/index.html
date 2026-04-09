@@ -1127,18 +1127,34 @@ function parseCsv(text){
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3800) ||         // cheap = bench/filler — raised from 3300 based on bust history
+      (salary > 0 && salary < 4400) ||         // raised to $4,400 — sub-$4,400 OFs consistently score 0-3pts
       (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
     );
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
     // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
     // avgPts === 0 = no history this season = not in rotation.
-    // SUB badge = DK emergency/spot starter — 50%+ blowup rate, block entirely
-    const isSubPitcher = rawPos === 'P' && rosterPos === 'SUB';
+    // Multi-signal SUB/spot-starter detection
+    // DK's UI shows "SUB" badge but CSV roster_position column uses position codes (SP/RP/P)
+    // Detect spot starters via multiple signals:
+    const isReliever = rawPos === 'P' && (
+      rosterPos === 'RP' ||        // DK marks true relievers as RP in CSV
+      rosterPos.includes('RP')     // any RP designation
+    );
+    // Spot starters (SUB badge) tend to have low avgPts relative to their salary
+    // A $7,200 pitcher with avgPts < 12 = not a real rotation starter
+    // Real starters at $7,000+ avg 18-25+ pts; spot starters avg 8-14 pts
+    const salaryToPtsRatio = salary > 0 ? avgPtsVal / (salary / 1000) : 0;
+    const isSpotStarter = rawPos === 'P' &&
+      salary >= 5500 &&           // has starter salary
+      avgPtsVal > 0 &&            // has some history (not new)
+      avgPtsVal < 14 &&           // but well below true starter average
+      salary < 8000;              // not a proven ace (aces are $8000+)
+    // True new call-ups: in rotation but 0 DK history — caught by avgPts=0 gate
+    const isSubPitcher = isReliever || (rosterPos === 'SUB') || isSpotStarter;
     const isBadPitcher = rawPos === 'P' && (
-      salary < 5500 ||          // below DK starter floor
-      avgPtsVal === 0 ||         // never scored = not a starter
-      isSubPitcher               // emergency starter — Painter/Mize type busts
+      salary < 5500 ||            // below DK starter floor
+      avgPtsVal === 0 ||           // zero history = not in rotation
+      isSubPitcher                 // reliever, spot starter, or SUB badge
     );
     // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
@@ -2738,9 +2754,23 @@ function enrich(raw) {
     const isOut = p.isOut || ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes((status||'').toLowerCase().trim());
 
     // Combined flat boosts applied to projected points
+    // Recent H2H penalty: if this player's team has scored ≤2 runs in their last
+    // 2+ games against this specific opponent, penalize heavily.
+    // HOU vs COL: HOU scored 1 run 3 times — the engine keeps picking HOU because
+    // season-long DVP says COL pitching is bad, but recent form says otherwise.
+    let recentH2HPenalty = 0;
+    if (sport === 'mlb' && p.pos !== 'P' && p.recentFormData) {
+      const last5 = p.recentFormData.last5 || [];
+      const recentBusts = last5.slice(0, 3).filter(pts => pts <= 3).length;
+      if (recentBusts >= 2) {
+        // Player has scored ≤3 pts in 2 of their last 3 games = cold streak
+        recentH2HPenalty = -3;
+      }
+    }
+
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
                       weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
-                      Math.round(coachBoost * 0.4); // 40% of coach signal into proj pts
+                      Math.round(coachBoost * 0.4) + recentH2HPenalty;
     // Use engineProj (Kalman-blended) as base, then apply signal boosts on top
     const adjProjPts = Math.max(0, Math.round((engineProj + flatBoost) * 10) / 10);
 
