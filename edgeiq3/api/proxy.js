@@ -2,7 +2,8 @@ export const config = { maxDuration: 60 }; // Vercel Pro: 60s, Free: 10s
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const { dgId, sport, action } = req.query;
   const scraperKey = process.env.SCRAPER_API_KEY;
@@ -54,7 +55,13 @@ export default async function handler(req, res) {
   // ── AI LINEUP VALIDATION ACTION ──────────────────────────────────
   // Uses Groq free tier — llama-3.3-70b-versatile, fast inference, no cost
   if (action === 'ai_validate') {
-    const lineupData = req.query.lineup ? JSON.parse(decodeURIComponent(req.query.lineup)) : null;
+    // Accept POST body or GET query param
+    let lineupData = null;
+    if (req.method === 'POST' && req.body) {
+      lineupData = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    } else if (req.query.lineup) {
+      lineupData = JSON.parse(decodeURIComponent(req.query.lineup));
+    }
     if (!lineupData) return res.status(400).json({ error: 'No lineup data' });
 
     const groqKey = process.env.GROQ_API_KEY;
