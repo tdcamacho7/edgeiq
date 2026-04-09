@@ -3894,13 +3894,22 @@ function optimize(all, sp) {
 // Greedy slot filler — used by MLB pitcher-first optimizer
 function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringBackCandidate = null) {
   // Sort by composite value: 60% edge (ownership leverage) + 40% projection quality.
-  // Pure edge-sort picks low-projection players when edge scores tie at 99.
-  // Composite ensures Cam Smith (17.4 proj, 99 edge) beats Andy Pages (9.9 proj, 99 edge).
   const playerValue = p => {
     const projScore = Math.min(99, (p.projPts || 0) * (p.pos === 'P' ? 3.3 : 5.5));
     return p.edgeScore * 0.60 + projScore * 0.40;
   };
-  const sorted = [...pool].sort((a,b) => playerValue(b) - playerValue(a));
+  // Pre-filter pool: hitters must meet proj floor BEFORE any sorting or picking
+  // This is the primary gate — all pick paths (stack, bring-back, fallback) draw from here
+  const hitterFloor = sp === 'mlb' ? 11 : sp === 'nba' ? 18 : 10;
+  const filteredPool = pool.filter(p => {
+    if (p.pos === 'P') return true;                           // pitchers always eligible
+    if ((p.projPts || 0) < hitterFloor) return false;        // proj floor
+    if (p.dvpLabel?.badge === 'bad matchup') return false;    // no bad matchups
+    return true;
+  });
+  // Use filtered pool for sorting — fall back to full pool only if filter leaves < slots
+  const sortBase = filteredPool.length >= slots.length ? filteredPool : pool;
+  const sorted = [...sortBase].sort((a,b) => playerValue(b) - playerValue(a));
   const used   = new Set();
   let salLeft  = budget;
   const lineup = [];
@@ -3966,7 +3975,8 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         // Only skip if stack player is completely unavailable (injured/no player at position)
         // C slot has naturally lower scores — use lower threshold for catchers
         const stackMinEdge = positions.includes('C') ? 50 : 60;
-        const stackMinPts  = positions.includes('C') ? 6  : 7;
+        // Use same floor as hitterFloor — stack picks must meet the same standard
+        const stackMinPts  = positions.includes('C') ? Math.max(8, hitterFloor - 3) : hitterFloor;
         if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || 0) >= stackMinPts) {
           pick = stackPick;
         }
@@ -4340,19 +4350,6 @@ async function buildAndRender(quickRebuild = false) {
     });
 
     // Use qualifying lineup if found, otherwise best we got
-    // Final fallback: if all quality gates failed, use absolute best attempt
-    // (no proj floors, just no OUT players) rather than showing error
-    if (!bestLineupSoFar) {
-      const lastResort = optimize(players, sport);
-      if (lastResort?.length) {
-        const lrValid = lastResort.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
-        if (lrValid.length >= (SLOTS[sport]?.length || 8) - 1) {
-          bestLineupSoFar = lastResort;
-          console.warn('Using last-resort lineup — all quality gates failed on this slate');
-        }
-      }
-    }
-
     lineup = qualifyingLineup || bestCleanLineup || bestLineupSoFar || [];
 
     if (!lineup.length) {
