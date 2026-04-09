@@ -5005,9 +5005,11 @@ Be concise. Use bullet points. Flag ONLY real concerns, not general advice.
 If the lineup looks clean, say so clearly. Max 150 words.`;
 
   try {
-    // Route through proxy — browser can't call Anthropic API directly (CORS + key security)
-    const encodedPrompt = encodeURIComponent(JSON.stringify({ prompt }));
-    const response = await fetch(`/api/proxy?action=ai_validate&lineup=${encodedPrompt}`, {
+    // POST to proxy — GET query params get truncated for long prompts
+    const response = await fetch('/api/proxy?action=ai_validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
       signal: AbortSignal.timeout(25000)
     });
 
