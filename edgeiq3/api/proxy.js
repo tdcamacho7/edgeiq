@@ -52,6 +52,118 @@ export default async function handler(req, res) {
     });
   }
 
+  // ── MLB STARTING LINEUPS ACTION ──────────────────────────────────
+  // Runs server-side so Vercel's IPs hit these APIs — not the user's browser
+  if (action === 'mlb_lineups') {
+    const today = new Date().toISOString().split('T')[0];
+
+    function normName(n) {
+      return (n || '').normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\./g, '')
+        .toLowerCase().trim();
+    }
+
+    const confirmed = {};  // { normalizedName: true }
+    let gamesFound = 0;
+
+    // SOURCE 1: MLB Stats API — batting order hydration
+    try {
+      const r = await fetch(
+        `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=lineups,probablePitcher`,
+        { signal: AbortSignal.timeout(8000),
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } }
+      );
+      if (r.ok) {
+        const data = await r.json();
+        for (const date of (data.dates || [])) {
+          for (const game of (date.games || [])) {
+            const home = game.lineups?.homePlayers || [];
+            const away = game.lineups?.awayPlayers || [];
+            if (home.length + away.length > 0) {
+              gamesFound++;
+              [...home, ...away].forEach(p => {
+                const n = normName(p.fullName);
+                if (n) confirmed[n] = true;
+                const parts = n.split(' ');
+                if (parts.length >= 2) confirmed[`${parts[0]} ${parts[parts.length-1]}`] = true;
+              });
+            }
+            // Also add probable pitchers as confirmed starters
+            const pp = [game.teams?.home?.probablePitcher, game.teams?.away?.probablePitcher];
+            pp.forEach(p => {
+              if (p?.fullName) {
+                const n = normName(p.fullName);
+                confirmed[n] = true;
+              }
+            });
+          }
+        }
+      }
+    } catch(e) {}
+
+    // SOURCE 2: ESPN scoreboard — confirmed lineup starters
+    if (gamesFound === 0) {
+      try {
+        const r2 = await fetch(
+          'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
+          { signal: AbortSignal.timeout(6000),
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } }
+        );
+        if (r2.ok) {
+          const d2 = await r2.json();
+          for (const event of (d2.events || [])) {
+            for (const comp of (event.competitions || [])) {
+              for (const team of (comp.competitors || [])) {
+                const starters = (team.roster || []).filter(p => p.starter);
+                if (starters.length > 0) {
+                  gamesFound++;
+                  starters.forEach(p => {
+                    const n = normName(p.athlete?.displayName);
+                    if (n) confirmed[n] = true;
+                    const parts = n.split(' ');
+                    if (parts.length >= 2) confirmed[`${parts[0]} ${parts[parts.length-1]}`] = true;
+                  });
+                }
+              }
+            }
+          }
+        }
+      } catch(e) {}
+    }
+
+    // SOURCE 3: RotoWire daily lineups page (ScrapingBee)
+    if (gamesFound === 0 && beeKey) {
+      try {
+        const rwUrl = encodeURIComponent('https://www.rotowire.com/baseball/daily-lineups.php');
+        const r3 = await fetch(
+          `https://app.scrapingbee.com/api/v1/?api_key=${beeKey}&url=${rwUrl}&render_js=false`,
+          { signal: AbortSignal.timeout(10000) }
+        );
+        if (r3.ok) {
+          const html = await r3.text();
+          // Extract player names from RotoWire lineup HTML
+          const nameMatches = html.matchAll(/class="[^"]*lineup__player[^"]*"[^>]*>\s*<a[^>]*>([^<]+)</g);
+          for (const m of nameMatches) {
+            const n = normName(m[1]);
+            if (n && n.length > 3) {
+              confirmed[n] = true;
+              const parts = n.split(' ');
+              if (parts.length >= 2) confirmed[`${parts[0]} ${parts[parts.length-1]}`] = true;
+            }
+          }
+          if (Object.keys(confirmed).length > 20) gamesFound = 3;
+        }
+      } catch(e) {}
+    }
+
+    return res.status(200).json({
+      confirmed,
+      gamesFound,
+      totalConfirmed: Object.keys(confirmed).length,
+    });
+  }
+
   // ── AI LINEUP VALIDATION ACTION ──────────────────────────────────
   // Uses Groq free tier — llama-3.3-70b-versatile, fast inference, no cost
   if (action === 'ai_validate') {
