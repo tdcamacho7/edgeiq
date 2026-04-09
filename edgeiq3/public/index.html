@@ -2677,7 +2677,7 @@ function enrich(raw) {
     const kalmanObs = [
       { value: basePts,             sigma: projSigma * 1.2 },  // DK historical
       p.realProjection ? { value: p.realProjection, sigma: projSigma * 0.8 } : null,
-      p.vegasImplied   ? { value: p.vegasImplied,   sigma: projSigma * 0.6 } : null,
+      p.vegasImplied   ? { value: p.vegasImplied,   sigma: projSigma * 1.1 } : null, // reduced weight — team total ≠ individual proj
       p.recentFormData?.weightedAvg ? { value: p.recentFormData.weightedAvg, sigma: projSigma * 0.9 } : null,
     ].filter(Boolean);
     const kalmanResult = kalmanFilter(kalmanObs, 0.3, projSigma);
@@ -2691,14 +2691,16 @@ function enrich(raw) {
 
     // CRITICAL: Feed Kalman back into projPts so displayed projection
     // reflects ALL data sources, not just Sleeper/DK avg alone.
-    // This is the engine's OWN projection — not any single website's number.
     // Weight: 60% Kalman (combined sources) + 40% original (DK avg / Sleeper)
-    // Blend prevents overfit to any single sharp signal.
-    const engineProj = Math.round(
+    // HARD FLOOR: engineProj must never go below DK avgPts.
+    // Vegas implied is a TEAM total — using it to drag individual projections
+    // below their DK pricing causes empty lineups in early season when
+    // team totals (4-5 runs) are lower than individual player averages (7-12 pts).
+    const rawEngineProj = Math.round(
       (kalmanProjection * 0.60 + projPts * 0.40) * 10
     ) / 10;
-    // Replace projPts with engine-blended projection going forward
-    // (flatBoost signals will still be applied on top)
+    // Floor at DK avg: Kalman can BOOST projections but never drag below baseline
+    const engineProj = Math.max(rawEngineProj, projPts * 0.85);
 
     // ── TIER 1 SIGNALS ──
     const recentForm   = calcRecentForm(p);
@@ -3903,10 +3905,11 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   // Prevents the 11pt fixed floor from wiping out the entire hitter pool
   const hitterProjs = pool.filter(p => p.pos !== 'P' && (p.projPts||0) > 0)
     .map(p => p.projPts).sort((a,b) => a-b);
-  const p40idx = Math.floor(hitterProjs.length * 0.40);
-  const slateHitterP40 = hitterProjs[p40idx] || 8;
-  // Clamp: never below 7 (true floor), never above 14 (no need stricter)
-  const hitterFloor = Math.min(14, Math.max(7, Math.round(slateHitterP40)));
+  const p30idx = Math.floor(hitterProjs.length * 0.30);
+  const slateHitterP30 = hitterProjs[p30idx] || 6;
+  // Clamp: min 5 (early-season small samples), max 13
+  // Early April: DK avgs are from 5-8 games — many legitimate players average 4-7
+  const hitterFloor = Math.min(13, Math.max(5, Math.round(slateHitterP30)));
 
   const filteredPool = pool.filter(p => {
     if (p.pos === 'P') return true;                           // pitchers always eligible
@@ -4260,8 +4263,8 @@ async function buildAndRender(quickRebuild = false) {
       const HITTER_MIN_PROJ = sport === 'nba' ? 18 : sport === 'nfl' ? 10 : (() => {
         const hProjs = players.filter(p => !p.isOut && p.pos !== 'P' && (p.projPts||0) > 0)
           .map(p => p.projPts).sort((a,b) => a-b);
-        const idx = Math.floor(hProjs.length * 0.40);
-        return Math.min(14, Math.max(7, Math.round(hProjs[idx] || 8)));
+        const idx = Math.floor(hProjs.length * 0.30);
+        return Math.min(13, Math.max(5, Math.round(hProjs[idx] || 6)));
       })();
       for (const l of valid) {
         if (l.player.pos === 'P') continue;
@@ -4320,7 +4323,13 @@ async function buildAndRender(quickRebuild = false) {
         bestLineupSoFar = candidate;
       }
       // Track best clean lineup (every hitter ≥ 8 proj) by composite score
-      const cleanMinProj = sport === 'mlb' ? 11 : sport === 'nba' ? 18 : 10;
+      // Early season: use same dynamic floor as greedyFillSlots
+      // Fixed 11 blocks entire early-season hitter pools
+      const cleanHitterProjs = players.filter(p=>!p.isOut&&p.pos!=='P'&&(p.projPts||0)>0)
+        .map(p=>p.projPts).sort((a,b)=>a-b);
+      const cleanP30 = cleanHitterProjs[Math.floor(cleanHitterProjs.length*0.30)] || 6;
+      const cleanMinProj = sport === 'nba' ? 18 : sport === 'nfl' ? 10
+        : Math.min(13, Math.max(5, Math.round(cleanP30)));
       const passesHitterFloor = candidateValid.every(l => {
         if (l.player.pos === 'P') return true;
         if ((l.player.projPts || 0) < cleanMinProj) return false;
