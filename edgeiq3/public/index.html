@@ -711,48 +711,14 @@ async function handleCsv(input){
       } catch(e) {}
     }
 
-    // MLB starting lineup check — filters non-starters once lineups are posted
-    let mlbStartingLineups = null;
-    if (sport === 'mlb') {
-      mlbStartingLineups = await Promise.race([
-        fetchMLBStartingLineups(),
-        new Promise(res => setTimeout(() => res(null), 6000)) // 6s max
-      ]).catch(() => null);
-      if (mlbStartingLineups) {
-        setStatus(`${raw.length} players found · ${mlbStartingLineups.gamesWithLineups} lineups confirmed...`, 'var(--cyan)');
-      }
-    }
+    // MLB lineup confirmation — handled by DK injury_indicator + avgPts in parseCsv
+    // Server-side lineup API removed — was failing silently and causing issues
 
     // Apply all data to players
     // Apply persisted scratches immediately so scratched players never enter the pipeline
     raw = raw.map(p => isManuallyOut(p.name) ? { ...p, isOut: true } : p);
 
-    // Apply confirmed MLB starting lineups — mark non-starters as OUT
-    if (mlbStartingLineups?.starters?.size > 0) {
-      // Use same normalization as the fetcher
-      const normName = mlbStartingLineups.normName || (n =>
-        (n||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-          .replace(/\./g,'').toLowerCase().trim()
-      );
-      let benchFiltered = 0;
-      raw = raw.map(p => {
-        if (p.isOut || p.pos === 'P') return p;
-        const norm = normName(p.name);
-        const parts = norm.split(' ');
-        const firstLast = parts.length >= 2 ? `${parts[0]} ${parts[parts.length-1]}` : norm;
-        const inLineup = mlbStartingLineups.starters.has(norm) ||
-                         mlbStartingLineups.starters.has(firstLast);
-        if (!inLineup) {
-          benchFiltered++;
-          return { ...p, isOut: true, status: 'Not in lineup' };
-        }
-        return p;
-      });
-      console.log(`Starting lineup filter: ${benchFiltered} non-starters removed`);
-      if (benchFiltered > 0) {
-        setStatus(`Lineups posted · ${benchFiltered} non-starters filtered · ${mlbStartingLineups.gamesWithLineups} games confirmed`, 'var(--cyan)');
-      }
-    }
+    // Non-starters filtered via DK injury_indicator + avgPts < 2.5 in parseCsv
 
     let withData = raw.map(p => {
       // Injury status from ESPN
@@ -1089,8 +1055,10 @@ function parseCsv(text){
   const ai=hdr.findIndex(h=>h.includes('avg'));
   // DraftKings sometimes includes injury status in the CSV
   const statusI=hdr.findIndex(h=>h.includes('status')||h.includes('injury'));
-  const idI=hdr.findIndex(h=>h==='id');  // DK player ID column (used for live status check)
-  const rosterI=hdr.findIndex(h=>h==='roster_position');  // SUB = spot/emergency starter
+  const idI=hdr.findIndex(h=>h==='id');
+  const rosterI=hdr.findIndex(h=>h==='roster_position');
+  // DK's injury_indicator column — 'O' = confirmed OUT on DK's platform
+  const injI=hdr.findIndex(h=>h.includes('injury_indicator')||h==='injury');
 
   return lines.slice(start+1).map(l=>{
     const v=l.split(',').map(c=>c.trim().replace(/"/g,''));
@@ -1103,6 +1071,9 @@ function parseCsv(text){
     const gi2=v[gi]||'', myTeam=v[ti]||'';
     const dkId = idI >= 0 ? (v[idI]||'').replace(/\D/g,'') : '';
     const rosterPos = rosterI >= 0 ? (v[rosterI]||'').trim().toUpperCase() : '';
+    // DK's own injury indicator — 'O' means DK has confirmed this player OUT
+    const dkInjury = injI >= 0 ? (v[injI]||'').trim().toUpperCase() : '';
+    const dkConfirmedOut = dkInjury === 'O' || dkInjury === 'OUT';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     // Get status from dedicated status/injury column
@@ -1149,12 +1120,15 @@ function parseCsv(text){
     // avgPts === 0 means DK has zero-projected this player — strong OUT signal at any salary.
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
-    // Block bench/non-starters using DK's own avgpointspergame — always reliable
-    // DK prices confirmed bench players at $2,000-$3,500 with 0-2 avgPts
-    // Grichuk 0.5 FPPG, Outman 1.4 FPPG, Hernaiz 1.0 FPPG = clearly not starting
+    // Block non-starters using DK's own data — always in the CSV, never fails
+    // Signal 1: DK injury_indicator = 'O' (confirmed out by DK)
+    // Signal 2: avgPts = 0 (never scored = not in rotation)
+    // Signal 3: avgPts < 2.5 (Grichuk 0.5, Outman 1.4, Hernaiz 1.0 = bench only)
+    // Signal 4: avgPts < 4 + salary < $3,500 (cheap + cold = bench filler)
     const isBenchPlayer = rawPos !== 'P' && (
-      avgPtsVal === 0 ||                              // zero history = never plays
-      (avgPtsVal > 0 && avgPtsVal < 2.5)             // < 2.5 avgPts = bench player, period
+      avgPtsVal === 0 ||
+      (avgPtsVal > 0 && avgPtsVal < 2.5) ||
+      (avgPtsVal > 0 && avgPtsVal < 4.0 && salary < 3500)
     );
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
     // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
@@ -1185,7 +1159,7 @@ function parseCsv(text){
     const isDeepBench = rawPos !== 'P' && avgPtsVal > 0 && avgPtsVal < 3.0;
     // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
-    const finalIsOut = isOut || isBenchPlayer || isDeepBench || isBadPitcher || isManuallyOut(name);
+    const finalIsOut = isOut || dkConfirmedOut || isBenchPlayer || isDeepBench || isBadPitcher || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
