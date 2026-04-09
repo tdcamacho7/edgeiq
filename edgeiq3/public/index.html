@@ -716,7 +716,7 @@ async function handleCsv(input){
     if (sport === 'mlb') {
       mlbStartingLineups = await Promise.race([
         fetchMLBStartingLineups(),
-        new Promise(res => setTimeout(() => res(null), 3000)) // 3s max
+        new Promise(res => setTimeout(() => res(null), 6000)) // 6s max
       ]).catch(() => null);
       if (mlbStartingLineups) {
         setStatus(`${raw.length} players found · ${mlbStartingLineups.gamesWithLineups} lineups confirmed...`, 'var(--cyan)');
@@ -726,6 +726,30 @@ async function handleCsv(input){
     // Apply all data to players
     // Apply persisted scratches immediately so scratched players never enter the pipeline
     raw = raw.map(p => isManuallyOut(p.name) ? { ...p, isOut: true } : p);
+
+    // Apply confirmed MLB starting lineups — mark non-starters as OUT
+    // When DK shows "Today's Lineup ✅", anyone NOT in the confirmed set is benched
+    // This is the most reliable source for filtering players like Hernaiz ($2,100)
+    if (mlbStartingLineups?.starters?.size > 0) {
+      let benchFiltered = 0;
+      raw = raw.map(p => {
+        if (p.isOut || p.pos === 'P') return p; // pitchers handled separately
+        const n = p.name.toLowerCase();
+        const first = n.split(' ')[0];
+        const last = n.split(' ').pop();
+        const inLineup = mlbStartingLineups.starters.has(n) ||
+                         mlbStartingLineups.starters.has(`${first} ${last}`) ||
+                         mlbStartingLineups.starters.has(last);
+        if (!inLineup) {
+          benchFiltered++;
+          return { ...p, isOut: true, status: 'Not in lineup' };
+        }
+        return p;
+      });
+      if (benchFiltered > 0) {
+        setStatus(`Lineups posted · ${benchFiltered} non-starters filtered · ${mlbStartingLineups.gamesWithLineups} games confirmed`, 'var(--cyan)');
+      }
+    }
 
     let withData = raw.map(p => {
       // Injury status from ESPN
