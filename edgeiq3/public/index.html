@@ -728,24 +728,27 @@ async function handleCsv(input){
     raw = raw.map(p => isManuallyOut(p.name) ? { ...p, isOut: true } : p);
 
     // Apply confirmed MLB starting lineups — mark non-starters as OUT
-    // When DK shows "Today's Lineup ✅", anyone NOT in the confirmed set is benched
-    // This is the most reliable source for filtering players like Hernaiz ($2,100)
     if (mlbStartingLineups?.starters?.size > 0) {
+      // Use same normalization as the fetcher
+      const normName = mlbStartingLineups.normName || (n =>
+        (n||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+          .replace(/\./g,'').toLowerCase().trim()
+      );
       let benchFiltered = 0;
       raw = raw.map(p => {
-        if (p.isOut || p.pos === 'P') return p; // pitchers handled separately
-        const n = p.name.toLowerCase();
-        const first = n.split(' ')[0];
-        const last = n.split(' ').pop();
-        const inLineup = mlbStartingLineups.starters.has(n) ||
-                         mlbStartingLineups.starters.has(`${first} ${last}`) ||
-                         mlbStartingLineups.starters.has(last);
+        if (p.isOut || p.pos === 'P') return p;
+        const norm = normName(p.name);
+        const parts = norm.split(' ');
+        const firstLast = parts.length >= 2 ? `${parts[0]} ${parts[parts.length-1]}` : norm;
+        const inLineup = mlbStartingLineups.starters.has(norm) ||
+                         mlbStartingLineups.starters.has(firstLast);
         if (!inLineup) {
           benchFiltered++;
           return { ...p, isOut: true, status: 'Not in lineup' };
         }
         return p;
       });
+      console.log(`Starting lineup filter: ${benchFiltered} non-starters removed`);
       if (benchFiltered > 0) {
         setStatus(`Lineups posted · ${benchFiltered} non-starters filtered · ${mlbStartingLineups.gamesWithLineups} games confirmed`, 'var(--cyan)');
       }
@@ -969,43 +972,84 @@ async function fetchMLBActiveRosters(teamAbbrevs) {
 }
 
 // Fetch confirmed MLB starting lineups from MLB Stats API (free, no key)
-// Returns Set of player names confirmed in today's starting lineups
-// Only available ~90 min before first pitch when lineups are posted
+// Returns Set of confirmed starter names — only hitters in today's batting order
 async function fetchMLBStartingLineups() {
+  // Normalize names: remove accents, periods, lowercase
+  function normName(n) {
+    return (n || '').normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')   // strip accents
+      .replace(/\./g, '')                  // remove periods (D.J. → DJ)
+      .toLowerCase().trim();
+  }
+
+  const confirmedStarters = new Set();
+  let gamesWithLineups = 0;
+
+  // SOURCE 1: MLB Stats API — most reliable when lineups are posted
   try {
     const today = new Date().toISOString().split('T')[0];
     const r = await fetch(
       `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=lineups`,
-      { signal: AbortSignal.timeout(4000) }
+      { signal: AbortSignal.timeout(6000) }
     );
-    if (!r.ok) return null;
-    const data = await r.json();
-    const confirmedStarters = new Set();
-    let gamesWithLineups = 0;
-
-    for (const date of (data.dates || [])) {
-      for (const game of (date.games || [])) {
-        const home = game.lineups?.homePlayers || [];
-        const away = game.lineups?.awayPlayers || [];
-        if (home.length + away.length > 0) {
-          gamesWithLineups++;
-          [...home, ...away].forEach(p => {
-            const name = (p.fullName || '').toLowerCase();
-            if (name) {
-              confirmedStarters.add(name);
-              // Also add last name for fuzzy matching
-              const parts = name.split(' ');
-              if (parts.length >= 2) confirmedStarters.add(parts[parts.length - 1]);
-            }
-          });
+    if (r.ok) {
+      const data = await r.json();
+      for (const date of (data.dates || [])) {
+        for (const game of (date.games || [])) {
+          const home = game.lineups?.homePlayers || [];
+          const away = game.lineups?.awayPlayers || [];
+          if (home.length + away.length > 0) {
+            gamesWithLineups++;
+            [...home, ...away].forEach(p => {
+              const norm = normName(p.fullName);
+              if (!norm) return;
+              confirmedStarters.add(norm);
+              // Add first+last variant
+              const parts = norm.split(' ');
+              if (parts.length >= 2) {
+                confirmedStarters.add(`${parts[0]} ${parts[parts.length-1]}`);
+              }
+            });
+          }
         }
       }
     }
-    // Only return if we got lineups for at least 1 game (means they're posted)
-    return gamesWithLineups >= 1 ? { starters: confirmedStarters, gamesWithLineups } : null;
-  } catch(e) {
-    return null;
+  } catch(e) {}
+
+  // SOURCE 2: ESPN scoreboard — fallback with today's confirmed lineups
+  if (gamesWithLineups === 0) {
+    try {
+      const r2 = await fetch(
+        'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
+        { signal: AbortSignal.timeout(6000) }
+      );
+      if (r2.ok) {
+        const d2 = await r2.json();
+        for (const event of (d2.events || [])) {
+          for (const comp of (event.competitions || [])) {
+            for (const team of (comp.competitors || [])) {
+              const roster = team.roster || [];
+              const starters = roster.filter(p => p.starter);
+              if (starters.length > 0) {
+                gamesWithLineups++;
+                starters.forEach(p => {
+                  const norm = normName(p.athlete?.displayName);
+                  if (!norm) return;
+                  confirmedStarters.add(norm);
+                  const parts = norm.split(' ');
+                  if (parts.length >= 2)
+                    confirmedStarters.add(`${parts[0]} ${parts[parts.length-1]}`);
+                });
+              }
+            }
+          }
+        }
+      }
+    } catch(e) {}
   }
+
+  console.log(`MLB lineups: ${gamesWithLineups} games confirmed, ${confirmedStarters.size} starters found`);
+  return gamesWithLineups >= 1 ? { starters: confirmedStarters, gamesWithLineups, normName } : null;
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
