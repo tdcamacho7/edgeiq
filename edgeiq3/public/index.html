@@ -3926,14 +3926,31 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   // Early April: DK avgs are from 5-8 games — many legitimate players average 4-7
   const hitterFloor = Math.min(13, Math.max(5, Math.round(slateHitterP30)));
 
+  // Catchers get a lower floor — thin position, early-season projs are 5-9pts
+  const catcherFloor = Math.max(3, hitterFloor - 4);
+
   const filteredPool = pool.filter(p => {
-    if (p.pos === 'P') return true;                           // pitchers always eligible
-    if ((p.projPts || 0) < hitterFloor) return false;        // dynamic proj floor
-    if (p.dvpLabel?.badge === 'bad matchup') return false;    // no bad matchups
+    if (p.pos === 'P') return true;
+    const floor = (p.pos === 'C') ? catcherFloor : hitterFloor;
+    if ((p.projPts || 0) < floor) return false;
+    if (p.dvpLabel?.badge === 'bad matchup') return false;
     return true;
   });
-  // Use filtered pool for sorting — fall back to full pool only if filter leaves < slots
-  const sortBase = filteredPool.length >= slots.length ? filteredPool : pool;
+
+  // Ensure every required position has at least one player in the pool
+  // If a position is completely filtered out, add the best available for that pos
+  const requiredPos = [...new Set(slots.filter(s => !['FLEX','UTIL','G','F'].includes(s)))];
+  const poolWithPos = [...filteredPool];
+  for (const pos of requiredPos) {
+    const hasPos = poolWithPos.some(p => p.pos === pos);
+    if (!hasPos) {
+      const best = pool.filter(p => p.pos === pos && !p.isOut)
+        .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+      if (best) poolWithPos.push(best);
+    }
+  }
+
+  const sortBase = poolWithPos.length >= slots.length ? poolWithPos : pool;
   const sorted = [...sortBase].sort((a,b) => playerValue(b) - playerValue(a));
   const used   = new Set();
   let salLeft  = budget;
