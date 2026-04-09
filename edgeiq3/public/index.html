@@ -768,8 +768,9 @@ async function handleCsv(input){
             const nameLow = p.name.toLowerCase();
             const lastName = nameLow.split(' ').pop();
             // Check all name variants
-            const injEntry = outMap[nameLow] || outMap[lastName] ||
-              outMap[`${nameLow.split(' ')[0]} ${lastName}`];
+            // Full name only — ESPN has 273+ injuries across all sports
+            // Last-name matching ("walker","smith") blocks legitimate players in other sports
+            const injEntry = outMap[nameLow];
             if (injEntry) {
               injExclusions++;
               return { ...p, isOut: true, status: injEntry.status };
@@ -813,7 +814,7 @@ async function handleCsv(input){
               if (p.isOut) return p;
               const nameLow = p.name.toLowerCase();
               const last = nameLow.split(' ').pop();
-              const hit = dkData.outPlayers[nameLow] || dkData.outPlayers[last];
+              const hit = dkData.outPlayers[nameLow]; // full name only
               if (hit) {
                 dkExclusions++;
                 return { ...p, isOut: true, status: hit.status };
@@ -986,16 +987,16 @@ async function fetchESPNInjuries(sp) {
   const path = sportPaths[sp] || 'basketball/nba';
   const map = {};
 
-  // Helper: add player to injury map with all name variants
+  // Helper: add player to injury map — full name only, no last-name keys
+  // Last-name keys cause cross-sport contamination when merged into _injuryCache
   function addToMap(name, status) {
     if (!name || !status) return;
     const n = name.toLowerCase().trim();
     map[n] = status;
     const parts = n.split(' ');
-    const last = parts[parts.length - 1];
-    if (last.length > 3) map[last] = status;
-    if (parts.length >= 2) map[`${parts[0][0]} ${last}`] = status;
-    if (parts.length >= 2) map[`${parts[0]} ${last}`] = status;
+    if (parts.length >= 2) {
+      map[`${parts[0]} ${parts[parts.length-1]}`] = status;  // first + last
+    }
   }
 
   // SOURCE 1: ESPN injuries endpoint (active injuries)
@@ -3481,9 +3482,10 @@ function optimize(all, sp) {
     // Re-check against live DK injury cache (populated by dk_status call)
     if (window._injuryCache) {
       const n = p.name.toLowerCase();
-      const last = n.split(' ').pop();
       const idKey = p.dkId ? `id:${p.dkId}` : null;
-      if (window._injuryCache[n] || window._injuryCache[last] || (idKey && window._injuryCache[idKey])) {
+      // Full name match only — last-name matching causes cross-sport false positives
+      // (273 ESPN injuries includes all sports; "Smith" in NBA blocks "Cam Smith" in MLB)
+      if (window._injuryCache[n] || (idKey && window._injuryCache[idKey])) {
         return false;
       }
     }
@@ -4241,7 +4243,8 @@ async function buildAndRender(quickRebuild = false) {
         if (p.isOut || p.edgeScore === 0) return false;
         const n = p.name.toLowerCase();
         const last = n.split(' ').pop();
-        if (window._injuryCache?.[n] || window._injuryCache?.[last]) return false;
+        // Full name only — last-name matching causes cross-sport false positives
+        if (window._injuryCache?.[n]) return false;
       }
 
       // Rule 3: individual edge floor
