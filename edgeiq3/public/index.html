@@ -1128,7 +1128,7 @@ function parseCsv(text){
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 4400) ||         // raised to $4,400 — sub-$4,400 OFs consistently score 0-3pts
+      (salary > 0 && salary < 3300) ||         // DK bench/filler pricing floor
       (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
     );
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
