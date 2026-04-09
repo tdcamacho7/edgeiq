@@ -1127,10 +1127,9 @@ function parseCsv(text){
     // avgPts === 0 means DK has zero-projected this player — strong OUT signal at any salary.
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
-    const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3300) ||         // DK bench/filler pricing floor
-      (avgPtsVal === 0 && salary < 6000)        // zero DK projection = scratch/unavailable
-    );
+    // Only block players DK has literally zero-projected (confirmed not starting)
+    // Salary floors removed — DK's pricing reflects expected performance, trust the data
+    const isBenchPlayer = rawPos !== 'P' && avgPtsVal === 0 && salary < 6000;
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
     // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
     // avgPts === 0 = no history this season = not in rotation.
@@ -1145,15 +1144,15 @@ function parseCsv(text){
     // Must have BOTH low avgPts AND low salary to be a spot starter
     // A $7,200 pitcher averaging 12pts might just be a streaky real starter
     const salaryToPtsRatio = salary > 0 ? avgPtsVal / (salary / 1000) : 0;
-    const isSpotStarter = rawPos === 'P' &&
-      salary >= 5500 &&           // has starter salary
-      avgPtsVal > 0 &&            // has some history
-      avgPtsVal < 10 &&           // clearly below starter average (raised from 14)
-      salary < 7000;              // only at low-end starter price
+    // Spot starter: performance signal only — salary is not the signal
+    // A pitcher averaging < 10 DK pts regardless of price is a spot/volatile starter
+    const isSpotStarter = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 10;
     // True new call-ups: in rotation but 0 DK history — caught by avgPts=0 gate
     const isSubPitcher = isReliever || (rosterPos === 'SUB') || isSpotStarter;
+    // Bad pitcher: performance signals only
+    // avgPts=0 = not in rotation | isSubPitcher = reliever/spot start
+    // Salary floor removed — a cheap pitcher with great stats should be considered
     const isBadPitcher = rawPos === 'P' && (
-      salary < 5500 ||            // below DK starter floor
       avgPtsVal === 0 ||           // zero history = not in rotation
       isSubPitcher                 // reliever, spot starter, or SUB badge
     );
@@ -3500,9 +3499,9 @@ function optimize(all, sp) {
     const pitcherBlend = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts / 30) * 99) * 0.40;
     const pitchers    = eligible
       .filter(p =>
-        p.pos === 'P' && p.salary >= 5500 && (p.avgPts || 0) > 0 &&
+        p.pos === 'P' && (p.avgPts || 0) > 0 &&
         (p.projPts || 0) >= PITCHER_MIN_PROJ &&
-        p.dvpLabel?.badge !== 'bad matchup'  // never use bad matchup pitchers
+        p.dvpLabel?.badge !== 'bad matchup'
       )
       .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
     const hitters     = eligible.filter(p => p.pos !== 'P');
@@ -3523,7 +3522,7 @@ function optimize(all, sp) {
       // This can happen with very early-season CSVs before pitchers have logged innings.
       // In that case, relax to allow pitchers with salary >= 5500 regardless of avgPts.
       const fallbackPitchers = eligible
-        .filter(p => p.pos === 'P' && p.salary >= 5500 && (p.projPts || 0) >= PITCHER_MIN_PROJ)
+        .filter(p => p.pos === 'P' && (p.projPts || 0) >= PITCHER_MIN_PROJ)
         .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
       if (fallbackPitchers.length) {
         console.warn('No pitchers with avgPts > 0 — using salary-only filter (early season slate)');
@@ -3687,19 +3686,16 @@ function optimize(all, sp) {
     return (p.avgPts || 0) > 2; // pitchers must avg > 2 DK pts (very lenient)
   };
 
+  // viablePool: filter by performance signals only, not salary
+  // DK's pricing already reflects expected performance — trust it
   const viablePool = eligible.filter(p =>
-    p.salary >= minSalaryFloor(p) &&
-    hasValidHistory(p) &&           // pitchers must have > 2 FPPG history
+    hasValidHistory(p) &&
     (p.projPts || 0) >= minPts(p) &&
     (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
-  // Never fall back to full eligible pool — that defeats all our filters.
-  // If viablePool is too small, relax thresholds incrementally but keep floor.
   let searchPool = viablePool;
   if (viablePool.length < slots.length + 2) {
-    // Relaxed pool: lower pts bar but keep salary floor (no bench players ever)
     searchPool = eligible.filter(p =>
-      p.salary >= minSalaryFloor(p) &&
       (p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 6 : 7) : 12) &&
       p.edgeScore >= 55
     );
