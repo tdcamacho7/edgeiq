@@ -3898,12 +3898,19 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     const projScore = Math.min(99, (p.projPts || 0) * (p.pos === 'P' ? 3.3 : 5.5));
     return p.edgeScore * 0.60 + projScore * 0.40;
   };
-  // Pre-filter pool: hitters must meet proj floor BEFORE any sorting or picking
-  // This is the primary gate — all pick paths (stack, bring-back, fallback) draw from here
-  const hitterFloor = sp === 'mlb' ? 11 : sp === 'nba' ? 18 : 10;
+  // Dynamic hitter floor: use the 40th percentile of actual hitter projections on this slate
+  // Early season (few games) = low averages = lower floor automatically
+  // Prevents the 11pt fixed floor from wiping out the entire hitter pool
+  const hitterProjs = pool.filter(p => p.pos !== 'P' && (p.projPts||0) > 0)
+    .map(p => p.projPts).sort((a,b) => a-b);
+  const p40idx = Math.floor(hitterProjs.length * 0.40);
+  const slateHitterP40 = hitterProjs[p40idx] || 8;
+  // Clamp: never below 7 (true floor), never above 14 (no need stricter)
+  const hitterFloor = Math.min(14, Math.max(7, Math.round(slateHitterP40)));
+
   const filteredPool = pool.filter(p => {
     if (p.pos === 'P') return true;                           // pitchers always eligible
-    if ((p.projPts || 0) < hitterFloor) return false;        // proj floor
+    if ((p.projPts || 0) < hitterFloor) return false;        // dynamic proj floor
     if (p.dvpLabel?.badge === 'bad matchup') return false;    // no bad matchups
     return true;
   });
@@ -4200,13 +4207,14 @@ async function buildAndRender(quickRebuild = false) {
       .sort((a,b) => a - b);
     const p85idx = Math.floor(eligibleScores.length * 0.85);
     const slateP85 = eligibleScores[p85idx] || 95;
-    const BASE_TARGET = Math.min(102, Math.max(92, Math.round(slateP85)));
+    const BASE_TARGET = Math.min(105, Math.max(95, Math.round(slateP85)));
     console.log(`Slate 85th percentile edge: ${slateP85.toFixed(1)} → target: ${BASE_TARGET}`);
-    // Individual edge floor: fixed per sport
-    // Dynamic percentile with cap=120 produces floors too high to achieve
-    // MLB: 78 (pitchers naturally score lower, pulling some players down)
-    // NBA: 82 (tighter pool, all players should be quality)
-    const MIN_INDIV_EDGE = sport === 'mlb' ? 78 : sport === 'nba' ? 82 : 78;
+    // Individual edge floor: target 99 but relax based on what the slate supports
+    // 99 is the ideal — every player should have genuine leverage
+    // But if the slate's 70th pct edge is 85, requiring 99 blocks everyone
+    // So: use 99 as the starting floor, relax down to 75 via the adaptive target
+    // The adaptive TARGET_SCORE already handles relaxation per-attempt
+    const MIN_INDIV_EDGE = sport === 'mlb' ? 80 : sport === 'nba' ? 85 : 80;
     const MAX_ATTEMPTS   = 25;
 
     // Composite score: 65% edge (ownership leverage) + 35% projection quality
@@ -4246,9 +4254,15 @@ async function buildAndRender(quickRebuild = false) {
       if (totalProj < MIN_TOTAL_PROJ) return false;
 
       // Rule 6: per-player projection floor + no bad matchup players
-      // NBA: every player must project >= 18 DK pts (position avg is 28+)
-      // MLB: every hitter must project >= 11 DK pts
-      const HITTER_MIN_PROJ = sport === 'mlb' ? 11 : sport === 'nba' ? 18 : 10;
+      // NBA floor: 18pts (position avg is 28+, rarely changes)
+      // MLB floor: dynamic — 40th percentile of slate hitters (7-14 range)
+      // Early season has lower averages; fixed 11pt floor wipes out the whole pool
+      const HITTER_MIN_PROJ = sport === 'nba' ? 18 : sport === 'nfl' ? 10 : (() => {
+        const hProjs = players.filter(p => !p.isOut && p.pos !== 'P' && (p.projPts||0) > 0)
+          .map(p => p.projPts).sort((a,b) => a-b);
+        const idx = Math.floor(hProjs.length * 0.40);
+        return Math.min(14, Math.max(7, Math.round(hProjs[idx] || 8)));
+      })();
       for (const l of valid) {
         if (l.player.pos === 'P') continue;
         if ((l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
@@ -4280,7 +4294,8 @@ async function buildAndRender(quickRebuild = false) {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       // Adaptive target: relax by 1 every 8 attempts so the engine finds something real
       // Relax 2pts every 3 attempts — reaches realistic floor by attempt 12
-      const TARGET_SCORE = Math.max(82, BASE_TARGET - Math.floor(attempt / 3) * 2);
+      // Relax 2pts every 3 attempts. Floor at 80 allows thin early-season slates to build
+      const TARGET_SCORE = Math.max(80, BASE_TARGET - Math.floor(attempt / 3) * 2);
       setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS} (target: ${TARGET_SCORE})`, 'var(--amber)');
       await new Promise(r => setTimeout(r, 0));
 
@@ -4350,6 +4365,14 @@ async function buildAndRender(quickRebuild = false) {
     });
 
     // Use qualifying lineup if found, otherwise best we got
+    // If no qualifying lineup found, try one final optimize with relaxed rules
+    if (!qualifyingLineup && !bestCleanLineup && !bestLineupSoFar) {
+      console.warn('All quality gates failed — building best-available lineup');
+      const lastChance = optimize(players, sport);
+      if (lastChance?.filter(l=>l.player).length > 0) {
+        bestLineupSoFar = lastChance;
+      }
+    }
     lineup = qualifyingLineup || bestCleanLineup || bestLineupSoFar || [];
 
     if (!lineup.length) {
