@@ -3990,11 +3990,11 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     // Best available fallback
     // Hard floors: edge >= 72, hitters must project >= 8 pts, DK team cap
     const EDGE_FLOOR    = 72;
-    const HITTER_PROJ   = 11; // minimum projected DK pts for any hitter slot
+    const HITTER_PROJ = sp === 'mlb' ? 11 : sp === 'nba' ? 18 : 10;
     const hitterOk = p => {
       if (p.pos === 'P') return true;
       if ((p.projPts || 0) < HITTER_PROJ) return false;
-      if (p.dvpLabel?.badge === 'bad matchup') return false; // never pick bad matchup hitters
+      if (p.dvpLabel?.badge === 'bad matchup') return false;
       return true;
     };
 
@@ -4190,12 +4190,13 @@ async function buildAndRender(quickRebuild = false) {
       .sort((a,b) => a - b);
     const p85idx = Math.floor(eligibleScores.length * 0.85);
     const slateP85 = eligibleScores[p85idx] || 95;
-    const BASE_TARGET = Math.min(108, Math.max(95, Math.round(slateP85)));
+    const BASE_TARGET = Math.min(102, Math.max(92, Math.round(slateP85)));
     console.log(`Slate 85th percentile edge: ${slateP85.toFixed(1)} → target: ${BASE_TARGET}`);
-    // Individual floor: 70th percentile of the slate (no player below median quality)
-    const p70idx = Math.floor(eligibleScores.length * 0.70);
-    const slateP70 = eligibleScores[p70idx] || 80;
-    const MIN_INDIV_EDGE = Math.min(88, Math.max(75, Math.round(slateP70)));
+    // Individual edge floor: fixed per sport
+    // Dynamic percentile with cap=120 produces floors too high to achieve
+    // MLB: 78 (pitchers naturally score lower, pulling some players down)
+    // NBA: 82 (tighter pool, all players should be quality)
+    const MIN_INDIV_EDGE = sport === 'mlb' ? 78 : sport === 'nba' ? 82 : 78;
     const MAX_ATTEMPTS   = 25;
 
     // Composite score: 65% edge (ownership leverage) + 35% projection quality
@@ -4234,8 +4235,10 @@ async function buildAndRender(quickRebuild = false) {
       const MIN_TOTAL_PROJ = sport === 'mlb' ? 160 : sport === 'nba' ? 280 : 140;
       if (totalProj < MIN_TOTAL_PROJ) return false;
 
-      // Rule 6: per-player projection floor + no bad matchup hitters
-      const HITTER_MIN_PROJ = sport === 'mlb' ? 11 : 0;
+      // Rule 6: per-player projection floor + no bad matchup players
+      // NBA: every player must project >= 18 DK pts (position avg is 28+)
+      // MLB: every hitter must project >= 11 DK pts
+      const HITTER_MIN_PROJ = sport === 'mlb' ? 11 : sport === 'nba' ? 18 : 10;
       for (const l of valid) {
         if (l.player.pos === 'P') continue;
         if ((l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
@@ -4276,16 +4279,23 @@ async function buildAndRender(quickRebuild = false) {
       const candidateValid = candidate.filter(l => l.player);
       const comp = compositeScore(candidate);  // 65% edge + 35% projection
 
-      // Track best by composite score (not just edge) — emergency fallback
-      if (comp > bestCompSoFar) {
+      // Track best by composite score — emergency fallback
+      // Apply minimum proj floor even here so bestLineupSoFar is never garbage
+      const fallbackProjOk = candidateValid.every(l => {
+        const minP = sport === 'mlb' ? 8 : sport === 'nba' ? 15 : 8;
+        return l.player.pos === 'P' || (l.player.projPts || 0) >= minP;
+      });
+      const noOutInFallback = candidateValid.every(l => !l.player.isOut && l.player.edgeScore > 0);
+      if (comp > bestCompSoFar && noOutInFallback && fallbackProjOk) {
         bestCompSoFar   = comp;
         bestLineupSoFar = candidate;
       }
       // Track best clean lineup (every hitter ≥ 8 proj) by composite score
+      const cleanMinProj = sport === 'mlb' ? 11 : sport === 'nba' ? 18 : 10;
       const passesHitterFloor = candidateValid.every(l => {
         if (l.player.pos === 'P') return true;
-        if ((l.player.projPts || 0) < 11) return false;           // same as lineupPassesRules
-        if (l.player.dvpLabel?.badge === 'bad matchup') return false; // same as lineupPassesRules
+        if ((l.player.projPts || 0) < cleanMinProj) return false;
+        if (l.player.dvpLabel?.badge === 'bad matchup') return false;
         return true;
       });
       if (passesHitterFloor && comp > bestCleanComp) {
