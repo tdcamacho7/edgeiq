@@ -51,6 +51,49 @@ export default async function handler(req, res) {
     });
   }
 
+  // ── AI LINEUP VALIDATION ACTION ──────────────────────────────────
+  // Uses Groq free tier — llama-3.3-70b-versatile, fast inference, no cost
+  if (action === 'ai_validate') {
+    const lineupData = req.query.lineup ? JSON.parse(decodeURIComponent(req.query.lineup)) : null;
+    if (!lineupData) return res.status(400).json({ error: 'No lineup data' });
+
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(200).json({ success: false, text: 'AI validation unavailable — add GROQ_API_KEY to Vercel env vars' });
+
+    try {
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${groqKey}`,
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile', // Groq free tier — fast + capable
+          max_tokens: 300,
+          temperature: 0.3,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert DFS lineup validator. Be concise, use bullet points, flag real concerns only. Max 150 words.'
+            },
+            { role: 'user', content: lineupData.prompt }
+          ]
+        })
+      });
+
+      if (!groqRes.ok) {
+        const err = await groqRes.text();
+        return res.status(200).json({ success: false, text: 'AI validation unavailable — verify manually before submitting', error: err });
+      }
+
+      const data = await groqRes.json();
+      const text = data.choices?.[0]?.message?.content || '';
+      return res.status(200).json({ success: true, text });
+    } catch(e) {
+      return res.status(200).json({ success: false, text: 'AI validation unavailable — verify manually before submitting' });
+    }
+  }
+
   // ── VEGAS ODDS ACTION ─────────────────────────────────────────────
   // Client calls /api/proxy?dgId=0&sport=mlb&action=vegas
   // Previously: no handler → fell through to DK scraper path → 502 every time
