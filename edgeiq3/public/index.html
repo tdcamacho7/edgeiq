@@ -971,85 +971,36 @@ async function fetchMLBActiveRosters(teamAbbrevs) {
   }
 }
 
-// Fetch confirmed MLB starting lineups from MLB Stats API (free, no key)
-// Returns Set of confirmed starter names — only hitters in today's batting order
+// Fetch confirmed MLB starting lineups via proxy (server-side)
+// Proxy hits MLB Stats API + ESPN + RotoWire with proper headers
 async function fetchMLBStartingLineups() {
-  // Normalize names: remove accents, periods, lowercase
   function normName(n) {
     return (n || '').normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')   // strip accents
-      .replace(/\./g, '')                  // remove periods (D.J. → DJ)
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\./g, '')
       .toLowerCase().trim();
   }
 
-  const confirmedStarters = new Set();
-  let gamesWithLineups = 0;
-
-  // SOURCE 1: MLB Stats API — most reliable when lineups are posted
   try {
-    const today = new Date().toISOString().split('T')[0];
-    const r = await fetch(
-      `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=lineups`,
-      { signal: AbortSignal.timeout(6000) }
-    );
-    if (r.ok) {
-      const data = await r.json();
-      for (const date of (data.dates || [])) {
-        for (const game of (date.games || [])) {
-          const home = game.lineups?.homePlayers || [];
-          const away = game.lineups?.awayPlayers || [];
-          if (home.length + away.length > 0) {
-            gamesWithLineups++;
-            [...home, ...away].forEach(p => {
-              const norm = normName(p.fullName);
-              if (!norm) return;
-              confirmedStarters.add(norm);
-              // Add first+last variant
-              const parts = norm.split(' ');
-              if (parts.length >= 2) {
-                confirmedStarters.add(`${parts[0]} ${parts[parts.length-1]}`);
-              }
-            });
-          }
-        }
-      }
+    const r = await fetch('/api/proxy?action=mlb_lineups', {
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+
+    if (!data.gamesFound || data.totalConfirmed < 5) {
+      console.log('MLB lineups: not yet posted or unavailable');
+      return null;
     }
-  } catch(e) {}
 
-  // SOURCE 2: ESPN scoreboard — fallback with today's confirmed lineups
-  if (gamesWithLineups === 0) {
-    try {
-      const r2 = await fetch(
-        'https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard',
-        { signal: AbortSignal.timeout(6000) }
-      );
-      if (r2.ok) {
-        const d2 = await r2.json();
-        for (const event of (d2.events || [])) {
-          for (const comp of (event.competitions || [])) {
-            for (const team of (comp.competitors || [])) {
-              const roster = team.roster || [];
-              const starters = roster.filter(p => p.starter);
-              if (starters.length > 0) {
-                gamesWithLineups++;
-                starters.forEach(p => {
-                  const norm = normName(p.athlete?.displayName);
-                  if (!norm) return;
-                  confirmedStarters.add(norm);
-                  const parts = norm.split(' ');
-                  if (parts.length >= 2)
-                    confirmedStarters.add(`${parts[0]} ${parts[parts.length-1]}`);
-                });
-              }
-            }
-          }
-        }
-      }
-    } catch(e) {}
+    // Convert confirmed object to Set for fast lookup
+    const starters = new Set(Object.keys(data.confirmed));
+    console.log(`MLB lineups: ${data.gamesFound} games confirmed, ${starters.size} starters from proxy`);
+    return { starters, gamesWithLineups: data.gamesFound, normName };
+  } catch(e) {
+    console.log('MLB lineups fetch failed:', e.message);
+    return null;
   }
-
-  console.log(`MLB lineups: ${gamesWithLineups} games confirmed, ${confirmedStarters.size} starters found`);
-  return gamesWithLineups >= 1 ? { starters: confirmedStarters, gamesWithLineups, normName } : null;
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
@@ -1198,9 +1149,13 @@ function parseCsv(text){
     // avgPts === 0 means DK has zero-projected this player — strong OUT signal at any salary.
     // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
     // Exception: keep high-salary stars ($6,000+) since they could be newly added.
-    // Only block players DK has literally zero-projected (confirmed not starting)
-    // Salary floors removed — DK's pricing reflects expected performance, trust the data
-    const isBenchPlayer = rawPos !== 'P' && avgPtsVal === 0 && salary < 6000;
+    // Block bench/non-starters using DK's own avgpointspergame — always reliable
+    // DK prices confirmed bench players at $2,000-$3,500 with 0-2 avgPts
+    // Grichuk 0.5 FPPG, Outman 1.4 FPPG, Hernaiz 1.0 FPPG = clearly not starting
+    const isBenchPlayer = rawPos !== 'P' && (
+      avgPtsVal === 0 ||                              // zero history = never plays
+      (avgPtsVal > 0 && avgPtsVal < 2.5)             // < 2.5 avgPts = bench player, period
+    );
     // Pitcher-specific exclusions (applied before MLB optimizer runs)
     // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
     // avgPts === 0 = no history this season = not in rotation.
@@ -1221,15 +1176,16 @@ function parseCsv(text){
     // True new call-ups: in rotation but 0 DK history — caught by avgPts=0 gate
     const isSubPitcher = isReliever || (rosterPos === 'SUB') || isSpotStarter;
     // Bad pitcher: performance signals only
-    // avgPts=0 = not in rotation | isSubPitcher = reliever/spot start
-    // Salary floor removed — a cheap pitcher with great stats should be considered
     const isBadPitcher = rawPos === 'P' && (
       avgPtsVal === 0 ||           // zero history = not in rotation
       isSubPitcher                 // reliever, spot starter, or SUB badge
     );
+    // Additional bench check: any hitter averaging under 3 DK pts is bench-only
+    // This catches players the above rules miss (e.g. avg=2.1 on $3,500 salary)
+    const isDeepBench = rawPos !== 'P' && avgPtsVal > 0 && avgPtsVal < 3.0;
     // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
-    const finalIsOut = isOut || isBenchPlayer || isBadPitcher || isManuallyOut(name);
+    const finalIsOut = isOut || isBenchPlayer || isDeepBench || isBadPitcher || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
@@ -4387,7 +4343,8 @@ async function buildAndRender(quickRebuild = false) {
       // Adaptive target: relax by 1 every 8 attempts so the engine finds something real
       // Relax 2pts every 3 attempts — reaches realistic floor by attempt 12
       // Relax 2pts every 3 attempts. Floor at 80 allows thin early-season slates to build
-      const TARGET_SCORE = Math.max(80, BASE_TARGET - Math.floor(attempt / 3) * 2);
+      // Relax 1pt per attempt — never below 85 (no more 75-edge lineups)
+      const TARGET_SCORE = Math.max(85, BASE_TARGET - attempt);
       setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS} (target: ${TARGET_SCORE})`, 'var(--amber)');
       await new Promise(r => setTimeout(r, 0));
 
@@ -4407,7 +4364,8 @@ async function buildAndRender(quickRebuild = false) {
         return l.player.pos === 'P' || (l.player.projPts || 0) >= minP;
       });
       const noOutInFallback = candidateValid.every(l => !l.player.isOut && l.player.edgeScore > 0);
-      if (comp > bestCompSoFar && noOutInFallback && fallbackProjOk) {
+      const avgEdgeFallback = candidateValid.reduce((s,l)=>s+l.player.edgeScore,0)/candidateValid.length;
+      if (comp > bestCompSoFar && noOutInFallback && fallbackProjOk && avgEdgeFallback >= 82) {
         bestCompSoFar   = comp;
         bestLineupSoFar = candidate;
       }
