@@ -449,83 +449,140 @@ export default async function handler(req, res) {
 
   // ── RESOLVE CONTEST ID → DRAFT GROUP ID ──────────────────────────
   // ── INJURY STATUS CHECK ACTION ──────────────────────────────────────
-  // Fetches from 3 sources and returns definitive OUT/IL player list
+  // Fetches from multiple sources and returns definitive OUT/IL player list
   if (action === 'injury_check') {
     const sp = req.query.sp || 'mlb';
     const outPlayers = {};
 
-    const OUT_STATUSES = ['out','ir','il','injured reserve','injured list',
-      'day-to-day','doubtful','inactive','suspended','60-day','10-day'];
+    // Every status that means "definitely not playing"
+    const HARD_OUT = ['out','ir','il','injured reserve','injured list',
+      'inactive','suspended','60-day il','10-day il','15-day il',
+      'paternity list','bereavement list','restricted list','non-roster',
+      'minors','disabled list'];
 
     function addOut(name, status, source) {
       if (!name || !status) return;
-      const n = name.toLowerCase().trim();
-      outPlayers[n] = { status, source };
-      const parts = n.split(' ');
-      if (parts.length >= 2) outPlayers[`${parts[0]} ${parts[parts.length-1]}`] = { status, source };
+      const key = name.toLowerCase().trim();
+      // Only add — never remove an existing OUT entry
+      if (!outPlayers[key]) {
+        outPlayers[key] = { status, source };
+        const parts = key.split(' ');
+        if (parts.length >= 2) {
+          outPlayers[parts[parts.length - 1]] = { status, source };
+          outPlayers[`${parts[0]} ${parts[parts.length - 1]}`] = { status, source };
+        }
+      }
     }
 
-    // Run all 3 sources in parallel with tight 4s timeouts
     const sportPath = sp === 'mlb' ? 'baseball/mlb' : sp === 'nba' ? 'basketball/nba' : 'football/nfl';
     const today = new Date();
-    const weekAgo = new Date(today - 7*24*60*60*1000);
-    const fmt = d => d.toISOString().slice(0,10).replace(/-/g,'');
+    const weekAgo = new Date(today - 7 * 24 * 60 * 60 * 1000);
+    const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 
-    const [espnRes, txRes, sleeperRes] = await Promise.allSettled([
-      fetch(`https://site.api.espn.com/apis/site/v2/sports/${sportPath}/injuries`,
-        { signal: AbortSignal.timeout(4000) }),
-      sp === 'mlb' ? fetch(
-        `https://statsapi.mlb.com/api/v1/transactions?sportId=1&startDate=${fmt(weekAgo)}&endDate=${fmt(today)}&limit=200`,
-        { signal: AbortSignal.timeout(4000) }) : Promise.resolve(null),
-      fetch(`https://api.sleeper.app/v1/players/${sp === 'mlb' ? 'nfl' : sp}`,
-        { signal: AbortSignal.timeout(4000) }),
-    ]);
+    // ── SOURCE 1: ESPN Injuries ──────────────────────────────────────
+    const espnProm = fetch(
+      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/injuries`,
+      { signal: AbortSignal.timeout(5000) }
+    ).catch(() => null);
 
-    // ESPN
+    // ── SOURCE 2: MLB Transactions (last 7 days) ─────────────────────
+    const txProm = sp === 'mlb' ? fetch(
+      `https://statsapi.mlb.com/api/v1/transactions?sportId=1&startDate=${fmt(weekAgo)}&endDate=${fmt(today)}&limit=500`,
+      { signal: AbortSignal.timeout(5000) }
+    ).catch(() => null) : Promise.resolve(null);
+
+    // ── SOURCE 3: MLB Active Roster cross-reference (MOST AUTHORITATIVE) ──
+    // Fetch 26-man active rosters for ALL 30 teams → anyone NOT on active = IL
+    // This catches IL players that ESPN and transactions miss
+    const MLB_TEAM_IDS = {
+      NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
+      MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
+      STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
+      TOR:141,LAD:119,CWS:145
+    };
+    const season = today.getFullYear();
+    let activeRosterNames = new Set(); // all players currently on 26-man active roster
+    let rostersFetched = 0;
+
+    if (sp === 'mlb') {
+      const teamIds = Object.values(MLB_TEAM_IDS);
+      // Fetch all 30 teams in parallel — each is fast (cached by MLB Stats API)
+      const rosterResults = await Promise.allSettled(
+        teamIds.map(id =>
+          fetch(`https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
+            { signal: AbortSignal.timeout(5000) })
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null)
+        )
+      );
+      for (const res of rosterResults) {
+        if (res.status !== 'fulfilled' || !res.value) continue;
+        rostersFetched++;
+        for (const p of (res.value.roster || [])) {
+          const name = (p.person?.fullName || '').toLowerCase().trim();
+          if (name) activeRosterNames.add(name);
+        }
+      }
+    }
+
+    // Process ESPN + Transactions in parallel
+    const [espnRes, txRes] = await Promise.allSettled([espnProm, txProm]);
+
+    // Process ESPN
     if (espnRes.status === 'fulfilled' && espnRes.value?.ok) {
       try {
         const data = await espnRes.value.json();
         for (const team of (data?.injuries || [])) {
           for (const inj of (team.injuries || [])) {
             const name = inj?.athlete?.displayName || '';
-            const status = inj?.status || inj?.type?.description || '';
-            if (OUT_STATUSES.some(s => status.toLowerCase().includes(s))) {
-              addOut(name, status, 'ESPN');
+            const status = (inj?.status || inj?.type?.description || '').toLowerCase();
+            if (HARD_OUT.some(s => status.includes(s))) {
+              addOut(name, inj.status || 'OUT', 'ESPN');
             }
           }
         }
       } catch(e) {}
     }
 
-    // MLB Transactions
-    if (txRes.status === 'fulfilled' && txRes.value?.ok) {
+    // Process MLB Transactions — find IL placements not yet reversed
+    if (sp === 'mlb' && txRes.status === 'fulfilled' && txRes.value?.ok) {
       try {
         const data = await txRes.value.json();
-        const activatedToday = new Set();
-        // First pass: collect activations
+        const activatedNames = new Set();
         for (const tx of (data?.transactions || [])) {
-          if ((tx?.description || '').toLowerCase().includes('activated')) {
-            activatedToday.add((tx?.player?.fullName || '').toLowerCase());
+          const desc = (tx?.description || '').toLowerCase();
+          if (desc.includes('activated') || desc.includes('reinstated')) {
+            activatedNames.add((tx?.player?.fullName || '').toLowerCase());
           }
         }
-        // Second pass: IL placements not yet activated
         for (const tx of (data?.transactions || [])) {
           const desc = (tx?.description || '').toLowerCase();
           const name = tx?.player?.fullName || '';
-          if (desc.includes('placed') && (desc.includes(' il') || desc.includes('injured list'))) {
-            if (!activatedToday.has(name.toLowerCase())) {
-              addOut(name, 'IL', 'MLB Transactions');
-            }
+          const isILPlacement = desc.includes('placed') && (
+            desc.includes('injured list') || desc.includes(' il') ||
+            desc.includes('10-day') || desc.includes('60-day') ||
+            desc.includes('15-day') || desc.includes('paternity') ||
+            desc.includes('bereavement') || desc.includes('restricted')
+          );
+          if (isILPlacement && !activatedNames.has(name.toLowerCase())) {
+            addOut(name, 'IL', 'MLB Transactions');
           }
         }
       } catch(e) {}
     }
+
+    // Build final count
+    const injurySourceCount = Object.keys(outPlayers).length;
+    const sources = ['ESPN'];
+    if (sp === 'mlb') sources.push('MLB Transactions', 'Active Roster');
 
     return res.json({
       success: true,
       outPlayers,
-      count: Object.keys(outPlayers).length,
-      sources: ['ESPN', 'MLB Transactions']
+      activeRosterNames: sp === 'mlb' ? [...activeRosterNames] : [],
+      rostersFetched,
+      count: injurySourceCount,
+      sources,
     });
   }
 
