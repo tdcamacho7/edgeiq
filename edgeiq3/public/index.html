@@ -4437,3 +4437,209 @@ async function runAIAnalysis() {
 }
 
 
+
+// ── SCREEN NAVIGATION ─────────────────────────────────────────────
+function showScreen(s) {
+  ['lineup','intel','multi','swap','stacks','signals','patterns'].forEach(sc => {
+    const el = document.getElementById('screen-'+sc);
+    if (el) el.style.display = sc===s?'block':'none';
+    const nav = document.getElementById('nav-'+sc);
+    if (nav) nav.classList.toggle('active', sc===s);
+  });
+  currentScreen = s;
+  if (s === 'swap' && lineup.length && typeof trackedLineup !== 'undefined' && !trackedLineup.length) {
+    const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
+    const el = document.getElementById('lineup-entry');
+    if (el) el.value = names;
+  }
+  if (s === 'multi') {
+    const el = document.getElementById('multi-status');
+    if (el) el.textContent = players.length ? 'Ready · '+players.filter(p=>!p.isOut).length+' eligible players' : 'Build a lineup first';
+  }
+  if (s === 'signals') renderSignalDashboard();
+}
+
+// ── SIGNAL DASHBOARD ──────────────────────────────────────────────
+function renderSignalDashboard() {
+  if (!players || !players.length) return;
+  const total = players.length;
+  const realCount  = players.filter(p => p.dataQuality?.projection).length;
+  const ownCount   = players.filter(p => p.dataQuality?.ownership).length;
+  const vegasCount = players.filter(p => p.dataQuality?.vegas).length;
+  const formCount  = players.filter(p => p.recentFormData).length;
+  const propsCount = players.filter(p => p.propData).length;
+  const pct = n => Math.round(n / total * 100);
+  const overallPct = Math.round([realCount,ownCount,vegasCount,formCount,propsCount].reduce((a,b)=>a+b,0) / (total*5) * 100);
+  const qualityLabel = overallPct>=70?'Excellent':overallPct>=50?'Good':overallPct>=30?'Fair':'Estimated';
+  const el = document.getElementById('signal-dashboard');
+  if (!el) return;
+  el.innerHTML = '<div style="padding:12px;background:var(--s2);border-radius:10px;font-size:12px;color:var(--t2)">'+
+    '<b style="color:var(--text)">Data quality: '+qualityLabel+' ('+overallPct+'%)</b><br><br>'+
+    'Real projections: '+realCount+'/'+total+'<br>'+
+    'Real ownership: '+ownCount+'/'+total+'<br>'+
+    'Vegas lines: '+vegasCount+'/'+total+'<br>'+
+    'Recent form: '+formCount+'/'+total+'<br>'+
+    'Player props: '+propsCount+'/'+total+
+    '</div>';
+  const upd = document.getElementById('signal-updated');
+  if (upd) upd.textContent = total+' players · Updated '+new Date().toLocaleTimeString();
+}
+
+// ── MULTI LINEUP ──────────────────────────────────────────────────
+let multiLineups = [];
+function setLineupCount(n, btn) {
+  document.querySelectorAll('.count-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const el = document.getElementById('lineup-count-display');
+  if (el) el.textContent = n + ' lineups';
+}
+function generateMultiLineups() {
+  if (!players || !players.length) { alert('Upload a CSV first'); return; }
+  const n = parseInt(document.getElementById('lineup-count-display')?.textContent) || 5;
+  buildMultipleLineups(n, 0.6, SLOTS[sport]);
+}
+function buildMultipleLineups(n, maxExposure, slots) {
+  multiLineups = [];
+  const used = {};
+  for (let i = 0; i < n; i++) {
+    const jittered = players.map(p => ({
+      ...p,
+      edgeScore: p.isOut ? 0 : Math.max(10, Math.min(99, p.edgeScore + Math.round((Math.random()-0.5)*14)))
+    }));
+    const candidate = optimize(jittered, sport);
+    if (!candidate || !candidate.filter(l=>l.player).length) continue;
+    candidate.filter(l=>l.player).forEach(l => {
+      used[l.player.name] = (used[l.player.name]||0)+1;
+    });
+    multiLineups.push(candidate);
+    // Penalize overexposed players
+    players = players.map(p => {
+      const exp = (used[p.name]||0)/(i+1);
+      return exp > maxExposure ? {...p, edgeScore: Math.max(10, p.edgeScore-15)} : p;
+    });
+  }
+  renderMultiLineups();
+}
+function renderMultiLineups() {
+  const el = document.getElementById('multi-lineups');
+  if (!el) return;
+  if (!multiLineups.length) { el.innerHTML = '<div style="color:var(--t3);padding:20px;text-align:center">No lineups generated yet</div>'; return; }
+  el.innerHTML = multiLineups.map((lu, i) => {
+    const valid = lu.filter(l=>l.player);
+    const avg = Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length);
+    const sal = valid.reduce((s,l)=>s+l.player.salary,0);
+    const own = Math.round(valid.reduce((s,l)=>s+l.player.projOwn,0)/valid.length);
+    return '<div style="background:var(--s2);border-radius:10px;padding:12px;margin-bottom:8px">'+
+      '<div style="font-size:12px;font-weight:600;margin-bottom:8px">Lineup '+(i+1)+
+      ' · Edge '+avg+' · $'+(sal/1000).toFixed(1)+'K · '+own+'% avg own</div>'+
+      valid.map(l=>'<div style="font-size:11px;color:var(--t2);margin-bottom:2px">'+
+        l.slot+' '+l.player.name+' ('+l.player.projOwn+'% own)</div>').join('')+
+      '</div>';
+  }).join('');
+}
+function exportAllLineups() {
+  if (!multiLineups.length) { alert('Generate lineups first'); return; }
+  const rows = multiLineups.map(lu => lu.filter(l=>l.player).map(l=>l.player.name).join(','));
+  const csv = rows.join('\n');
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'edgeiq_lineups.csv';
+  a.click();
+}
+
+// ── AUTO REFRESH ──────────────────────────────────────────────────
+let autoRefreshTimer = null;
+function startAutoRefresh() {
+  stopAutoRefresh();
+  autoRefreshTimer = setInterval(() => {
+    if (players && players.length) buildAndRender();
+  }, 5*60*1000);
+}
+function stopAutoRefresh() {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+}
+
+// ── SAVE HISTORY ──────────────────────────────────────────────────
+function saveHistory() {
+  if (!lineup || !lineup.filter(l=>l.player).length) return;
+  const history = JSON.parse(localStorage.getItem('edgeiq_h_'+sport)||'[]');
+  history.push({ date: new Date().toISOString(), lineup: lineup.filter(l=>l.player).map(l=>({name:l.player.name,edgeScore:l.player.edgeScore,projPts:l.player.projPts})) });
+  if (history.length > 50) history.shift();
+  localStorage.setItem('edgeiq_h_'+sport, JSON.stringify(history));
+}
+
+// ── EXPORT LINEUP ─────────────────────────────────────────────────
+function exportLineup() {
+  if (!lineup || !lineup.filter(l=>l.player).length) { alert('Build a lineup first'); return; }
+  const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
+  navigator.clipboard?.writeText(names).then(() => setStatus('Player names copied to clipboard','var(--green)')).catch(()=>{});
+}
+
+// ── RESULT LOGGER ─────────────────────────────────────────────────
+function logContestResult(playerResults) {
+  const results = JSON.parse(localStorage.getItem('edgeiq_results_'+sport)||'[]');
+  results.push({ date: new Date().toISOString(), players: playerResults });
+  if (results.length > 100) results.shift();
+  localStorage.setItem('edgeiq_results_'+sport, JSON.stringify(results));
+}
+function logTonightResult() {
+  if (!lineup || !lineup.filter(l=>l.player).length) return;
+  const entry = lineup.filter(l=>l.player).map(l=>({
+    name:l.player.name, edgeScore:l.player.edgeScore, projPts:l.player.projPts, actualPts:0
+  }));
+  logContestResult(entry);
+  setStatus('Lineup saved to result history','var(--green)');
+}
+
+// ── LIVE TRACKING ─────────────────────────────────────────────────
+let trackedLineup = [];
+let liveTimer = null;
+function startLiveTracking() {
+  trackedLineup = lineup.filter(l=>l.player).map(l=>({...l.player, livePts:0}));
+  liveTimer = setInterval(fetchLiveScores, 60000);
+  fetchLiveScores();
+}
+async function fetchLiveScores() {
+  // Placeholder — would need a live scoring API
+  renderLiveScores(0, lineup.filter(l=>l.player).reduce((s,l)=>s+l.player.projPts,0));
+}
+function renderLiveScores(live, proj) {
+  const el = document.getElementById('live-score-display');
+  if (el) el.textContent = 'Live: '+live.toFixed(1)+' pts · Proj: '+proj.toFixed(1)+' pts';
+}
+
+// ── SWAP RECOMMENDATIONS ──────────────────────────────────────────
+function generateSwapRecommendations(games) {
+  if (!players || !lineup) return [];
+  return lineup.filter(l=>l.player).map(l => {
+    const better = players.filter(p => !p.isOut && p.pos===l.player.pos && p.edgeScore > l.player.edgeScore+10 && p.salary <= l.player.salary+500).slice(0,2);
+    return better.length ? { slot:l.slot, current:l.player, options:better } : null;
+  }).filter(Boolean);
+}
+
+// ── PATTERNS ─────────────────────────────────────────────────────
+function loadPatterns() {
+  const el = document.getElementById('patterns-content');
+  if (!el) return;
+  const results = JSON.parse(localStorage.getItem('edgeiq_results_'+sport)||'[]');
+  if (!results.length) { el.innerHTML = '<div style="color:var(--t3);padding:20px;text-align:center">No results logged yet. Enter contests and come back to see patterns.</div>'; return; }
+  el.innerHTML = '<div style="font-size:13px;color:var(--t2);padding:12px">'+results.length+' contests logged. Pattern analysis coming soon.</div>';
+}
+
+// ── INIT ──────────────────────────────────────────────────────────
+(function init() {
+  showScreen('lineup');
+  startAutoRefresh();
+  const lastUrl = localStorage.getItem('edgeiq_last_url');
+  if (lastUrl) {
+    const inp = document.getElementById('dk-url');
+    if (inp) { inp.value='https://www.draftkings.com/draft/contest/'+lastUrl; }
+    const btn = document.getElementById('fetch-btn');
+    if (btn) btn.disabled=false;
+    setStatus('Tap Build to reload last slate','var(--cyan)');
+  }
+})();
+</script>
+</body>
+</html>
