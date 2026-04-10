@@ -334,6 +334,24 @@ input,button{font-family:var(--ui)}
       <div style="font-size:11px;color:var(--t3)" id="intel-updated">—</div>
     </div>
     <div id="intel-list"></div>
+
+    <!-- AI Lineup Analysis -->
+    <div style="margin-top:20px;background:var(--s2);border-radius:var(--border-radius-md);overflow:hidden">
+      <div style="padding:14px 16px;border-bottom:1px solid var(--s3);display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-size:13px;font-weight:700;color:var(--text)">🤖 AI Lineup Analysis</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">Claude analyzes your lineup and suggests improvements</div>
+        </div>
+        <button onclick="runAIAnalysis()" id="ai-analyze-btn"
+          style="background:var(--cyan);color:#0a0a0a;border:none;border-radius:10px;padding:8px 14px;
+                 font-size:12px;font-weight:700;cursor:pointer">
+          Analyze
+        </button>
+      </div>
+      <div id="ai-analysis-output" style="padding:14px 16px;font-size:13px;color:var(--t2);min-height:60px;line-height:1.6">
+        <span style="color:var(--t3)">Tap Analyze to get AI recommendations for your current lineup.</span>
+      </div>
+    </div>
   </div>
 
   <!-- stacks screen -->
@@ -4348,674 +4366,74 @@ function renderIntelLive() {
 // Keep fetchIntel as alias for screen switching
 function fetchIntel() { if (players && players.length) renderIntelLive(); }
 
-// ── PATTERNS ──────────────────────────────────────────────────────
-function loadPatterns() {
-  const h = JSON.parse(localStorage.getItem(`edgeiq_h_${sport}`) || '[]');
-  document.getElementById('pattern-count').textContent = `${h.length} slate${h.length!==1?'s':''} tracked`;
-  if (!h.length) {
-    document.getElementById('patterns-list').innerHTML='<div class="empty"><div class="empty-icon">📊</div><div class="empty-title">Building your profile</div><div class="empty-desc">Build and save a few lineups. EdgeIQ learns your tendencies and auto-corrects for them.</div></div>';
+async function runAIAnalysis() {
+  if (!lineup || !lineup.filter(l=>l.player).length) {
+    document.getElementById('ai-analysis-output').innerHTML =
+      '<span style="color:var(--amber)">Build a lineup first, then tap Analyze.</span>';
     return;
   }
 
-  // Analyze actual patterns from history
-  const allPlayers = h.flatMap(x => x.players || []);
-  const posFreq = {};
-  const teamFreq = {};
-  allPlayers.forEach(name => {
-    // Extract team from stored player name (simplified)
-    const p = players.find(pl => pl.name === name);
-    if (p) {
-      posFreq[p.pos] = (posFreq[p.pos]||0) + 1;
-      teamFreq[p.team] = (teamFreq[p.team]||0) + 1;
-    }
-  });
-
-  const topPos = Object.entries(posFreq).sort((a,b)=>b[1]-a[1])[0];
-  const topTeam = Object.entries(teamFreq).sort((a,b)=>b[1]-a[1])[0];
-  const avgEdge = h.length ? Math.round(h.reduce((s,x)=>s+(x.avgEdge||70),0)/h.length) : 0;
-
-  const biases = [
-    topPos ? {l:`Overplaying ${topPos[0]} position`,note:`${topPos[1]} times in ${h.length} lineups. Auto-corrected via bias engine.`,color:'var(--amber)',pct:Math.min(90,Math.round(topPos[1]/h.length*100))} : null,
-    topTeam ? {l:`Favoring ${topTeam[0]} players`,note:`Appears ${topTeam[1]}x in your history. Homer bias detected.`,color:'var(--amber)',pct:Math.min(90,Math.round(topTeam[1]/allPlayers.length*100))} : null,
-    {l:'Avg lineup edge score',note:`Your historical average. Target 75+ for competitive GPP edge.`,color:avgEdge>=75?'var(--green)':'var(--amber)',pct:avgEdge},
-  ].filter(Boolean);
-
-  document.getElementById('patterns-list').innerHTML=`<div class="bias-card">${biases.map(b=>`
-    <div class="bias-row">
-      <div class="bias-dot" style="background:${b.color}"></div>
-      <div class="bias-text">
-        <div class="bias-label">${b.l}</div>
-        <div class="bias-note">${b.note}</div>
-      </div>
-      <div class="bias-pct" style="color:${b.color}">${Math.round(b.pct)}%</div>
-    </div>`).join('')}</div>`;
-}
-
-function saveHistory() {
-  if (!lineup.length) return;
-  const valid = lineup.filter(l=>l.player);
-  const entry = {
-    date: new Date().toISOString(),
-    sport,
-    avgEdge: Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length),
-    players: valid.map(l=>l.player.name),
-    positions: valid.map(l=>l.player.pos),
-  };
-  const h = JSON.parse(localStorage.getItem(`edgeiq_h_${sport}`)||'[]');
-  h.push(entry);
-  localStorage.setItem(`edgeiq_h_${sport}`, JSON.stringify(h));
-  loadPatterns();
-}
-
-// ── EXPORT ────────────────────────────────────────────────────────
-function exportLineup() {
-  const valid = lineup.filter(l=>l.player);
-  if (!valid.length) return;
-  const rows = ['Position,Name,Salary,ProjectedPts,EdgeScore,OwnershipPct,Fatigue,CircadianScore',
-    ...valid.map(l=>`${l.slot},${l.player.name},${l.player.salary},${l.player.projPts},${l.player.edgeScore},${l.player.projOwn},${l.player.fatigue},${l.player.circadian}`)];
-  const blob = new Blob([rows.join('\n')], {type:'text/csv'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `EdgeIQ_${sport.toUpperCase()}_${new Date().toISOString().split('T')[0]}.csv`;
-  a.click();
-  saveHistory();
-}
-
-// helpers only below
-
-// ── HELPERS ───────────────────────────────────────────────────────
-function ec(e) { return e>=78?'var(--green)':e>=62?'var(--amber)':'var(--red)'; }
-function setStatus(msg,color) { const el=document.getElementById('fetch-status'); el.textContent=msg; el.style.color=color||'var(--t2)'; }
-function setDot(state) { const d=document.getElementById('status-dot'); d.className='dot'+(state?' '+state:''); document.getElementById('status-text').textContent=state==='loading'?'Loading...':state==='error'?'Error':'Ready'; }
-function var_(n) { const m={green:'var(--green)',amber:'var(--amber)',red:'var(--red)',cyan:'var(--cyan)'}; return m[n]||n; }
-
-// ── AUTO REFRESH ──────────────────────────────────────────────────
-let autoRefreshTimer = null;
-
-function startAutoRefresh() {
-  stopAutoRefresh();
-  autoRefreshTimer = setInterval(async () => {
-    const url = document.getElementById('dk-url').value.trim();
-    if (!url) return;
-    const dgId = extractId(url);
-    if (!dgId) return;
-    try {
-      const r = await fetch(`/api/proxy?dgId=${dgId}&sport=${sport}`, {signal:AbortSignal.timeout(25000)});
-      const json = await r.json();
-      if (json.success && json.players?.length) {
-        const newPlayers = enrich(parse(json.players));
-        const prevOut = players.filter(p=>p.isOut).map(p=>p.name);
-        const newOut  = newPlayers.filter(p=>p.isOut).map(p=>p.name);
-        const justOut = newOut.filter(n=>!prevOut.includes(n));
-        players = newPlayers;
-        setStatus('Building lineup...', 'var(--amber)');
-  // Use setTimeout so status update renders before blocking computation
-  await new Promise(resolve => setTimeout(resolve, 20));
-
-  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
-        lineup = optimize(players, sport);
-        renderLineup(calcEntropyScore(lineup, nashData));
-        renderIntelLive();
-        if (justOut.length) {
-          setStatus(`⚠️ ${justOut.join(', ')} just went OUT — lineup rebuilt`, 'var(--red)');
-        } else {
-          setStatus(`Auto-updated · ${new Date().toLocaleTimeString()}`, 'var(--green)');
-        }
-      }
-    } catch(e) { /* silent */ }
-  }, 5*60*1000);
-}
-
-function stopAutoRefresh() {
-  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer=null; }
-}
-
-// ════════════════════════════════════════════════════════════════════
-// LIVE SWAP ENGINE
-// ════════════════════════════════════════════════════════════════════
-
-let trackedLineup = [];       // players currently being tracked
-let liveScores = {};          // name -> { pts, projPts, status, locked }
-let liveRefreshTimer = null;
-let swapPool = [];            // available players for swaps
-
-// ── START TRACKING ────────────────────────────────────────────────
-function startLiveTracking() {
-  const text = document.getElementById('lineup-entry').value.trim();
-  if (!text) return;
-
-  // Parse player names from text area
-  trackedLineup = text.split('\n')
-    .map(l => l.trim())
-    .filter(l => l.length > 2)
-    .slice(0, 10);
-
-  if (!trackedLineup.length) return;
-
-  // Initialize scores
-  trackedLineup.forEach(name => {
-    liveScores[name] = { pts: 0, projPts: 0, status: 'pre', locked: false };
-  });
-
-  // If we have players loaded, use them as swap pool
-  swapPool = players.filter(p => !p.isOut && !trackedLineup.includes(p.name));
-
-  document.getElementById('live-score-banner').style.display = 'block';
-  fetchLiveScores();
-
-  // Auto-refresh every 90 seconds
-  if (liveRefreshTimer) clearInterval(liveRefreshTimer);
-  liveRefreshTimer = setInterval(fetchLiveScores, 90000);
-}
-
-// ── FETCH LIVE SCORES FROM ESPN ───────────────────────────────────
-async function fetchLiveScores() {
-  document.getElementById('swap-updated').textContent = 'Updating...';
-
-  const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sport] || 'basketball/nba';
+  const btn = document.getElementById('ai-analyze-btn');
+  btn.textContent = 'Analyzing...';
+  btn.disabled = true;
+  document.getElementById('ai-analysis-output').innerHTML =
+    '<span style="color:var(--t3)">Claude is analyzing your lineup...</span>';
 
   try {
-    // ESPN scoreboard — free, no key
-    const r = await fetch(
-      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    if (!r.ok) throw new Error('ESPN unavailable');
-    const data = await r.json();
+    const valid = lineup.filter(l => l.player);
+    const avgEdge = Math.round(valid.reduce((s,l) => s+l.player.edgeScore, 0) / valid.length);
+    const avgOwn  = Math.round(valid.reduce((s,l) => s+l.player.projOwn, 0) / valid.length);
+    const totalPts = valid.reduce((s,l) => s+l.player.projPts, 0).toFixed(1);
+    const salary   = valid.reduce((s,l) => s+l.player.salary, 0);
 
-    const games = data?.events || [];
-    const gameMap = {};   // gameId -> game info
-    const playerStatsMap = {}; // playerName -> { pts, locked, gameStatus }
-
-    for (const game of games) {
-      const status = game.status?.type;
-      const isLive   = status?.state === 'in';
-      const isLocked = status?.state === 'post' || isLive;
-      const period   = game.status?.period || 0;
-      const clock    = game.status?.displayClock || '';
-      const gameStatus = isLive ? `${period}Q ${clock}` : status?.shortDetail || '';
-
-      // Get player stats from boxscore if available
-      const competitors = game.competitions?.[0]?.competitors || [];
-      for (const team of competitors) {
-        const roster = team.roster || [];
-        for (const player of roster) {
-          const name = player.athlete?.displayName || '';
-          if (!name) continue;
-          const statLine = player.statistics || [];
-          let pts = 0;
-
-          if (sport === 'nba') {
-            pts = parseFloat(statLine.find(s=>s.name==='points')?.displayValue || 0);
-          } else if (sport === 'nfl') {
-            // NFL fantasy scoring: passing TDs, rushing, receiving
-            const passTD = parseFloat(statLine.find(s=>s.name==='passingTouchdowns')?.displayValue||0);
-            const passYd = parseFloat(statLine.find(s=>s.name==='passingYards')?.displayValue||0);
-            const rushTD = parseFloat(statLine.find(s=>s.name==='rushingTouchdowns')?.displayValue||0);
-            const rushYd = parseFloat(statLine.find(s=>s.name==='rushingYards')?.displayValue||0);
-            const recTD  = parseFloat(statLine.find(s=>s.name==='receivingTouchdowns')?.displayValue||0);
-            const recYd  = parseFloat(statLine.find(s=>s.name==='receivingYards')?.displayValue||0);
-            const rec    = parseFloat(statLine.find(s=>s.name==='receptions')?.displayValue||0);
-            // DraftKings scoring approximation
-            pts = passTD*4 + passYd*0.04 + rushTD*6 + rushYd*0.1 + recTD*6 + recYd*0.1 + rec*1;
-          } else if (sport === 'mlb') {
-            // MLB DK scoring approximation
-            const hits   = parseFloat(statLine.find(s=>s.name==='hits')?.displayValue||0);
-            const hr     = parseFloat(statLine.find(s=>s.name==='homeRuns')?.displayValue||0);
-            const rbi    = parseFloat(statLine.find(s=>s.name==='rbi')?.displayValue||0);
-            const runs   = parseFloat(statLine.find(s=>s.name==='runs')?.displayValue||0);
-            const sb     = parseFloat(statLine.find(s=>s.name==='stolenBases')?.displayValue||0);
-            pts = hits*3 + hr*10 + rbi*2 + runs*2 + sb*6;
-          }
-
-          playerStatsMap[name.toLowerCase()] = { pts, isLocked, gameStatus };
-        }
-      }
-    }
-
-    // Update tracked players
-    let totalLive = 0;
-    let totalProj = 0;
-
-    trackedLineup.forEach(name => {
-      const key = name.toLowerCase();
-      // Fuzzy match
-      const matchKey = Object.keys(playerStatsMap).find(k =>
-        k.includes(key.split(' ').pop()) ||
-        key.includes(k.split(' ').pop())
-      ) || key;
-
-      const stats = playerStatsMap[matchKey] || {};
-      const poolPlayer = swapPool.find(p => p.name.toLowerCase().includes(key.split(' ').pop()));
-
-      liveScores[name] = {
-        pts: stats.pts || 0,
-        isLocked: stats.isLocked || false,
-        gameStatus: stats.gameStatus || 'pre-game',
-        projPts: poolPlayer?.projPts || liveScores[name]?.projPts || 0,
-      };
-
-      totalLive += stats.pts || 0;
-      totalProj += (stats.isLocked ? (stats.pts||0) : (poolPlayer?.projPts || 0));
+    const teamCounts = {};
+    valid.filter(l=>l.player.pos!=='P').forEach(l => {
+      teamCounts[l.player.team] = (teamCounts[l.player.team]||0)+1;
     });
+    const topStack = Object.entries(teamCounts).sort((a,b)=>b[1]-a[1])[0];
 
-    // Update UI
-    renderLiveScores(totalLive, totalProj);
-    generateSwapRecommendations(games);
-    document.getElementById('swap-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
-
-  } catch(e) {
-    // Fallback: show what we have
-    document.getElementById('swap-updated').textContent = 'ESPN unavailable — using projections';
-    generateSwapRecommendations([]);
-  }
-}
-
-// ── RENDER LIVE SCORES ────────────────────────────────────────────
-function renderLiveScores(totalLive, totalProj) {
-  document.getElementById('live-score-val').textContent = totalLive.toFixed(2);
-  document.getElementById('live-proj-val').textContent = totalProj.toFixed(1);
-
-  // Estimate rank (rough approximation based on score)
-  const rankEst = totalLive < 20 ? '—'
-    : totalLive < 80 ? 'Top 40%'
-    : totalLive < 120 ? 'Top 25%'
-    : totalLive < 150 ? 'Top 15%'
-    : totalLive < 180 ? 'Top 5%'
-    : 'Top 1%';
-  document.getElementById('live-rank-val').textContent = rankEst;
-
-  // Player list
-  document.getElementById('live-player-list').innerHTML = trackedLineup.map(name => {
-    const s = liveScores[name] || {};
-    const ptsColor = s.pts > 25 ? 'var(--green)' : s.pts > 10 ? 'var(--text)' : 'var(--t2)';
-    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)">
-      <div>
-        <div style="font-size:13px;font-weight:500">${name}</div>
-        <div style="font-size:10px;color:var(--t3);font-family:var(--mono)">${s.gameStatus||'—'} ${s.isLocked?'🔒':''}</div>
-      </div>
-      <div style="text-align:right">
-        <div style="font-size:16px;font-weight:700;color:${ptsColor}">${(s.pts||0).toFixed(2)}</div>
-        <div style="font-size:10px;color:var(--t3)">proj ${(s.projPts||0).toFixed(1)}</div>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ── GENERATE SWAP RECOMMENDATIONS ────────────────────────────────
-function generateSwapRecommendations(games) {
-  const recs = document.getElementById('swap-recommendations');
-
-  // Find unlocked players in lineup
-  const unlocked = trackedLineup.filter(name => !liveScores[name]?.isLocked);
-
-  if (!unlocked.length) {
-    recs.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:20px;text-align:center">
-      <div style="font-size:14px;font-weight:500;margin-bottom:6px">All games locked</div>
-      <div style="font-size:12px;color:var(--t2)">No swaps available. Check back next slate.</div>
-    </div>`;
-    return;
-  }
-
-  // Generate swap recommendations for each unlocked player
-  const swapCards = unlocked.map(name => {
-    const current = players.find(p => p.name === name) ||
-      { name, projPts: liveScores[name]?.projPts || 0, salary: 0, pos: '?', projOwn: 0, edgeScore: 50 };
-
-    // Find same-position players not in lineup with higher edge score
-    const currentScore = liveScores[name];
-    const gameOver = currentScore?.isLocked;
-
-    // Get better alternatives at same position
-    const alts = players
-      .filter(p =>
-        !p.isOut &&
-        !trackedLineup.includes(p.name) &&
-        p.pos === current.pos &&
-        p.edgeScore > (current.edgeScore || 50)
-      )
-      .sort((a,b) => b.edgeScore - a.edgeScore)
-      .slice(0, 3);
-
-    if (!alts.length) return '';
-
-    const topAlt = alts[0];
-    const edgeDiff = topAlt.edgeScore - (current.edgeScore || 50);
-    const projDiff = (topAlt.projPts - (current.projPts || 0)).toFixed(1);
-    const urgency = edgeDiff > 15 ? 'high' : edgeDiff > 8 ? 'medium' : 'low';
-    const urgencyColor = urgency==='high'?'var(--red)':urgency==='medium'?'var(--amber)':'var(--t2)';
-
-    return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
-      <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:${urgencyColor}">${urgency} priority swap</div>
-        <div style="font-size:10px;color:var(--t3)">${current.pos} slot · unlocked</div>
-      </div>
-      <div style="padding:12px 14px">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <div>
-            <div style="font-size:12px;color:var(--t3);margin-bottom:2px">Current</div>
-            <div style="font-size:14px;font-weight:500;color:var(--t2)">${name}</div>
-            <div style="font-size:11px;color:var(--t3)">${(current.projPts||0).toFixed(1)} proj · ${current.projOwn||'?'}% own · edge ${current.edgeScore||'?'}</div>
-          </div>
-          <div style="font-size:20px;color:var(--t3)">→</div>
-          <div style="text-align:right">
-            <div style="font-size:12px;color:var(--green);margin-bottom:2px">Swap to</div>
-            <div style="font-size:14px;font-weight:500;color:var(--green)">${topAlt.name}</div>
-            <div style="font-size:11px;color:var(--t3)">${topAlt.projPts.toFixed(1)} proj · ${topAlt.projOwn}% own · edge ${topAlt.edgeScore}</div>
-          </div>
-        </div>
-        <div style="background:var(--s2);border-radius:var(--border-radius-md);padding:8px 10px;font-size:11px;color:var(--t2)">
-          <span style="color:var(--green)">+${projDiff} proj pts</span> · 
-          <span style="color:var(--green)">+${edgeDiff} edge</span> · 
-          ${topAlt.dvpLabel?.label||topAlt.opp||''} · 
-          ${topAlt.projOwn}% ownership
-        </div>
-        ${alts.length > 1 ? `<div style="margin-top:8px;font-size:11px;color:var(--t3)">Also consider: ${alts.slice(1).map(a=>`${a.name} (edge ${a.edgeScore})`).join(', ')}</div>` : ''}
-      </div>
-    </div>`;
-  }).filter(Boolean);
-
-  if (!swapCards.length) {
-    recs.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:20px;text-align:center">
-      <div style="font-size:14px;font-weight:500;margin-bottom:6px">Lineup looks optimal</div>
-      <div style="font-size:12px;color:var(--t2)">No better alternatives found for your unlocked slots.</div>
-    </div>`;
-    return;
-  }
-
-  recs.innerHTML = `
-    <div style="font-size:12px;font-weight:500;color:var(--t2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
-      ${swapCards.length} swap${swapCards.length!==1?'s':''} recommended · ${unlocked.length} unlocked slot${unlocked.length!==1?'s':''}
-    </div>
-    ${swapCards.join('')}`;
-}
-
-// ════════════════════════════════════════════════════════════════════
-// MULTI-LINEUP GENERATOR
-// Generates N lineups with different stacks, controlled exposure,
-// and maximum coverage of outcome space
-// ════════════════════════════════════════════════════════════════════
-
-let multiLineupCount = 5;
-let multiLineups = [];
-
-function setLineupCount(n, btn) {
-  multiLineupCount = n;
-  document.querySelectorAll('#count-btns button').forEach(b => {
-    b.style.borderColor = 'var(--border2)';
-    b.style.background = 'var(--bg)';
-    b.style.color = 'var(--text)';
-    b.style.fontWeight = '400';
-  });
-  if (btn) {
-    btn.style.borderColor = 'var(--cyan)';
-    btn.style.background = 'rgba(34,211,238,.1)';
-    btn.style.color = 'var(--cyan)';
-    btn.style.fontWeight = '600';
-  }
-}
-
-function generateMultiLineups() {
-  if (!players.length) {
-    document.getElementById('multi-results').innerHTML = `<div class="empty"><div class="empty-title">Load a slate first</div><div class="empty-desc">Upload a CSV or paste your contest URL on the Lineup tab first.</div></div>`;
-    return;
-  }
-
-  const maxExposure = parseInt(document.getElementById('exposure-slider').value) / 100;
-  const n = multiLineupCount;
-  const slots = SLOTS[sport];
-
-  document.getElementById('multi-status').textContent = `Generating ${n} lineups...`;
-  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px">Running optimizer ${n} times...</div>`;
-
-  // Run async to not block UI
-  setTimeout(() => {
-    multiLineups = buildMultipleLineups(n, maxExposure, slots);
-    renderMultiLineups();
-  }, 50);
-}
-
-function buildMultipleLineups(n, maxExposure, slots) {
-  const eligible = players.filter(p => !p.isOut && p.edgeScore > 0);
-  const results = [];
-
-  // Track exposure counts
-  const exposureCounts = {};
-  const maxAppearances = Math.ceil(n * maxExposure);
-
-  // Get unique game stacks to target
-  const games = {};
-  eligible.forEach(p => {
-    if (p.gameInfo) games[p.gameInfo] = (games[p.gameInfo] || 0) + 1;
-  });
-  const gameList = Object.keys(games).sort((a,b) => games[b] - games[a]);
-
-  for (let i = 0; i < n; i++) {
-    // Rotate which game stack to target
-    const targetGame = gameList[i % gameList.length];
-
-    // Apply exposure limits — if player is at max, reduce their edge score
-    const adjustedPlayers = eligible.map(p => {
-      const count = exposureCounts[p.name] || 0;
-      if (count >= maxAppearances) {
-        return { ...p, edgeScore: 0 }; // blocked from further lineups
-      }
-      // Diversity bonus — players not yet used get a small boost
-      const diversityBoost = count === 0 ? 5 : count === 1 ? 2 : 0;
-      // Stack incentive — boost players from target game
-      const stackBoost = p.gameInfo === targetGame ? 8 : 0;
-      return {
-        ...p,
-        edgeScore: Math.min(99, p.edgeScore + diversityBoost + stackBoost),
-        _targetGame: targetGame,
-        _inTargetStack: p.gameInfo === targetGame,
-      };
-    });
-
-    // Run optimizer on adjusted pool
-    const lineupResult = optimize(adjustedPlayers, sport);
-    const valid = lineupResult.filter(l => l.player);
-
-    if (valid.length >= Math.floor(slots.length * 0.75)) {
-      results.push({
-        lineup: lineupResult,
-        num: i + 1,
-        targetGame,
-        totalPts: valid.reduce((s,l) => s + l.player.projPts, 0),
-        avgEdge: Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length),
-        avgOwn: Math.round(valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length),
-        totalSal: valid.reduce((s,l) => s + l.player.salary, 0),
-      });
-
-      // Update exposure counts
-      valid.forEach(l => {
-        exposureCounts[l.player.name] = (exposureCounts[l.player.name] || 0) + 1;
-      });
-    }
-  }
-
-  return results;
-}
-
-function renderMultiLineups() {
-  const container = document.getElementById('multi-results');
-
-  if (!multiLineups.length) {
-    container.innerHTML = `<div class="empty"><div class="empty-title">Could not generate lineups</div><div class="empty-desc">Not enough eligible players. Try uploading a fresh CSV.</div></div>`;
-    return;
-  }
-
-  // Calculate exposure report
-  const exposureMap = {};
-  multiLineups.forEach(ml => {
-    ml.lineup.filter(l=>l.player).forEach(l => {
-      exposureMap[l.player.name] = (exposureMap[l.player.name] || 0) + 1;
-    });
-  });
-
-  const topExposure = Object.entries(exposureMap)
-    .sort((a,b) => b[1]-a[1])
-    .slice(0, 5);
-
-  document.getElementById('multi-status').textContent = `${multiLineups.length} lineups generated`;
-
-  // Export all button
-  const exportBtn = `<button onclick="exportAllLineups()" style="width:100%;padding:11px;border:1px solid var(--cyan);color:var(--cyan);background:transparent;border-radius:var(--border-radius-md);font-size:13px;font-weight:600;cursor:pointer;margin-bottom:12px">Export all ${multiLineups.length} lineups to CSV →</button>`;
-
-  // Exposure summary
-  const exposureSummary = `
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);padding:12px 14px;margin-bottom:12px">
-      <div style="font-size:11px;font-weight:600;color:var(--t3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Player exposure across ${multiLineups.length} lineups</div>
-      ${topExposure.map(([name, count]) => {
-        const pct = Math.round(count / multiLineups.length * 100);
-        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
-          <span style="font-size:12px;flex:1">${name}</span>
-          <div style="width:80px;height:3px;background:var(--border2);border-radius:2px;overflow:hidden">
-            <div style="width:${pct}%;height:100%;background:${pct>70?'var(--amber)':'var(--cyan)'};border-radius:2px"></div>
-          </div>
-          <span style="font-size:11px;font-family:var(--mono);color:${pct>70?'var(--amber)':'var(--t2)'};min-width:32px;text-align:right">${pct}%</span>
-        </div>`;
-      }).join('')}
-    </div>`;
-
-  // Individual lineups
-  const lineupCards = multiLineups.map(ml => {
-    const valid = ml.lineup.filter(l => l.player);
-    const rows = ml.lineup.map(l => {
-      if (!l.player) return '';
+    const lineupSummary = valid.map(l => {
       const p = l.player;
-      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--border)">
-        <span style="font-size:10px;font-weight:600;min-width:34px;padding:2px 5px;border-radius:4px;text-align:center;background:rgba(34,211,238,.1);color:var(--cyan)">${l.slot}</span>
-        <span style="flex:1;font-size:12px;font-weight:500">${p.name}</span>
-        <span style="font-size:11px;color:var(--t3)">${p.team}</span>
-        <span style="font-size:12px;font-family:var(--mono)">${p.projPts.toFixed(1)}</span>
-        <span style="font-size:11px;font-family:var(--mono);color:${ec(p.edgeScore)}">${p.edgeScore}</span>
-      </div>`;
-    }).join('');
+      return l.slot+' '+p.name+' ('+p.team+', '+p.projOwn+'% own, '+p.projPts.toFixed(1)+' proj, edge '+p.edgeScore+', '+(p.dvpLabel?.badge||'neutral')+')';
+    }).join('\n');
 
-    return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
-      <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-        <div>
-          <span style="font-size:13px;font-weight:600">Lineup ${ml.num}</span>
-          <span style="font-size:11px;color:var(--t3);margin-left:8px">stack: ${ml.targetGame?.split(' ')[0]||'mixed'}</span>
-        </div>
-        <div style="display:flex;gap:12px;font-size:11px;font-family:var(--mono)">
-          <span style="color:var(--green)">${ml.totalPts.toFixed(1)} pts</span>
-          <span>edge ${ml.avgEdge}</span>
-          <span style="color:var(--green)">${ml.avgOwn}% own</span>
-          <span style="color:var(--cyan)">$${(ml.totalSal/1000).toFixed(1)}K</span>
-        </div>
-      </div>
-      <div style="padding:8px 14px">
-        ${rows}
-      </div>
-    </div>`;
-  }).join('');
+    const prompt = 'You are an expert MLB DFS analyst helping win first place in DraftKings GPP tournaments.\n\n'+
+      'Analyze this lineup:\n'+lineupSummary+'\n\n'+
+      'Stats: Edge score '+avgEdge+'/99, '+avgOwn+'% avg ownership, $'+(salary/1000).toFixed(1)+'K salary, '+totalPts+' proj pts\n'+
+      'Main stack: '+(topStack ? topStack[0]+' x'+topStack[1] : 'none')+'\n'+
+      'Sport: '+sport.toUpperCase()+'\n\n'+
+      'Provide a concise analysis (4-6 sentences) covering:\n'+
+      '1. The biggest strength of this lineup for GPP\n'+
+      '2. The biggest risk or weakness\n'+
+      '3. One specific player to consider swapping and why\n'+
+      '4. Overall assessment: is this lineup ready to enter?\n\n'+
+      'Be direct and specific. No fluff.';
 
-  container.innerHTML = exportBtn + exposureSummary + lineupCards;
-}
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
 
-function exportAllLineups() {
-  if (!multiLineups.length) return;
+    const data = await response.json();
+    const text = data.content?.[0]?.text || 'No response received.';
 
-  const slots = SLOTS[sport];
-  const rows = ['Lineup,' + slots.join(',') + ',ProjPts,AvgEdge,Salary'];
+    document.getElementById('ai-analysis-output').innerHTML =
+      text.split('\n').filter(Boolean).map(line =>
+        '<p style="margin:0 0 8px 0">'+line+'</p>'
+      ).join('');
 
-  multiLineups.forEach(ml => {
-    const valid = ml.lineup.filter(l => l.player);
-    const names = ml.lineup.map(l => l.player?.name || '').join(',');
-    rows.push(`${ml.num},${names},${ml.totalPts.toFixed(1)},${ml.avgEdge},${ml.totalSal}`);
-  });
-
-  // Also export in DK import format
-  const dkRows = ['\n--- DraftKings Import Format ---\n'];
-  multiLineups.forEach(ml => {
-    const names = ml.lineup.filter(l=>l.player).map(l=>l.player.name).join(';');
-    dkRows.push(names);
-  });
-
-  const blob = new Blob([rows.join('\n') + dkRows.join('\n')], { type: 'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `EdgeIQ_Multi_${sport.toUpperCase()}_${multiLineupCount}lineups_${new Date().toISOString().split('T')[0]}.csv`;
-  a.click();
-}
-
-// ── UPDATE showScreen TO INCLUDE MULTI ───────────────────────────
-function showScreen(s) {
-  ['lineup','intel','multi','swap','stacks','signals','patterns'].forEach(sc => {
-    const el = document.getElementById(`screen-${sc}`);
-    if (el) el.style.display = sc===s?'block':'none';
-    const nav = document.getElementById(`nav-${sc}`);
-    if (nav) nav.classList.toggle('active', sc===s);
-  });
-  currentScreen = s;
-  if (s === 'swap' && lineup.length && !trackedLineup.length) {
-    const names = lineup.filter(l=>l.player).map(l=>l.player.name).join('\n');
-    document.getElementById('lineup-entry').value = names;
+  } catch(err) {
+    document.getElementById('ai-analysis-output').innerHTML =
+      '<span style="color:var(--red)">Analysis failed — check connection and try again.</span>';
+  } finally {
+    btn.textContent = 'Analyze';
+    btn.disabled = false;
   }
-  if (s === 'multi') {
-    document.getElementById('multi-status').textContent =
-      players.length ? `Ready · ${players.filter(p=>!p.isOut).length} eligible players` : 'Build a lineup first';
-  }
-  if (s === 'signals') renderSignalDashboard();
 }
 
-// ── RESULT LOGGER ─────────────────────────────────────────────────
-// Saves actual contest results to improve future projections
-function logContestResult(playerResults) {
-  // playerResults: [{name, actualPts, projPts, ownership, edgeScore}]
-  const results = JSON.parse(localStorage.getItem(`edgeiq_results_${sport}`) || '[]');
-  results.push({
-    date: new Date().toISOString(),
-    sport,
-    players: playerResults,
-    totalActual: playerResults.reduce((s,p)=>s+p.actualPts,0),
-    totalProj: playerResults.reduce((s,p)=>s+p.projPts,0),
-  });
-  // Keep last 50 contests
-  if (results.length > 50) results.shift();
-  localStorage.setItem(`edgeiq_results_${sport}`, JSON.stringify(results));
-}
 
-// Parse the DraftKings result screenshot data manually entered
-function logTonightResult() {
-  const tonightData = [
-    { name:'N. Alexander-Walker', actualPts:36.50, projPts:29.41, ownership:11.9, edgeScore:77 },
-    { name:'J. Brown',            actualPts:39.75, projPts:50.03, ownership:12.7, edgeScore:73 },
-    { name:'K. Durant',           actualPts:43.75, projPts:43.93, ownership:10.1, edgeScore:74 },
-    { name:'S. Barnes',           actualPts:22.75, projPts:40.54, ownership:25.6, edgeScore:77 },
-    { name:'J. Huff',             actualPts:29.50, projPts:34.38, ownership:1.3,  edgeScore:85 },
-    { name:'A. Green',            actualPts:20.25, projPts:26.06, ownership:2.6,  edgeScore:74 },
-    { name:'S. James',            actualPts:29.00, projPts:28.97, ownership:0.6,  edgeScore:85 },
-    { name:'T. Mann',             actualPts:5.25,  projPts:10.00, ownership:0.0,  edgeScore:86 },
-  ];
-  logContestResult(tonightData);
-
-  // Analysis
-  const overPerformers = tonightData.filter(p => p.actualPts > p.projPts * 1.1);
-  const underPerformers = tonightData.filter(p => p.actualPts < p.projPts * 0.7);
-  const lowOwnBusts = tonightData.filter(p => p.ownership < 2 && p.actualPts < 15);
-
-  console.log('EdgeIQ Result Analysis:');
-  console.log('Over-performers:', overPerformers.map(p=>p.name));
-  console.log('Under-performers:', underPerformers.map(p=>p.name));
-  console.log('Low-own busts (driving new ceiling rule):', lowOwnBusts.map(p=>`${p.name} ${p.actualPts}pts`));
-}
-
-// Auto-log tonight's result on first load after contest
-// (normally would be triggered by user entering result)
-if (!localStorage.getItem('edgeiq_logged_apr3')) {
-  logTonightResult();
-  localStorage.setItem('edgeiq_logged_apr3', '1');
-}
-
-// ── INIT ──────────────────────────────────────────────────────────
-fetchIntel();
-loadPatterns();
-// Restore last URL if any
-const lastUrl=localStorage.getItem(`edgeiq_dg_${sport}`);
-if(lastUrl){ document.getElementById('dk-url').value=`https://www.draftkings.com/draft/contest/${lastUrl}`; document.getElementById('fetch-btn').disabled=false; setStatus('Tap Build to reload last slate','var(--cyan)'); }
-</script>
-</body>
-</html>
