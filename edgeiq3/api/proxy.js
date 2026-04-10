@@ -164,6 +164,60 @@ export default async function handler(req, res) {
     });
   }
 
+  // ── MULTI-AGENT BULL/BEAR/JUDGE DEBATE ──────────────────────────
+  // Three Groq agents debate the lineup simultaneously
+  // Bull: finds reasons it wins | Bear: finds reasons it fails | Judge: verdicts
+  if (action === 'ai_debate') {
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(200).json({ success: false, text: 'No GROQ_API_KEY' });
+
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { lineupSummary, sport, totalProj, avgOwn, avgEdge, stackInfo } = body;
+
+    const context = `${sport.toUpperCase()} DFS lineup for DraftKings GPP:
+${lineupSummary}
+Stats: ${totalProj} proj pts | ${avgEdge} avg edge | ${avgOwn}% avg own | Stacks: ${stackInfo}`;
+
+    const BULL_PROMPT = `You are a BULL analyst. Your job: make the strongest possible case FOR this lineup winning a GPP tonight. Focus on: leverage plays, correlation, game environment, ownership advantages. Be specific. Max 80 words.`;
+    const BEAR_PROMPT = `You are a BEAR analyst. Your job: DESTROY this lineup. Find every weakness — SUB pitchers, bad matchups, chalk traps, injury risks, poor game environment, ownership fails. Be ruthless and specific. If you see any player with "SUB" tag, flag it immediately. Max 80 words.`;
+    const JUDGE_PROMPT = `You are the JUDGE. Given both bull and bear cases, give a final verdict: score 1-10, identify the SINGLE biggest risk, and recommend exactly ONE player swap if needed. Format: SCORE: X/10 | RISK: [one sentence] | SWAP: [player out] → [type of player in] or SWAP: none. Max 60 words.`;
+
+    try {
+      const groqCall = (systemMsg, userMsg) => fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 200,
+          temperature: 0.4,
+          messages: [
+            { role: 'system', content: systemMsg },
+            { role: 'user', content: `Lineup context:
+${context}
+
+${userMsg}` }
+          ]
+        }),
+        signal: AbortSignal.timeout(15000)
+      }).then(r => r.json()).then(d => d.choices?.[0]?.message?.content || '');
+
+      // Run Bull and Bear in parallel, then Judge with their outputs
+      const [bull, bear] = await Promise.all([
+        groqCall(BULL_PROMPT, 'Make the bull case:'),
+        groqCall(BEAR_PROMPT, 'Make the bear case:'),
+      ]);
+
+      const judgeContext = `BULL CASE: ${bull}
+
+BEAR CASE: ${bear}`;
+      const judge = await groqCall(JUDGE_PROMPT, judgeContext);
+
+      return res.status(200).json({ success: true, bull, bear, judge });
+    } catch(e) {
+      return res.status(200).json({ success: false, error: e.message });
+    }
+  }
+
   // ── AI LINEUP VALIDATION ACTION ──────────────────────────────────
   // Uses Groq free tier — llama-3.3-70b-versatile, fast inference, no cost
   if (action === 'ai_validate') {
@@ -210,6 +264,189 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, text });
     } catch(e) {
       return res.status(200).json({ success: false, text: 'AI validation unavailable — verify manually before submitting' });
+    }
+  }
+
+
+  // ── STATCAST EXPECTED STATS ───────────────────────────────────────
+  // Free from Baseball Savant — xBA, xSLG, xwOBA, barrel%, hard hit%
+  // Players with high xStats vs actual BA = undervalued / due to pop
+  if (action === 'statcast') {
+    try {
+      const year = new Date().getFullYear();
+      const url = `https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=batter&year=${year}&position=&team=&min=5&csv=true`;
+      const r = await fetch(url, {
+        signal: AbortSignal.timeout(10000),
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/csv,application/json' }
+      });
+      if (!r.ok) return res.status(200).json({ players: {}, source: 'statcast_failed' });
+      const csv = await r.text();
+      const lines = csv.trim().split('\n');
+      const hdr = lines[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase());
+      const nameI = hdr.findIndex(h => h.includes('last_name') || h === 'name');
+      const firstI = hdr.findIndex(h => h.includes('first_name'));
+      const xbaI   = hdr.findIndex(h => h === 'xba' || h.includes('est_ba'));
+      const xslgI  = hdr.findIndex(h => h === 'xslg' || h.includes('est_slg'));
+      const xwOBAI = hdr.findIndex(h => h.includes('xwoba') || h.includes('est_woba'));
+      const barrelI= hdr.findIndex(h => h.includes('barrel') && h.includes('percent'));
+      const hardI  = hdr.findIndex(h => h.includes('hard_hit'));
+      const baI    = hdr.findIndex(h => h === 'ba' || h === 'avg');
+
+      const players = {};
+      for (let i = 1; i < lines.length; i++) {
+        const v = lines[i].split(',').map(c => c.replace(/"/g,'').trim());
+        if (!v[nameI]) continue;
+        const lastName = v[nameI] || '';
+        const firstName = firstI >= 0 ? v[firstI] : '';
+        const fullName = firstName ? `${firstName} ${lastName}`.toLowerCase() : lastName.toLowerCase();
+        const xba    = parseFloat(v[xbaI]) || 0;
+        const xslg   = parseFloat(v[xslgI]) || 0;
+        const xwoba  = parseFloat(v[xwOBAI]) || 0;
+        const barrel = parseFloat(v[barrelI]) || 0;
+        const hardHit= parseFloat(v[hardI]) || 0;
+        const ba     = parseFloat(v[baI]) || 0;
+        // Regression signal: xBA much higher than BA = due to improve
+        const luckAdjust = ba > 0 ? (xba - ba) : 0;
+        players[fullName] = { xba, xslg, xwoba, barrel, hardHit, ba, luckAdjust };
+      }
+      return res.status(200).json({ players, source: 'statcast', count: Object.keys(players).length });
+    } catch(e) {
+      return res.status(200).json({ players: {}, source: 'statcast_error', error: e.message });
+    }
+  }
+
+  // ── UMPIRE TENDENCIES ─────────────────────────────────────────────
+  // Gets tonight's home plate ump from MLB API + historical tendency data
+  if (action === 'umpires') {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const schedR = await fetch(
+        `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=officials`,
+        { signal: AbortSignal.timeout(8000), headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      const schedData = schedR.ok ? await schedR.json() : { dates: [] };
+      const gameUmps = {};
+
+      for (const date of (schedData.dates || [])) {
+        for (const game of (date.games || [])) {
+          const officials = game.officials || [];
+          const hp = officials.find(o => o.officialType === 'Home Plate');
+          if (hp?.official?.fullName && game.teams) {
+            const away = game.teams.away?.team?.abbreviation || '';
+            const home = game.teams.home?.team?.abbreviation || '';
+            const gameKey = `${away}@${home}`;
+            gameUmps[gameKey] = {
+              name: hp.official.fullName,
+              id: hp.official.id,
+            };
+          }
+        }
+      }
+
+      // Static historical tendency data for known umps
+      // Source: umpire scorecards historical averages
+      // kRate = strikeout rate vs league avg (positive = more Ks)
+      // bbRate = walk rate vs league avg
+      // hrRate = HR rate vs league avg
+      const UMP_TENDENCIES = {
+        'angel hernandez':    { kRate: -0.08, bbRate: +0.12, hrRate: -0.05, note: 'Expansive zone, low K' },
+        'joe west':           { kRate: -0.06, bbRate: +0.09, hrRate: +0.02, note: 'Veteran, wide zone' },
+        'cb bucknor':         { kRate: -0.09, bbRate: +0.15, hrRate: -0.03, note: 'Very wide zone' },
+        'dan iassogna':       { kRate: +0.11, bbRate: -0.08, hrRate: +0.04, note: 'Tight zone, pitcher friendly' },
+        'laz diaz':           { kRate: +0.07, bbRate: -0.06, hrRate: +0.03, note: 'Consistent tight zone' },
+        'mike everitt':       { kRate: +0.05, bbRate: -0.04, hrRate: +0.02, note: 'Slightly pitcher friendly' },
+        'jim wolf':           { kRate: +0.09, bbRate: -0.07, hrRate: +0.05, note: 'Tight zone, high HR park effect' },
+        'ted barrett':        { kRate: -0.03, bbRate: +0.05, hrRate: +0.01, note: 'Near average' },
+        'todd tichenor':      { kRate: +0.06, bbRate: -0.05, hrRate: +0.03, note: 'Pitcher friendly' },
+        'mark carlson':       { kRate: -0.04, bbRate: +0.06, hrRate: -0.01, note: 'Slightly hitter friendly' },
+        'paul nauert':        { kRate: -0.07, bbRate: +0.10, hrRate: -0.02, note: 'Wide zone' },
+        'adam hamari':        { kRate: +0.04, bbRate: -0.03, hrRate: +0.02, note: 'Near average, slight pitcher lean' },
+        'bill miller':        { kRate: -0.05, bbRate: +0.08, hrRate: 0,     note: 'Average-wide zone' },
+        'brian gorman':       { kRate: +0.08, bbRate: -0.07, hrRate: +0.04, note: 'Tight zone' },
+        'gerry davis':        { kRate: -0.02, bbRate: +0.03, hrRate: +0.01, note: 'Near average' },
+        'lance barrett':      { kRate: +0.05, bbRate: -0.04, hrRate: +0.02, note: 'Slightly tight' },
+        'default':            { kRate: 0,     bbRate: 0,     hrRate: 0,     note: 'League average assumed' },
+      };
+
+      // Attach tendencies to each game
+      const result = {};
+      for (const [gameKey, ump] of Object.entries(gameUmps)) {
+        const name = ump.name.toLowerCase();
+        const tendency = UMP_TENDENCIES[name] || UMP_TENDENCIES['default'];
+        result[gameKey] = { ...ump, ...tendency };
+      }
+
+      return res.status(200).json({ umps: result, gamesFound: Object.keys(result).length });
+    } catch(e) {
+      return res.status(200).json({ umps: {}, gamesFound: 0, error: e.message });
+    }
+  }
+
+  // ── ROLLING CALIBRATION — READ ────────────────────────────────────
+  // Returns historical projection accuracy per player/team/position
+  if (action === 'calibration_read') {
+    try {
+      const kvUrl = process.env.KV_REST_API_URL;
+      const kvToken = process.env.KV_REST_API_TOKEN;
+      if (!kvUrl || !kvToken) return res.status(200).json({ corrections: {}, source: 'no_kv' });
+      const sp = req.query.sport || 'mlb';
+      const r = await fetch(`${kvUrl}/get/edgeiq_cal_${sp}`, {
+        headers: { Authorization: `Bearer ${kvToken}` }
+      });
+      const data = await r.json();
+      const corrections = data.result ? JSON.parse(data.result) : {};
+      return res.status(200).json({ corrections, source: 'kv', count: Object.keys(corrections).length });
+    } catch(e) {
+      return res.status(200).json({ corrections: {}, source: 'kv_error' });
+    }
+  }
+
+  // ── ROLLING CALIBRATION — WRITE ───────────────────────────────────
+  // Stores actual vs projected for calibration learning
+  if (action === 'calibration_write') {
+    try {
+      const kvUrl = process.env.KV_REST_API_URL;
+      const kvToken = process.env.KV_REST_API_TOKEN;
+      if (!kvUrl || !kvToken) return res.status(200).json({ ok: false, reason: 'no_kv' });
+      const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      const { sport, results } = body; // results: [{ name, projected, actual, pos, team }]
+      if (!results?.length) return res.status(400).json({ ok: false });
+
+      // Read existing calibration
+      const readR = await fetch(`${kvUrl}/get/edgeiq_cal_${sport}`, {
+        headers: { Authorization: `Bearer ${kvToken}` }
+      });
+      const readData = await readR.json();
+      const existing = readData.result ? JSON.parse(readData.result) : {};
+
+      // Update with new results — rolling 30-day weighted average
+      const updated = { ...existing };
+      const DECAY = 0.85; // older data gets 15% less weight each day
+
+      for (const r of results) {
+        const key = r.name.toLowerCase();
+        const error = r.actual - r.projected; // positive = we under-projected
+        const entry = updated[key] || { errors: [], avgError: 0, count: 0, pos: r.pos, team: r.team };
+        entry.errors = [error, ...entry.errors.slice(0, 29)]; // keep 30 days
+        // Weighted average — recent games matter more
+        const weights = entry.errors.map((_, i) => Math.pow(DECAY, i));
+        const totalW = weights.reduce((s,w) => s+w, 0);
+        entry.avgError = entry.errors.reduce((s,e,i) => s + e * weights[i], 0) / totalW;
+        entry.count = Math.min(entry.count + 1, 30);
+        entry.lastUpdated = new Date().toISOString().split('T')[0];
+        updated[key] = entry;
+      }
+
+      // Write back to KV
+      await fetch(`${kvUrl}/set/edgeiq_cal_${sport}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${kvToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(JSON.stringify(updated))
+      });
+
+      return res.status(200).json({ ok: true, playersUpdated: results.length, totalTracked: Object.keys(updated).length });
+    } catch(e) {
+      return res.status(200).json({ ok: false, error: e.message });
     }
   }
 
