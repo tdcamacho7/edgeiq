@@ -1459,8 +1459,10 @@ function calcScarcityBoost(player, allPlayers, sp) {
   // SP in MLB on small slates
   if (sp === 'mlb' && pos === 'P' && viableAtPos < 5) return 5;
 
-  if (viableAtPos < threshold * 0.4) return 6; // very scarce
-  if (viableAtPos < threshold * 0.6) return 3; // somewhat scarce
+  // Scarcity: fewer viable options = more valuable
+  const minViable = { nba: 12, nfl: 8, mlb: 6 }[sp] || 8;
+  if (viableAtPos < minViable * 0.4) return 6; // very scarce
+  if (viableAtPos < minViable * 0.6) return 3; // somewhat scarce
   return 0;
 }
 
