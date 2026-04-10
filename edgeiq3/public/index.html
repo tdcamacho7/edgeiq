@@ -1,4 +1,5 @@
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3467,6 +3468,16 @@ function calcEdgeScore(p) {
   if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);
   else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
 
+  // PROJECTION FLOOR: low-projection players cannot win you GPPs
+  // Low ownership doesn't help if a player scores 0-3 pts.
+  // These caps prevent sub-5pt hitters from getting inflated edge scores.
+  if (pos !== 'P') {
+    const projPtsCheck = p.projPts || p.avgPts || 0;
+    if (projPtsCheck < 3)  score = Math.min(score, 20); // basically zero — dead play
+    if (projPtsCheck < 5)  score = Math.min(score, 45); // very low projection — huge risk
+    if (projPtsCheck < 7)  score = Math.min(score, 65); // below average — soft cap
+  }
+
   // Terrible pitcher (negative FPPG avg) — hard cap, never pick
   if (p.terriblePitcher) score = Math.min(score, 30);
 
@@ -3520,7 +3531,8 @@ function optimize(all, sp) {
       for (let j = i + 1; j < topPitchers.length; j++) {
         const p1 = topPitchers[i], p2 = topPitchers[j];
         const remainingBudget = CAP - p1.salary - p2.salary;
-        if (remainingBudget < hitterSlots.length * 2500) continue;
+        // Need enough for 8 hitter slots at $3,500 avg minimum (realistic quality floor)
+        if (remainingBudget < hitterSlots.length * 3500) continue;
 
         // Blocked teams: pitcher's OWN team + pitcher's OPPONENT team
         // Own team: stacking your own pitcher's teammates suppresses their ceiling
@@ -3577,7 +3589,13 @@ function optimize(all, sp) {
         const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
-        const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
+        // HARD RULE: Never use hitters from any pitcher's game.
+        // - Pitcher's own team: correlated with pitcher's failure (low-scoring game)
+        // - Pitcher's opponent: facing your pitcher — if pitcher dominates, they score 0
+        // blockedFromStack already contains both pitcher teams + both opponent teams.
+        const availHitters = hitters.filter(h =>
+          !usedPitchers.has(h.name) && !blockedFromStack.has(h.team)
+        );
 
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
@@ -3624,16 +3642,14 @@ function optimize(all, sp) {
   // avgPts is the player's historical average — low avgPts = unreliable
   // A player who averages 10pts can't win you first place in NBA
   const minPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 5 : 4; // very low - don't filter pitchers
+    if (sp === 'mlb') return p.pos === 'P' ? 8 : 6;   // hitters must project >= 6 DK pts
     if (sp === 'nba') return 18;
     if (sp === 'nfl') return 10;
     return 15;
   };
   // Minimum AVERAGE DK points — removes dead weight
-  // MLB hitters naturally avg 8-12 pts, pitchers 15-25
-  // NBA: need 20+ avg to be a relevant player
   const minAvgPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 3 : 3; // very permissive for MLB
+    if (sp === 'mlb') return p.pos === 'P' ? 8 : 5;   // hitters must avg >= 5 DK pts
     if (sp === 'nba') return 20;
     if (sp === 'nfl') return 10;
     return 10;
@@ -3905,14 +3921,17 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         );
         // ALWAYS pick stack player when building toward 4-man stack
         // The +60 stack bonus outweighs individual edge score differences
-        // Only skip if stack player is completely unavailable (injured/no player at position)
-        // C slot has naturally lower scores — use lower threshold for catchers
-        const stackMinEdge = positions.includes('C') ? 50 : 60;
-        const stackMinPts  = positions.includes('C') ? 6  : 7;
-        if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || 0) >= stackMinPts) {
+        // Lower thresholds vs non-stack fill — we NEED the stack to win GPPs
+        const stackMinEdge = positions.includes('C') ? 40 : 50;
+        const stackMinPts  = positions.includes('C') ? 4  : 5;
+        if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || stackPick.avgPts || 0) >= stackMinPts) {
           pick = stackPick;
         }
-        // If no viable stack player, take best available
+        // If no viable stack player at this threshold, take any stack player
+        // (a weak stack player is still better than breaking the stack)
+        if (!pick && mustStack && stackPick && (stackPick.projPts || stackPick.avgPts || 0) >= 3) {
+          pick = stackPick;
+        }
       }
     }
 
@@ -3928,10 +3947,16 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       }
     }
 
-    // Best available fallback
+    // Best available fallback — minimum projection floor enforced
+    // Never pick a hitter projecting < 5 pts as a fallback fill
     if (!pick) {
       pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
+        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 5)
+      ) || sorted.find(p =>
+        // True last resort: relax projection floor but still require > 3 pts
+        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
+        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 3)
       );
     }
 
@@ -3945,43 +3970,54 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   }
 
   // ── SALARY UPGRADE PASS ───────────────────────────────────────────
-  // Replace cheaper players with higher-salary alternatives that score similarly.
-  // This fixes the "too much salary unused" problem while maintaining stack.
-  for (let i = lineup.length-1; i >= 0; i--) {
-    if (salLeft < 400) break;
-    const cur  = lineup[i].player; if (!cur) continue;
-    const slot = lineup[i].slot;
-    const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
-      : slot === 'G' ? G_POS : slot === 'F' ? F_POS
-      : slot === 'UTIL' ? UTIL_POS : [slot];
+  // Replace cheaper players with higher-salary alternatives.
+  // Run multiple passes until salary is within $500 of cap.
+  // Critical: $4K unused = missing a better player. Always spend the cap.
+  let upgradeIterations = 0;
+  while (salLeft > 500 && upgradeIterations < 4) {
+    upgradeIterations++;
+    let madeUpgrade = false;
 
-    // Prefer upgrading within stack team first to maintain the stack
-    const inStack = cur.team === stackTeam && slot !== 'P';
-    const upgrade = sorted.find(p =>
-      !used.has(p.name) &&
-      p.salary > cur.salary &&
-      p.salary <= cur.salary + salLeft - 200 &&
-      positions.includes(p.pos) &&
-      p.edgeScore >= cur.edgeScore - 5 &&
-      (!inStack || p.team === stackTeam) // stay within stack if already in it
-    ) || sorted.find(p =>
-      !used.has(p.name) &&
-      p.salary > cur.salary &&
-      p.salary <= cur.salary + salLeft - 200 &&
-      positions.includes(p.pos) &&
-      p.edgeScore >= cur.edgeScore - 5
-    );
+    for (let i = lineup.length - 1; i >= 0; i--) {
+      if (salLeft < 200) break;
+      const cur  = lineup[i].player; if (!cur) continue;
+      const slot = lineup[i].slot;
+      const positions = slot === 'FLEX' ? (FLEX_POS[sp]||[])
+        : slot === 'G' ? G_POS : slot === 'F' ? F_POS
+        : slot === 'UTIL' ? UTIL_POS : [slot];
 
-    if (upgrade) {
-      // Never swap a stack player for a non-stack player
       const curInStack = cur.team === presetStackTeam && slot !== 'P';
-      const upgrInStack = upgrade.team === presetStackTeam;
-      if (!curInStack || upgrInStack) {
+      // Looser edge tolerance on later passes to force salary usage
+      const edgeTolerance = upgradeIterations <= 2 ? 8 : 18;
+
+      const upgrade = sorted.find(p =>
+        !used.has(p.name) &&
+        p.salary > cur.salary &&
+        p.salary <= cur.salary + salLeft - 200 &&
+        positions.includes(p.pos) &&
+        p.edgeScore >= cur.edgeScore - edgeTolerance &&
+        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 5) &&
+        // Stack integrity: if cur is in stack, upgrade must also be in stack team
+        (!curInStack || p.team === presetStackTeam)
+      ) || (salLeft > 1500 ? sorted.find(p =>
+        // Second attempt: non-stack swap OK if we have $1500+ unused
+        !used.has(p.name) &&
+        p.salary > cur.salary &&
+        p.salary <= cur.salary + salLeft - 200 &&
+        positions.includes(p.pos) &&
+        p.edgeScore >= cur.edgeScore - edgeTolerance &&
+        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 5)
+      ) : null);
+
+      if (upgrade) {
         salLeft += cur.salary - upgrade.salary;
-        used.delete(cur.name); used.add(upgrade.name);
+        used.delete(cur.name);
+        used.add(upgrade.name);
         lineup[i] = { slot, player: upgrade };
+        madeUpgrade = true;
       }
     }
+    if (!madeUpgrade) break; // no more upgrades possible
   }
 
   return lineup;
@@ -4060,6 +4096,28 @@ async function buildAndRender() {
       attempts++;
     }
     lineup = bestLineupSoFar || optimize(players, sport) || [];
+
+    // ── GARBAGE PLAYER VALIDATION ────────────────────────────────────
+    // Reject any lineup with a hitter projecting < 3 pts — rebuild until clean
+    // This catches Chapman-type situations where signal penalties crush a projection
+    const hasGarbagePlayers = (lu) => lu.some(l =>
+      l.player && l.player.pos !== 'P' &&
+      (l.player.projPts || l.player.avgPts || 0) < 3
+    );
+
+    let garbageAttempts = 0;
+    while (lineup && hasGarbagePlayers(lineup) && garbageAttempts < 3) {
+      garbageAttempts++;
+      const garbageNames = lineup
+        .filter(l => l.player && l.player.pos !== 'P' && (l.player.projPts || l.player.avgPts || 0) < 3)
+        .map(l => l.player.name);
+      console.warn(`Garbage players detected (attempt ${garbageAttempts}): ${garbageNames.join(', ')} — hard-excluding and rebuilding`);
+      // Hard-exclude these players and rebuild
+      players = players.map(p =>
+        garbageNames.includes(p.name) ? { ...p, isOut: true, edgeScore: 0 } : p
+      );
+      lineup = optimize(players, sport) || lineup;
+    }
 
     // Show warning if we couldn't hit 97+
     if (!lineup || !lineup.length) {
