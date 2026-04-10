@@ -510,6 +510,31 @@ input,button{font-family:var(--ui)}
 let sport = 'nfl';
 let players = [];
 let lineup = [];
+
+// ── CORE UTILITIES — must be defined before everything else ───────
+function setStatus(msg, color) {
+  const el = document.getElementById('fetch-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = color || 'var(--t2)';
+}
+
+function setDot(state) {
+  const d = document.getElementById('status-dot');
+  if (!d) return;
+  d.className = 'dot' + (state ? ' ' + state : '');
+  const t = document.getElementById('status-text');
+  if (t) t.textContent = state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Ready';
+}
+
+function ec(e) {
+  return e >= 78 ? 'var(--green)' : e >= 62 ? 'var(--amber)' : 'var(--red)';
+}
+
+function var_(n) {
+  const m = { green:'var(--green)', amber:'var(--amber)', red:'var(--red)', cyan:'var(--cyan)' };
+  return m[n] || n;
+}
 let nashData = { topChalk: [], contrarianPlays: [], fieldFrequency: {}, iterations: 0, ownership: {} };
 let excludedPlayers = new Set(JSON.parse(localStorage.getItem('edgeiq_banned') || '[]'));
 let currentScreen = 'lineup';
