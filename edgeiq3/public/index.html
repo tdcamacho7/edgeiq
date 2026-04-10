@@ -705,46 +705,46 @@ async function handleCsv(input){
       safeTimeout(6000)
     ]).then(r => r || {});
 
-    // ── CACHE PROXY DATA (saves ScraperAPI credits on rebuilds) ──────
+    // ── CACHE KEY (for ownership/vegas only — injuries always fresh) ──
     const CACHE_TTL = 20 * 60 * 1000; // 20 minutes
     const cacheKey = `edgeiq_cache_${sport}_${new Date().toDateString()}`;
-    let cachedProxyData = null;
-    try {
-      const stored = sessionStorage.getItem(cacheKey);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed && Date.now() - (parsed.ts || 0) < CACHE_TTL) cachedProxyData = parsed;
-      }
-    } catch(e) { cachedProxyData = null; }
 
     let injuryMap, ownershipData, vegasData;
-    if (cachedProxyData) {
-      // Use cached data — no ScraperAPI calls needed
-      injuryMap = cachedProxyData.injuryMap || {};
-      ownershipData = cachedProxyData.ownershipData || {};
-      vegasData = cachedProxyData.vegasData || {};
-      setStatus(`${raw.length} players found · using cached live data...`, 'var(--cyan)');
-    } else {
-      // ESPN injuries FIRST — 8s timeout, must complete before enrich
-      // This is the critical gate that catches Snell/Paredes type situations
-      setStatus(`${raw.length} players found · checking injuries...`, 'var(--amber)');
-      injuryMap = await Promise.race([
-        fetchESPNInjuries(sport).catch(() => ({})),
-        new Promise(r => setTimeout(() => r({}), 8000))
-      ]);
 
-      // Ownership + Vegas in parallel
+    // INJURY DATA IS NEVER CACHED — always fetch fresh (late scratches must be caught)
+    // Ownership + Vegas can be cached (change slowly)
+    let cachedStaticData = null;
+    try {
+      const stored = sessionStorage.getItem(cacheKey + '_static');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && Date.now() - (parsed.ts || 0) < CACHE_TTL) cachedStaticData = parsed;
+      }
+    } catch(e) {}
+
+    if (cachedStaticData) {
+      ownershipData = cachedStaticData.ownershipData || {};
+      vegasData     = cachedStaticData.vegasData || {};
+      setStatus(`${raw.length} players found · checking injuries (always fresh)...`, 'var(--amber)');
+    } else {
       [ownershipData, vegasData] = await Promise.all([
         safeFetch(() => fetchOwnershipFromProxy(sport)),
         safeFetch(() => fetchVegasFromProxy(sport)),
       ]);
-      // Cache for this session
       try {
-        sessionStorage.setItem(cacheKey, JSON.stringify({
-          ts: Date.now(), injuryMap, ownershipData, vegasData
+        sessionStorage.setItem(cacheKey + '_static', JSON.stringify({
+          ts: Date.now(), ownershipData, vegasData
         }));
       } catch(e) {}
     }
+
+    // ALWAYS fetch injuries fresh — NEVER cache injury status
+    setStatus(`${raw.length} players found · checking injuries...`, 'var(--amber)');
+    injuryMap = await Promise.race([
+      fetchESPNInjuries(sport).catch(() => ({})),
+      new Promise(r => setTimeout(() => r({}), 8000))
+    ]);
+    console.log(`ESPN injuries fetched: ${Object.keys(injuryMap).length} players found`);
 
     // MLB starting lineup check — filters non-starters once lineups are posted
     let mlbStartingLineups = null;
@@ -758,12 +758,27 @@ async function handleCsv(input){
       }
     }
 
-    // Apply all data to players
-    const withData = raw.map(p => {
-      // Injury status from ESPN
-      const espnStatus = injuryMap[p.name.toLowerCase()] ||
-                         injuryMap[p.name.toLowerCase().split(' ').pop()];
-      const isOut = p.isOut || isManuallyOut(p.name) || (espnStatus && ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes(espnStatus.toLowerCase().trim()));
+    // Apply all data to players — MUST be let so injury_check can update it below
+    let withData = raw.map(p => {
+      // Injury status from ESPN — comprehensive IL/OUT status check
+      const espnStatusRaw = injuryMap[p.name.toLowerCase()] ||
+                         injuryMap[p.name.toLowerCase().split(' ').pop()] ||
+                         injuryMap[p.name.toLowerCase().split(' ').slice(-1)[0]];
+      const espnStatus = espnStatusRaw || '';
+      const espnStatusLow = espnStatus.toLowerCase().trim();
+      const HARD_OUT_STATUSES = ['out','o','ir','il','il10','il15','il60','il-10','il-60',
+        'injured list','injured reserve','injured','inactive','na','sus','suspended',
+        'did not play','dnp','scratched','out indefinitely','sspd','injury-reserve',
+        'injured_list','injured_reserve','non-roster','minors','dl','disabled list',
+        'paternity','bereavement','restricted','ineligible'];
+      const isEspnOut = espnStatus && (
+        HARD_OUT_STATUSES.includes(espnStatusLow) ||
+        espnStatusLow.startsWith('il') ||
+        espnStatusLow.includes('injured list') ||
+        espnStatusLow.includes('injured reserve') ||
+        espnStatusLow.includes('disabled list')
+      );
+      const isOut = p.isOut || isManuallyOut(p.name) || isEspnOut;
 
       // Real ownership from scraped sources
       const fpOwnership = fuzzyMatchOwnership(p.name, ownershipData);
@@ -780,42 +795,136 @@ async function handleCsv(input){
       return { ...p, status: espnStatus||p.status||'', isOut, fpOwnership, vegasImplied, gameTotal };
     });
 
-    const outCount  = withData.filter(p=>p.isOut).length;
+    // ── MLB ACTIVE ROSTER CHECK ── (direct from MLB Stats API, most authoritative)
+    // Anyone in DK pool who is NOT on team's 26-man active roster = IL/suspended/minors
+    if (sport === 'mlb') {
+      try {
+        const teams = [...new Set(withData.map(p => p.team).filter(Boolean))];
+        const MLB_TEAM_IDS = {
+          NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
+          MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
+          STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
+          TOR:141,LAD:119,CWS:145
+        };
+        const season = new Date().getFullYear();
+        const activeNames = new Set();
+        await Promise.allSettled(teams.slice(0, 20).map(async abbr => {
+          const id = MLB_TEAM_IDS[abbr]; if (!id) return;
+          try {
+            const r = await fetch(
+              `https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
+              { signal: AbortSignal.timeout(3500) }
+            );
+            if (!r.ok) return;
+            const data = await r.json();
+            for (const p of (data.roster || [])) {
+              const fullName = (p.person?.fullName || '').toLowerCase();
+              const lastName = fullName.split(' ').pop();
+              if (fullName) {
+                activeNames.add(fullName);
+                if (lastName.length > 3) activeNames.add(lastName);
+              }
+            }
+          } catch(e) {}
+        }));
+
+        if (activeNames.size > 30) {
+          // Only apply if we got meaningful data (at least 30 players across rosters)
+          let rosterExclusions = 0;
+          withData = withData.map(p => {
+            if (p.isOut) return p;
+            const nameLow = p.name.toLowerCase().trim();
+            const lastName = nameLow.split(' ').pop();
+            const onRoster = activeNames.has(nameLow) || activeNames.has(lastName);
+            if (!onRoster) {
+              rosterExclusions++;
+              return { ...p, isOut: true, status: p.status || 'NOT ON ACTIVE ROSTER' };
+            }
+            return p;
+          });
+          console.log(`MLB roster check: ${rosterExclusions} not on active roster (${activeNames.size} active players loaded)`);
+        }
+      } catch(e) { console.log('MLB roster check failed:', e.message); }
+    }
+
+
+    // ── MLB STARTING LINEUP GATE ──────────────────────────────────────
+    // Once lineups are posted (~90 min before first pitch), exclude hitters
+    // who are NOT in the confirmed starting lineup. They score 0 on DK.
+    if (sport === 'mlb' && mlbStartingLineups && mlbStartingLineups.starters.size > 0) {
+      let starterExclusions = 0;
+      withData = withData.map(p => {
+        if (p.isOut || p.pos === 'P') return p; // pitchers don't appear in lineup cards
+        const nameLow = p.name.toLowerCase().trim();
+        const lastName = nameLow.split(' ').pop();
+        const inLineup = mlbStartingLineups.starters.has(nameLow) ||
+                         mlbStartingLineups.starters.has(lastName) ||
+                         mlbStartingLineups.starters.has(nameLow.replace(/\./g,''));
+        if (!inLineup) {
+          starterExclusions++;
+          return { ...p, isOut: true, status: p.status || 'NOT IN STARTING LINEUP' };
+        }
+        return p;
+      });
+      console.log(`Starting lineup gate: ${starterExclusions} hitters excluded (not in confirmed lineup)`);
+    }
+
+    const totalOut = withData.filter(p=>p.isOut).length;
+    const outCount  = totalOut;
     const ownCount  = withData.filter(p=>p.fpOwnership!=null).length;
     const vegasCount= withData.filter(p=>p.vegasImplied!=null).length;
 
-    // ── INJURY CHECK — 3 sources via proxy (ESPN + MLB Transactions + Sleeper) ──
-    setStatus(`${withData.length} players · checking injuries...`, 'var(--amber)');
+    // ── INJURY CHECK — Proxy: ESPN + MLB Transactions + Active Roster ──
+    setStatus(`${withData.filter(p=>!p.isOut).length} eligible · verifying with proxy...`, 'var(--amber)');
     try {
       const injRes = await Promise.race([
         fetch(`/api/proxy?action=injury_check&sp=${sport}`),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000))
       ]);
       if (injRes.ok) {
         const injData = await injRes.json();
+        let injExclusions = 0;
+
+        // Apply injury map (ESPN + MLB Transactions)
         if (injData.success && Object.keys(injData.outPlayers || {}).length > 0) {
           const outMap = injData.outPlayers;
-          let injExclusions = 0;
           withData = withData.map(p => {
             if (p.isOut) return p;
             const nameLow = p.name.toLowerCase();
             const lastName = nameLow.split(' ').pop();
-            // Check all name variants
             const injEntry = outMap[nameLow] || outMap[lastName] ||
               outMap[`${nameLow.split(' ')[0]} ${lastName}`];
             if (injEntry) {
               injExclusions++;
-              return { ...p, isOut: true, status: injEntry.status };
+              return { ...p, isOut: true, status: injEntry.status || 'OUT' };
             }
             return p;
           });
-          console.log(`Injury check: ${injExclusions} players excluded (${injData.count} total out)`);
-          const sources = injData.sources?.join(', ') || '';
-          setStatus(`${withData.length} players · ${injExclusions} OUT confirmed via ${sources}`, 'var(--amber)');
         }
+
+        // Apply active roster cross-reference (MLB only — most authoritative)
+        // Anyone in DK pool NOT on any team's 26-man roster is definitely unavailable
+        if (sport === 'mlb' && injData.activeRosterNames?.length > 30) {
+          const rosterSet = new Set(injData.activeRosterNames);
+          withData = withData.map(p => {
+            if (p.isOut) return p;
+            const nameLow = p.name.toLowerCase().trim();
+            const lastName = nameLow.split(' ').pop();
+            const onRoster = rosterSet.has(nameLow) || (lastName.length > 3 && rosterSet.has(lastName));
+            if (!onRoster) {
+              injExclusions++;
+              return { ...p, isOut: true, status: p.status || 'NOT ON ACTIVE ROSTER' };
+            }
+            return p;
+          });
+        }
+
+        console.log(`Proxy injury check: ${injExclusions} more players excluded (${injData.count} in injury map, ${injData.rostersFetched || 0} rosters)`);
+        const sources = injData.sources?.join('+') || 'proxy';
+        setStatus(`${withData.filter(p=>!p.isOut).length} eligible · ${injExclusions} excluded via ${sources}`, 'var(--amber)');
       }
     } catch(e) {
-      console.log('Injury check skipped:', e.message);
+      console.log('Proxy injury check skipped:', e.message);
     }
 
     // Fetch weather BEFORE enrich
@@ -829,8 +938,9 @@ async function handleCsv(input){
     players = enrich(withData);
     buildAndRender();
 
+    const finalOut = withData.filter(p=>p.isOut).length;
     const sources = [
-      `${outCount} OUT filtered`,
+      `${finalOut} OUT/IL filtered`,
       ownCount > 0 ? `${ownCount} real ownership%` : 'ownership estimated',
       vegasCount > 0 ? `${vegasCount} Vegas lines` : null,
       weatherTeams > 0 ? `${weatherTeams} weather feeds` : null,
@@ -1043,28 +1153,34 @@ function parseCsv(text){
     const status = statusI>=0 ? (v[statusI]||'') : injuryInName || '';
     const statusLow = (status||'').toLowerCase().trim();
 
-    // OUT status list
-    const OUT_STATUSES = ['out','o','ir','il','il10','il60','il-10','il-60',
-      'injured list','injured reserve','injured','inactive','na','sus',
-      'suspended','did not play','dnp','scratched','out indefinitely','sspd'];
+    // OUT status list — comprehensive, covers all DK CSV formats
+    const OUT_STATUSES = new Set(['out','o','ir','il','il10','il15','il60','il-10','il-15','il-60',
+      'injured list','injured reserve','injured','inactive','na','n/a','sus',
+      'suspended','did not play','dnp','scratched','out indefinitely','sspd',
+      'injured_list','injured_reserve','disabled list','dl','paternity',
+      'bereavement','restricted','non-roster','minors','10-day il','15-day il','60-day il']);
 
-    // Check 1: injury suffix in player name "(IL)", "(O)", "(OUT)"
-    const nameHasIL = OUT_STATUSES.includes(injuryInName) || injuryInName.startsWith('il');
+    // Check 1: injury suffix in player name "(IL)", "(O)", "(OUT)", "(IL10)"
+    const nameHasIL = OUT_STATUSES.has(injuryInName) || injuryInName.startsWith('il')
+      || injuryInName === 'out' || injuryInName === 'o' || injuryInName.includes('injur');
 
     // Check 2: status column explicitly set
-    const statusIsOut = OUT_STATUSES.includes(statusLow) || statusLow.startsWith('il');
+    const statusIsOut = OUT_STATUSES.has(statusLow) || statusLow.startsWith('il')
+      || statusLow.startsWith('dl') || statusLow.includes('injured list')
+      || statusLow.includes('injured reserve') || statusLow.includes('disabled list');
 
     // Check 3: scan EVERY column individually for IL/OUT markers
-    // (fixes broken pipe-delimited check — CSV is comma-separated)
     const colHasIL = v.some(col => {
       const c = col.toLowerCase().trim();
-      return OUT_STATUSES.includes(c) || (c === 'il') || (c === 'o' && col.trim().length === 1);
+      return OUT_STATUSES.has(c) || c.startsWith('il') || (c === 'o' && col.trim().length === 1);
     });
 
     // Check 4: find the "Injury Indicator" column specifically by header index
-    const injColI = hdr.findIndex(h => h.includes('injury') && h.includes('indicator'));
+    // DK uses values like "IL", "O", "OUT", "IL10", "IL60", "DTD" — any non-empty is suspect
+    const injColI = hdr.findIndex(h => h.includes('injury') || h.includes('indicator') || h === 'status');
     const injIndicator = (injColI >= 0 ? v[injColI] || '' : '').toLowerCase().trim();
-    const injIndicatorOut = injIndicator.length > 0 && injIndicator !== 'none' && injIndicator !== '-';
+    const injIndicatorOut = injIndicator.length > 0 &&
+      injIndicator !== 'none' && injIndicator !== '-' && injIndicator !== 'active' && injIndicator !== 'healthy';
 
     const isOut = nameHasIL || statusIsOut || colHasIL || injIndicatorOut;
     // Also treat extremely low salary non-pitchers as effectively unavailable
@@ -1174,25 +1290,18 @@ function calcRecentForm(player) {
     return player.recentFormData;
   }
 
-  // Fallback: estimate from average pts with variance
-  const cached = recentFormCache[player.name.toLowerCase()];
-  if (cached) return cached;
-
+  // Fallback: when no real game log data is available, return neutral estimate
+  // DO NOT use pseudorandom numbers seeded by name — that's just noise dressed as signal
+  // avgPts IS the historical average — it already captures form over the season
   const base = player.avgPts || 15;
-  const seed = player.name.charCodeAt(0) * 31 + (player.salary % 1000);
-  const rng = (o=0) => ((seed * 9301 + (o+1) * 49297) % 233280) / 233280;
-
-  const last5 = [0,1,2,3,4].map(i => {
-    const variance = (rng(i) - 0.5) * base * 0.6;
-    return Math.max(0, base + variance);
-  });
-
-  const weightedAvg = last5.reduce((s, pts, i) => s + pts * FORM_WEIGHTS[i], 0);
-  const recentAvg = (last5[0] + last5[1]) / 2;
-  const trend = recentAvg > base * 1.15 ? 'hot' : recentAvg < base * 0.75 ? 'cold' : 'neutral';
-  const trendBoost = trend === 'hot' ? 8 : trend === 'cold' ? -8 : 0;
-
-  return { weightedAvg: Math.round(weightedAvg*10)/10, trend, trendBoost, last5 };
+  // Neutral form: we don't know recent trend, so don't pretend we do
+  return {
+    weightedAvg: Math.round(base * 10) / 10,
+    trend: 'neutral',
+    trendBoost: 0,
+    last5: [base, base, base, base, base],
+    estimated: true,  // flag: this is estimated, not real game log data
+  };
 }
 
 // ── HOME/AWAY SPLITS ──────────────────────────────────────────────
@@ -2562,14 +2671,29 @@ function enrich(raw) {
   cachedOwnership = {};
 
   return raw.map((p, i) => {
+    // ── HARD BLOCK: OUT/IL players get zeroed and returned immediately ──
+    // This is the final safety gate — should never reach optimize() with isOut=true
+    const finalIsOut = p.isOut || isManuallyOut(p.name) ||
+      (p.edgeScore === 0 && p.status && ['out','ir','il','inactive','suspended'].some(s =>
+        (p.status||'').toLowerCase().includes(s)
+      ));
+    if (finalIsOut) {
+      return { ...p, isOut: true, edgeScore: 0, projPts: 0, projOwn: 99, _ceiling: 0 };
+    }
+
     const seed = (p.name.charCodeAt(0)||65)*31 + (p.salary%1000) + i*17;
     const rng = (o=0) => ((seed*9301+(i+o+1)*49297+o*233)%233280)/233280;
 
-    // ── PROJECTIONS ──
-    const basePts = p.realProjection || (p.avgPts>2 ? p.avgPts : (p.salary/50000)*45+8);
+    // ── PROJECTIONS — use DK avgPts as primary source (most reliable) ──
+    // Remove randomness from basePts; only use rng for variance in projPts when no real projection
+    const basePts = p.realProjection || (p.avgPts > 2 ? p.avgPts : (p.salary / 50000) * 45 + 8);
+    // No randomness when avgPts is available — it's already the DK historical average
     const projPts = p.realProjection
-      ? Math.round(p.realProjection*10)/10
-      : Math.round((basePts*(0.88+rng(1)*.24))*10)/10;
+      ? Math.round(p.realProjection * 10) / 10
+      : p.avgPts > 2
+        ? Math.round(p.avgPts * 10) / 10   // use DK avgPts directly — no noise
+        : Math.round((basePts * (0.88 + rng(1) * 0.24)) * 10) / 10;
+
 
     // ── OWNERSHIP ──
     const projOwn = p.fpOwnership != null
@@ -2657,7 +2781,14 @@ function enrich(raw) {
 
     const biasCorrection = getBiasCorrection(p, history, sport);
     const status = p.status || '';
-    const isOut = p.isOut || ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes((status||'').toLowerCase().trim());
+    const statusLowE = status.toLowerCase().trim();
+    const isOut = p.isOut || isManuallyOut(p.name) || (statusLowE && (
+      ['out','o','ir','il','il10','il15','il60','il-10','il-60',
+       'injured list','injured reserve','injured','inactive','na','sus',
+       'suspended','did not play','dnp','scratched','out indefinitely',
+       'not on active roster','not in starting lineup'].includes(statusLowE)
+      || statusLowE.startsWith('il') || statusLowE.includes('injured list')
+    ));
 
     // Combined flat boosts applied to projected points
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
