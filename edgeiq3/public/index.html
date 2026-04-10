@@ -698,11 +698,23 @@ async function handleCsv(input){
         new Promise(r => setTimeout(() => r({}), 8000))
       ]);
 
-      // Ownership + Vegas in parallel
-      [ownershipData, vegasData] = await Promise.all([
+      // Ownership + Vegas + Statcast + Umpires + Calibration in parallel
+      let statcastData = {}, umpireData = {}, calibrationData = {};
+      [ownershipData, vegasData, statcastData, umpireData, calibrationData] = await Promise.all([
         safeFetch(() => fetchOwnershipFromProxy(sport)),
         safeFetch(() => fetchVegasFromProxy(sport)),
+        sport === 'mlb' ? safeFetch(fetchStatcast).catch(() => ({})) : Promise.resolve({}),
+        sport === 'mlb' ? safeFetch(fetchUmpires).catch(() => ({})) : Promise.resolve({}),
+        safeFetch(() => fetchCalibration(sport)).catch(() => ({})),
       ]);
+
+      const statcastCount = Object.keys(statcastData?.players || {}).length;
+      const umpireCount   = Object.keys(umpireData?.umps || {}).length;
+      const calCount      = Object.keys(calibrationData?.corrections || {}).length;
+      if (statcastCount > 0) console.log(`✅ Statcast: ${statcastCount} players loaded`);
+      if (umpireCount > 0)   console.log(`✅ Umpires: ${umpireCount} games loaded`);
+      if (calCount > 0)      console.log(`✅ Calibration: ${calCount} player corrections loaded`);
+
       // Cache for this session
       try {
         sessionStorage.setItem(cacheKey, JSON.stringify({
@@ -967,6 +979,42 @@ async function fetchMLBStartingLineups() {
     console.log('MLB lineups fetch failed:', e.message);
     return null;
   }
+}
+
+// ── STATCAST FETCH ───────────────────────────────────────────────
+async function fetchStatcast() {
+  const r = await fetch('/api/proxy?action=statcast', { signal: AbortSignal.timeout(12000) });
+  if (!r.ok) return {};
+  return await r.json();
+}
+
+// ── UMPIRE FETCH ──────────────────────────────────────────────────
+async function fetchUmpires() {
+  const r = await fetch('/api/proxy?action=umpires', { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) return {};
+  return await r.json();
+}
+
+// ── CALIBRATION FETCH ─────────────────────────────────────────────
+async function fetchCalibration(sp) {
+  const r = await fetch(`/api/proxy?action=calibration_read&sport=${sp}`, { signal: AbortSignal.timeout(5000) });
+  if (!r.ok) return {};
+  return await r.json();
+}
+
+// ── CALIBRATION WRITE (called after results entered) ──────────────
+async function writeCalibrationResults(sport, results) {
+  if (!results?.length) return;
+  try {
+    const r = await fetch('/api/proxy?action=calibration_write', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sport, results }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const data = await r.json();
+    if (data.ok) console.log(`✅ Calibration updated: ${data.playersUpdated} players, ${data.totalTracked} total tracked`);
+  } catch(e) { console.log('Calibration write failed:', e.message); }
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
@@ -2716,6 +2764,59 @@ function enrich(raw) {
     const practiceBoost  = calcPracticeBoost(p);
     const parkFactor     = calcParkFactorBoost(p, sport);
 
+    // ── STATCAST SIGNALS (MLB only) ───────────────────────────────
+    // xStats regression: if xBA >> BA, player is unlucky and due to improve
+    // Barrel% and hard hit% signal sustainable power
+    let statcastBoost = 0;
+    if (sport === 'mlb' && p.pos !== 'P' && statcastData?.players) {
+      const norm = (p.name||'').toLowerCase().replace(/\./g,'');
+      const sc = statcastData.players[norm] ||
+                 statcastData.players[norm.split(' ').slice(0,2).join(' ')];
+      if (sc) {
+        // Luck adjustment: under 0 = bad luck, above 0 = due for positive regression
+        if (sc.luckAdjust > 0.025) statcastBoost += 2;   // xBA > BA by 25pts = +2
+        if (sc.luckAdjust > 0.050) statcastBoost += 2;   // 50pts lucky gap = +4 total
+        if (sc.barrel > 12)  statcastBoost += 1;          // Elite barrel rate
+        if (sc.barrel > 18)  statcastBoost += 1;          // Elite+ barrel rate
+        if (sc.hardHit > 45) statcastBoost += 1;          // Hard contact above avg
+        if (sc.luckAdjust < -0.030) statcastBoost -= 2;  // Negative regression due
+        p._statcast = sc;
+      }
+    }
+
+    // ── UMPIRE SIGNALS (MLB pitchers only) ────────────────────────
+    // Pitcher-friendly umps boost K projection → higher ceiling
+    let umpireBoost = 0;
+    if (sport === 'mlb' && p.pos === 'P' && umpireData?.umps) {
+      // Match game to umpire by gameInfo string
+      const gameKey = Object.keys(umpireData.umps).find(k => {
+        const [away, home] = k.split('@');
+        return (p.gameInfo||'').includes(away) || (p.gameInfo||'').includes(home);
+      });
+      if (gameKey) {
+        const ump = umpireData.umps[gameKey];
+        // kRate > 0 = ump calls more Ks = pitcher gets more Ks = more DK pts
+        umpireBoost = Math.round((ump.kRate || 0) * 15); // ±8 pts for extreme umps
+        p._ump = ump;
+      }
+    }
+
+    // ── CALIBRATION CORRECTION ────────────────────────────────────
+    // After 5+ games, apply learned correction factor from historical errors
+    // If we consistently under-project a player, boost their projection
+    let calibrationBoost = 0;
+    if (calibrationData?.corrections) {
+      const key = (p.name||'').toLowerCase();
+      const cal = calibrationData.corrections[key];
+      if (cal && cal.count >= 5) {
+        // avgError = actual - projected. Positive = we under-projected
+        // Apply 60% of the correction to avoid overfitting
+        calibrationBoost = Math.round(cal.avgError * 0.6);
+        calibrationBoost = Math.max(-5, Math.min(5, calibrationBoost)); // cap at ±5
+        p._calibration = cal;
+      }
+    }
+
     // ── ADVANCED SIGNALS (no other tool uses) ──
     const propsDivergence    = calcPropsDivergence(p);          // Vegas props vs DK projection gap
     const coachBoost         = calcCoachTendencyBoost(p, sport); // Coach rotation patterns
@@ -2766,7 +2867,8 @@ function enrich(raw) {
 
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
                       weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
-                      Math.round(coachBoost * 0.4) + recentH2HPenalty;
+                      Math.round(coachBoost * 0.4) + recentH2HPenalty +
+                      statcastBoost + umpireBoost + calibrationBoost;
     // Use engineProj (Kalman-blended) as base, then apply signal boosts on top
     const adjProjPts = Math.max(0, Math.round((engineProj + flatBoost) * 10) / 10);
 
@@ -4966,101 +5068,108 @@ async function runLineupValidationAgent() {
   const valid = lineup.filter(l => l.player);
   if (!valid.length) return;
 
-  // Show loading state
-  panel.style.display = 'block';
-  panel.innerHTML = `
-    <div style="background:rgba(34,211,238,.06);border:1px solid rgba(34,211,238,.2);
-      border-radius:8px;padding:12px 14px;margin-bottom:8px;font-size:12px">
-      <div style="display:flex;align-items:center;gap:8px;color:var(--cyan);font-weight:600;margin-bottom:4px">
-        <span style="animation:spin 1s linear infinite;display:inline-block">⟳</span>
-        AI Agent analyzing lineup...
-      </div>
-      <div style="color:var(--t3);font-size:11px">Checking for scratches, SUB pitchers, stack quality, ownership risks...</div>
-    </div>`;
-
-  // Build lineup summary for the agent
+  // Build lineup summary for agents
   const lineupSummary = valid.map(l => {
     const p = l.player;
-    return `${l.slot}: ${p.name} (${p.team} vs ${p.opp||'?'}, $${p.salary}, proj ${p.projPts.toFixed(1)}pts, ${p.projOwn}% own, edge ${p.edgeScore}${p.recentFormData?.trend === 'hot' ? ', HOT' : p.recentFormData?.trend === 'cold' ? ', COLD' : ''}${p.dvpLabel?.badge ? ', ' + p.dvpLabel.badge : ''})`;
+    const tags = [
+      p.recentFormData?.trend === 'hot' ? 'HOT' : p.recentFormData?.trend === 'cold' ? 'COLD' : '',
+      p.dvpLabel?.badge || '',
+      p._ump ? `UMP:${p._ump.note}` : '',
+      p._statcast ? `xBA_gap:${(p._statcast.luckAdjust*1000).toFixed(0)}pts` : '',
+      p._calibration ? `cal:${p._calibration.avgError > 0 ? '+' : ''}${p._calibration.avgError.toFixed(1)}` : '',
+    ].filter(Boolean).join(', ');
+    return `${l.slot}: ${p.name} (${p.team}, $${p.salary}, proj ${p.projPts.toFixed(1)}, ${p.projOwn}% own, edge ${p.edgeScore}${tags ? ' ['+tags+']' : ''})`;
   }).join('\n');
 
-  const totalProj = valid.reduce((s,l) => s+l.player.projPts, 0).toFixed(1);
-  const avgOwn = (valid.reduce((s,l) => s+l.player.projOwn, 0)/valid.length).toFixed(1);
-  const avgEdge = Math.round(valid.reduce((s,l) => s+l.player.edgeScore, 0)/valid.length);
-
-  // Count team stacks
+  const totalProj = valid.reduce((s,l)=>s+(l.player.projPts||0),0).toFixed(1);
+  const avgOwn   = (valid.reduce((s,l)=>s+(l.player.projOwn||0),0)/valid.length).toFixed(1);
+  const avgEdge  = Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length);
   const teamCounts = {};
-  valid.filter(l=>l.player.pos!=='P').forEach(l => {
-    teamCounts[l.player.team] = (teamCounts[l.player.team]||0)+1;
-  });
-  const stackInfo = Object.entries(teamCounts).sort((a,b)=>b[1]-a[1])
-    .map(([t,n])=>`${t}×${n}`).join(', ');
+  valid.filter(l=>l.player.pos!=='P').forEach(l=>{teamCounts[l.player.team]=(teamCounts[l.player.team]||0)+1;});
+  const stackInfo = Object.entries(teamCounts).sort((a,b)=>b[1]-a[1]).map(([t,n])=>`${t}×${n}`).join(', ');
 
-  // Scratched players context
-  const scratchedCtx = manualOutNames.size > 0
-    ? `\nCurrently scratched by user: ${[...manualOutNames].filter(n=>n.length>4).join(', ')}`
-    : '';
-
-  const prompt = `You are an expert DFS lineup validator for DraftKings ${sport.toUpperCase()} GPP contests.
-
-Review this lineup and flag any concerns the optimizer may have missed:
-
-LINEUP (${sport.toUpperCase()}, $50K cap):
-${lineupSummary}
-
-STATS: ${totalProj} proj pts | ${avgEdge} avg edge | ${avgOwn}% avg own | Stacks: ${stackInfo}${scratchedCtx}
-
-Check for these specific issues:
-1. Any player likely to be a game-day scratch or rest candidate based on their name/team/matchup
-2. Pitchers who look like spot starters or relievers (SUB risk) based on salary and projection
-3. Stack quality — is the primary stack in a high-run-environment game?
-4. Ownership concerns — any players likely to be much higher owned than projected?
-5. Bring-back quality — does the bring-back player correlate well?
-6. Any obvious red flags I should scratch before submitting
-
-Be concise. Use bullet points. Flag ONLY real concerns, not general advice.
-If the lineup looks clean, say so clearly. Max 150 words.`;
+  // Show loading with 3 agent status
+  panel.style.display = 'block';
+  panel.innerHTML = `
+    <div style="background:rgba(0,0,0,.25);border:1px solid rgba(34,211,238,.2);
+      border-radius:10px;padding:14px;margin-bottom:8px;font-size:12px">
+      <div style="font-weight:700;color:var(--cyan);margin-bottom:10px;font-size:13px">
+        ⚡ AI Agent Team Analyzing...
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+        <div style="text-align:center;padding:8px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:6px">
+          <div style="font-size:10px;color:var(--green);font-weight:600">🐂 BULL</div>
+          <div style="font-size:10px;color:var(--t3);margin-top:2px">Building case...</div>
+        </div>
+        <div style="text-align:center;padding:8px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:6px">
+          <div style="font-size:10px;color:var(--red);font-weight:600">🐻 BEAR</div>
+          <div style="font-size:10px;color:var(--t3);margin-top:2px">Finding holes...</div>
+        </div>
+        <div style="text-align:center;padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px">
+          <div style="font-size:10px;color:var(--amber);font-weight:600">⚖️ JUDGE</div>
+          <div style="font-size:10px;color:var(--t3);margin-top:2px">Waiting...</div>
+        </div>
+      </div>
+    </div>`;
 
   try {
-    // POST to proxy — GET query params get truncated for long prompts
-    const response = await fetch('/api/proxy?action=ai_validate', {
+    const response = await fetch('/api/proxy?action=ai_debate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-      signal: AbortSignal.timeout(25000)
+      body: JSON.stringify({ lineupSummary, sport, totalProj, avgOwn, avgEdge, stackInfo }),
+      signal: AbortSignal.timeout(35000)
     });
-
     const data = await response.json();
-    const text = data.text || 'No response';
+    if (!data.success) throw new Error(data.error || 'failed');
 
-    // Parse response into structured display
-    const hasWarnings = /scratch|out|sub|risk|concern|flag|avoid|worry|caution|check/i.test(text);
-    const borderColor = hasWarnings ? 'rgba(245,158,11,.35)' : 'rgba(16,185,129,.25)';
-    const headerColor = hasWarnings ? 'var(--amber)' : 'var(--green)';
-    const icon = hasWarnings ? '⚠️' : '✅';
-    const label = hasWarnings ? 'AI Agent flagged concerns' : 'AI Agent: lineup looks clean';
+    // Parse judge score
+    const scoreMatch = data.judge?.match(/SCORE:\s*(\d+)/i);
+    const score = scoreMatch ? parseInt(scoreMatch[1]) : 5;
+    const scoreColor = score >= 8 ? 'var(--green)' : score >= 6 ? 'var(--amber)' : 'var(--red)';
+    const riskMatch = data.judge?.match(/RISK:\s*([^|]+)/i);
+    const swapMatch = data.judge?.match(/SWAP:\s*(.+)/i);
+    const risk = riskMatch ? riskMatch[1].trim() : '';
+    const swap = swapMatch ? swapMatch[1].trim() : 'none';
 
-    // Convert markdown bullets to HTML
-    const formatted = text
-      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-      .replace(/^[•\-\*] (.+)$/gm, '<div style="margin:3px 0;padding-left:12px;position:relative"><span style="position:absolute;left:0">•</span>$1</div>')
-      .replace(/\n\n/g, '<br>')
-      .replace(/\n/g, '<br>');
+    const fmt = t => (t||'').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>');
 
     panel.innerHTML = `
-      <div style="background:rgba(0,0,0,.2);border:1px solid ${borderColor};
-        border-radius:8px;padding:12px 14px;margin-bottom:8px;font-size:11px;line-height:1.6">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-          <div style="font-weight:700;color:${headerColor};font-size:12px">${icon} ${label}</div>
-          <button onclick="document.getElementById('ai-validation').style.display='none'"
-            style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:14px;padding:0;line-height:1">×</button>
+      <div style="background:rgba(0,0,0,.25);border:1px solid var(--border);
+        border-radius:10px;overflow:hidden;margin-bottom:8px;font-size:11px">
+        <div style="padding:10px 14px;border-bottom:1px solid var(--border);
+          display:flex;align-items:center;justify-content:space-between">
+          <div style="font-weight:700;font-size:13px">⚡ AI Agent Debate</div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:16px;font-weight:800;color:${scoreColor}">${score}/10</span>
+            <button onclick="runLineupValidationAgent()"
+              style="background:none;border:1px solid var(--border);color:var(--cyan);
+                cursor:pointer;font-size:10px;padding:3px 8px;border-radius:4px">Re-run</button>
+            <button onclick="document.getElementById('ai-validation').style.display='none'"
+              style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:16px;padding:0">×</button>
+          </div>
         </div>
-        <div style="color:var(--t2)">${formatted}</div>
-        <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);
-          font-size:10px;color:var(--t3);display:flex;justify-content:space-between">
-          <span>Claude AI · EdgeIQ Validation Agent</span>
-          <button onclick="runLineupValidationAgent()" 
-            style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:10px;padding:0">Re-analyze</button>
+        <div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--border)">
+          <div style="padding:10px 12px;border-right:1px solid var(--border)">
+            <div style="font-weight:700;color:var(--green);margin-bottom:6px;font-size:11px">🐂 BULL CASE</div>
+            <div style="color:var(--t2);line-height:1.5">${fmt(data.bull)}</div>
+          </div>
+          <div style="padding:10px 12px">
+            <div style="font-weight:700;color:var(--red);margin-bottom:6px;font-size:11px">🐻 BEAR CASE</div>
+            <div style="color:var(--t2);line-height:1.5">${fmt(data.bear)}</div>
+          </div>
+        </div>
+        <div style="padding:10px 14px;background:rgba(245,158,11,.05)">
+          <div style="font-weight:700;color:var(--amber);margin-bottom:6px;font-size:11px">⚖️ JUDGE VERDICT</div>
+          ${risk ? `<div style="margin-bottom:4px"><span style="color:var(--t3)">Risk: </span><span style="color:var(--t1)">${risk}</span></div>` : ''}
+          ${swap && swap.toLowerCase() !== 'none' ? `<div style="color:var(--amber)">⚡ Swap: ${swap}</div>` : `<div style="color:var(--green)">✅ No swaps needed</div>`}
+        </div>
+        <div style="padding:6px 14px;border-top:1px solid var(--border);
+          display:flex;justify-content:space-between;font-size:10px;color:var(--t3)">
+          <span>Groq llama-3.3-70b · 3 agents · EdgeIQ</span>
+          <button onclick="showResultLogger()"
+            style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:10px;padding:0">
+            Log last night's results →
+          </button>
         </div>
       </div>`;
 
@@ -5071,6 +5180,88 @@ If the lineup looks clean, say so clearly. Max 150 words.`;
         AI validation unavailable — verify manually before submitting
       </div>`;
   }
+}
+
+// ── RESULT LOGGER ─────────────────────────────────────────────────
+// Allows entering actual scores after contest to feed calibration engine
+function showResultLogger() {
+  const valid = lineup.filter(l => l.player);
+  if (!valid.length) { alert('Build a lineup first to log results'); return; }
+
+  const rows = valid.map(l => {
+    const p = l.player;
+    return `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;
+        border-bottom:1px solid var(--border)">
+      <span style="font-size:12px;min-width:34px;padding:2px 5px;border-radius:4px;
+        text-align:center;background:rgba(34,211,238,.1);color:var(--cyan)">${l.slot}</span>
+      <span style="flex:1;font-size:12px;font-weight:500">${p.name}</span>
+      <span style="font-size:11px;color:var(--t3);min-width:40px">${p.projPts.toFixed(1)} proj</span>
+      <input type="number" placeholder="actual" step="0.25"
+        id="result_${p.name.replace(/[^a-z]/gi,'_')}"
+        style="width:70px;padding:4px 6px;border-radius:4px;border:1px solid var(--border);
+          background:var(--bg2);color:var(--t1);font-size:12px;text-align:center">
+    </div>`;
+  }).join('');
+
+  const modal = document.createElement('div');
+  modal.id = 'result-logger-modal';
+  modal.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:9999;
+    display:flex;align-items:center;justify-content:center;padding:20px`;
+  modal.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;
+      width:100%;max-width:420px;max-height:80vh;overflow-y:auto">
+      <div style="padding:14px 16px;border-bottom:1px solid var(--border);
+        display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-weight:700;font-size:14px">📊 Log Contest Results</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">
+            Enter actual DK scores to train the calibration engine
+          </div>
+        </div>
+        <button onclick="document.getElementById('result-logger-modal').remove()"
+          style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:20px">×</button>
+      </div>
+      <div style="padding:12px 16px">${rows}</div>
+      <div style="padding:12px 16px;border-top:1px solid var(--border)">
+        <button onclick="submitResults()"
+          style="width:100%;padding:10px;background:var(--cyan);color:#000;border:none;
+            border-radius:8px;font-weight:700;font-size:13px;cursor:pointer">
+          Submit Results → Train Engine
+        </button>
+        <div id="result-status" style="text-align:center;font-size:11px;color:var(--t3);margin-top:8px"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function submitResults() {
+  const valid = lineup.filter(l => l.player);
+  const results = [];
+  for (const l of valid) {
+    const p = l.player;
+    const inputId = 'result_' + p.name.replace(/[^a-z]/gi,'_');
+    const input = document.getElementById(inputId);
+    const actual = input ? parseFloat(input.value) : null;
+    if (actual !== null && !isNaN(actual)) {
+      results.push({
+        name: p.name,
+        projected: p.projPts,
+        actual,
+        pos: p.pos,
+        team: p.team,
+        date: new Date().toISOString().split('T')[0],
+      });
+    }
+  }
+  if (!results.length) {
+    document.getElementById('result-status').textContent = 'Enter at least one actual score';
+    return;
+  }
+  document.getElementById('result-status').textContent = 'Saving...';
+  await writeCalibrationResults(sport, results);
+  document.getElementById('result-status').textContent =
+    `✅ ${results.length} results saved — engine will auto-correct projections`;
+  setTimeout(() => document.getElementById('result-logger-modal')?.remove(), 2000);
 }
 
 function exportLineup() {
