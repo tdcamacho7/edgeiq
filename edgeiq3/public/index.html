@@ -102,8 +102,6 @@ input,button{font-family:var(--ui)}
   display:flex;align-items:center;gap:12px;
 }
 .player-card.flagged{border-color:var(--amber);background:rgba(245,158,11,.05)}
-.scratch-btn{opacity:.55;transition:opacity .15s;background:none;border:1px solid rgba(239,68,68,.35);border-radius:4px;cursor:pointer;font-size:9px;color:rgba(239,68,68,.8);padding:1px 5px;vertical-align:middle;line-height:1.4;white-space:nowrap;margin-left:4px}
-.scratch-btn:hover{opacity:1;background:rgba(239,68,68,.12)}
 .slot-pos{
   font-size:10px;font-weight:700;letter-spacing:.04em;
   padding:4px 7px;border-radius:6px;text-align:center;
@@ -258,7 +256,6 @@ input,button{font-family:var(--ui)}
         </div>
         <div style="text-align:center;font-size:12px;color:var(--t3);margin-top:8px">
           DraftKings → your contest → Export to CSV → upload here
-          <br><span style="color:var(--amber);font-size:11px">⚡ Paste contest URL above first for live OUT detection</span>
         </div>
       </label>
       <input type="file" id="csv-upload-main" accept=".csv" style="display:none" onchange="handleCsv(this)">
@@ -322,9 +319,6 @@ input,button{font-family:var(--ui)}
           <div class="empty-desc">Upload your DraftKings CSV above to build your optimal GPP lineup. Export CSV from the DraftKings contest lobby.</div>
         </div>
       </div>
-      <!-- AI Validation Agent -->
-      <div id="ai-validation" style="display:none;margin:10px 0 0 0"></div>
-
       <div id="export-section" style="display:none">
         <button class="action-btn btn-export" onclick="exportLineup()">Export lineup to DraftKings →</button>
         <button class="action-btn btn-rebuild" onclick="saveAndRebuild()" style="display:none">Save & rebuild</button>
@@ -598,8 +592,6 @@ async function fetchSlate(){
     }).catch(()=>{});
 
     localStorage.setItem(`edgeiq_dg_${sport}`, dgId);
-    // Save the REAL draftGroupId (not contest ID) — used by CSV injury check
-    if (json.draftGroupId) localStorage.setItem(`edgeiq_dgrid_${sport}`, json.draftGroupId);
     buildAndRender();
     startAutoRefresh();
 
@@ -656,7 +648,7 @@ async function handleCsv(input){
 
   const reader=new FileReader();
   reader.onload= async e=>{
-    let raw=parseCsv(e.target.result);
+    const raw=parseCsv(e.target.result);
     if(!raw.length){ setStatus('Could not read CSV — try re-downloading from DraftKings','var(--red)'); setDot('error'); return; }
 
     setStatus(`${raw.length} players found · fetching live data...`,'var(--amber)');
@@ -698,23 +690,11 @@ async function handleCsv(input){
         new Promise(r => setTimeout(() => r({}), 8000))
       ]);
 
-      // Ownership + Vegas + Statcast + Umpires + Calibration in parallel
-      let statcastData = {}, umpireData = {}, calibrationData = {};
-      [ownershipData, vegasData, statcastData, umpireData, calibrationData] = await Promise.all([
+      // Ownership + Vegas in parallel
+      [ownershipData, vegasData] = await Promise.all([
         safeFetch(() => fetchOwnershipFromProxy(sport)),
         safeFetch(() => fetchVegasFromProxy(sport)),
-        sport === 'mlb' ? safeFetch(fetchStatcast).catch(() => ({})) : Promise.resolve({}),
-        sport === 'mlb' ? safeFetch(fetchUmpires).catch(() => ({})) : Promise.resolve({}),
-        safeFetch(() => fetchCalibration(sport)).catch(() => ({})),
       ]);
-
-      const statcastCount = Object.keys(statcastData?.players || {}).length;
-      const umpireCount   = Object.keys(umpireData?.umps || {}).length;
-      const calCount      = Object.keys(calibrationData?.corrections || {}).length;
-      if (statcastCount > 0) console.log(`✅ Statcast: ${statcastCount} players loaded`);
-      if (umpireCount > 0)   console.log(`✅ Umpires: ${umpireCount} games loaded`);
-      if (calCount > 0)      console.log(`✅ Calibration: ${calCount} player corrections loaded`);
-
       // Cache for this session
       try {
         sessionStorage.setItem(cacheKey, JSON.stringify({
@@ -723,16 +703,20 @@ async function handleCsv(input){
       } catch(e) {}
     }
 
-    // MLB lineup confirmation — handled by DK injury_indicator + avgPts in parseCsv
-    // Server-side lineup API removed — was failing silently and causing issues
+    // MLB starting lineup check — filters non-starters once lineups are posted
+    let mlbStartingLineups = null;
+    if (sport === 'mlb') {
+      mlbStartingLineups = await Promise.race([
+        fetchMLBStartingLineups(),
+        new Promise(res => setTimeout(() => res(null), 3000)) // 3s max
+      ]).catch(() => null);
+      if (mlbStartingLineups) {
+        setStatus(`${raw.length} players found · ${mlbStartingLineups.gamesWithLineups} lineups confirmed...`, 'var(--cyan)');
+      }
+    }
 
     // Apply all data to players
-    // Apply persisted scratches immediately so scratched players never enter the pipeline
-    raw = raw.map(p => isManuallyOut(p.name) ? { ...p, isOut: true } : p);
-
-    // Non-starters filtered via DK injury_indicator + avgPts < 2.5 in parseCsv
-
-    let withData = raw.map(p => {
+    const withData = raw.map(p => {
       // Injury status from ESPN
       const espnStatus = injuryMap[p.name.toLowerCase()] ||
                          injuryMap[p.name.toLowerCase().split(' ').pop()];
@@ -767,8 +751,6 @@ async function handleCsv(input){
       if (injRes.ok) {
         const injData = await injRes.json();
         if (injData.success && Object.keys(injData.outPlayers || {}).length > 0) {
-          // Cache globally so post-build sweep and future rebuilds can re-check
-          window._injuryCache = { ...(window._injuryCache || {}), ...injData.outPlayers };
           const outMap = injData.outPlayers;
           let injExclusions = 0;
           withData = withData.map(p => {
@@ -776,9 +758,8 @@ async function handleCsv(input){
             const nameLow = p.name.toLowerCase();
             const lastName = nameLow.split(' ').pop();
             // Check all name variants
-            // Full name only — ESPN has 273+ injuries across all sports
-            // Last-name matching ("walker","smith") blocks legitimate players in other sports
-            const injEntry = outMap[nameLow];
+            const injEntry = outMap[nameLow] || outMap[lastName] ||
+              outMap[`${nameLow.split(' ')[0]} ${lastName}`];
             if (injEntry) {
               injExclusions++;
               return { ...p, isOut: true, status: injEntry.status };
@@ -794,55 +775,6 @@ async function handleCsv(input){
       console.log('Injury check skipped:', e.message);
     }
 
-    // ── DK LIVE STATUS CHECK ───────────────────────────────────────────
-    // Catches game-day scratches that ESPN/MLB Transactions always miss.
-    // Uses the REAL draftGroupId (not contest ID) to call DK's draftables API.
-    // Priority: (1) cached draftGroupId from last URL fetch, (2) URL field parse.
-    // First URL fetch saves draftGroupId to localStorage — reused for all future CSVs.
-    try {
-      const cachedDgRid = localStorage.getItem(`edgeiq_dgrid_${sport}`) || '';
-      const dkUrlField  = document.getElementById('dk-url')?.value?.trim() || '';
-      const parsedId    = extractId(dkUrlField);
-      // Use cached real draftGroupId first (most reliable), fall back to URL parse
-      const draftGroupId = cachedDgRid || parsedId || '';
-
-      if (draftGroupId) {
-        setStatus(`${withData.length} players · checking DK live statuses...`, 'var(--amber)');
-        const dkRes = await Promise.race([
-          fetch(`/api/proxy?action=dk_status&dgId=${draftGroupId}&sport=${sport}`),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000))
-        ]);
-        if (dkRes.ok) {
-          const dkData = await dkRes.json();
-          console.log(`DK status: source=${dkData.source}, out=${dkData.count}, total=${dkData.totalPlayers}`);
-          if (dkData.success && Object.keys(dkData.outPlayers || {}).length > 0) {
-            window._injuryCache = { ...(window._injuryCache || {}), ...dkData.outPlayers };
-            let dkExclusions = 0;
-            withData = withData.map(p => {
-              if (p.isOut) return p;
-              const nameLow = p.name.toLowerCase();
-              const last = nameLow.split(' ').pop();
-              const hit = dkData.outPlayers[nameLow]; // full name only
-              if (hit) {
-                dkExclusions++;
-                return { ...p, isOut: true, status: hit.status };
-              }
-              return p;
-            });
-            if (dkExclusions > 0) {
-              setStatus(`🚨 ${dkExclusions} game-day scratch(es) caught via DK`, 'var(--red)');
-            }
-          } else if (dkData.totalPlayers > 0) {
-            console.log(`DK status: all ${dkData.totalPlayers} players active`);
-          }
-        }
-      } else {
-        console.warn('DK status check skipped — no draftGroupId. Do a URL fetch once to enable this check.');
-      }
-    } catch(e) {
-      console.log('DK status check skipped:', e.message);
-    }
-
     // Fetch weather BEFORE enrich
     setStatus(`${withData.length} players · fetching weather...`, 'var(--amber)');
     await Promise.race([
@@ -851,7 +783,7 @@ async function handleCsv(input){
     ]).catch(() => {});
     const weatherTeams = Object.keys(weatherCache).length;
 
-    players = applyBuzzMultiplier(enrich(withData));
+    players = enrich(withData);
     buildAndRender();
 
     const sources = [
@@ -883,31 +815,8 @@ async function fetchVegasFromProxy(sp) {
     const r = await fetch(`/api/proxy?dgId=0&sport=${sp}&action=vegas`, { signal: AbortSignal.timeout(8000) });
     if (!r.ok) return {};
     const data = await r.json();
-    // Cache props alongside odds so enrich() can use both without a second round-trip
-    if (data.props && Object.keys(data.props).length) {
-      window._cachedProps = data.props;
-    }
     return data.odds || {};
   } catch(e) { return {}; }
-}
-
-// ── BUZZ MULTIPLIER ──────────────────────────────────────────────
-// Hot players in elite matchups at low salary get massively under-projected ownership.
-// Queen at 14% projected → 53.7% actual is the textbook case.
-// When a player is hot + elite matchup + price < $6,500, inflate projected own by 2x
-// so the engine correctly discounts them as chalk traps.
-function applyBuzzMultiplier(players) {
-  return players.map(p => {
-    const isHot = p.recentFormData?.trend === 'hot';
-    const isElite = p.dvpLabel?.badge === 'elite matchup';
-    const isCheap = (p.salary || 0) < 6500;
-    const isBuzz = isHot && isElite && isCheap;
-    if (isBuzz && (p.projOwn || 0) < 20) {
-      // Inflate projected ownership — engine will correctly penalize via ownershipMult
-      return { ...p, projOwn: Math.min(35, (p.projOwn || 10) * 2.2), _buzzInflated: true };
-    }
-    return p;
-  });
 }
 
 // Fuzzy match player name to ownership map
@@ -949,72 +858,44 @@ async function fetchMLBActiveRosters(teamAbbrevs) {
   }
 }
 
-// Fetch confirmed MLB starting lineups via proxy (server-side)
-// Proxy hits MLB Stats API + ESPN + RotoWire with proper headers
+// Fetch confirmed MLB starting lineups from MLB Stats API (free, no key)
+// Returns Set of player names confirmed in today's starting lineups
+// Only available ~90 min before first pitch when lineups are posted
 async function fetchMLBStartingLineups() {
-  function normName(n) {
-    return (n || '').normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/\./g, '')
-      .toLowerCase().trim();
-  }
-
   try {
-    const r = await fetch('/api/proxy?action=mlb_lineups', {
-      signal: AbortSignal.timeout(12000)
-    });
+    const today = new Date().toISOString().split('T')[0];
+    const r = await fetch(
+      `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}&hydrate=lineups`,
+      { signal: AbortSignal.timeout(4000) }
+    );
     if (!r.ok) return null;
     const data = await r.json();
+    const confirmedStarters = new Set();
+    let gamesWithLineups = 0;
 
-    if (!data.gamesFound || data.totalConfirmed < 5) {
-      console.log('MLB lineups: not yet posted or unavailable');
-      return null;
+    for (const date of (data.dates || [])) {
+      for (const game of (date.games || [])) {
+        const home = game.lineups?.homePlayers || [];
+        const away = game.lineups?.awayPlayers || [];
+        if (home.length + away.length > 0) {
+          gamesWithLineups++;
+          [...home, ...away].forEach(p => {
+            const name = (p.fullName || '').toLowerCase();
+            if (name) {
+              confirmedStarters.add(name);
+              // Also add last name for fuzzy matching
+              const parts = name.split(' ');
+              if (parts.length >= 2) confirmedStarters.add(parts[parts.length - 1]);
+            }
+          });
+        }
+      }
     }
-
-    // Convert confirmed object to Set for fast lookup
-    const starters = new Set(Object.keys(data.confirmed));
-    console.log(`MLB lineups: ${data.gamesFound} games confirmed, ${starters.size} starters from proxy`);
-    return { starters, gamesWithLineups: data.gamesFound, normName };
+    // Only return if we got lineups for at least 1 game (means they're posted)
+    return gamesWithLineups >= 1 ? { starters: confirmedStarters, gamesWithLineups } : null;
   } catch(e) {
-    console.log('MLB lineups fetch failed:', e.message);
     return null;
   }
-}
-
-// ── STATCAST FETCH ───────────────────────────────────────────────
-async function fetchStatcast() {
-  const r = await fetch('/api/proxy?action=statcast', { signal: AbortSignal.timeout(12000) });
-  if (!r.ok) return {};
-  return await r.json();
-}
-
-// ── UMPIRE FETCH ──────────────────────────────────────────────────
-async function fetchUmpires() {
-  const r = await fetch('/api/proxy?action=umpires', { signal: AbortSignal.timeout(8000) });
-  if (!r.ok) return {};
-  return await r.json();
-}
-
-// ── CALIBRATION FETCH ─────────────────────────────────────────────
-async function fetchCalibration(sp) {
-  const r = await fetch(`/api/proxy?action=calibration_read&sport=${sp}`, { signal: AbortSignal.timeout(5000) });
-  if (!r.ok) return {};
-  return await r.json();
-}
-
-// ── CALIBRATION WRITE (called after results entered) ──────────────
-async function writeCalibrationResults(sport, results) {
-  if (!results?.length) return;
-  try {
-    const r = await fetch('/api/proxy?action=calibration_write', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sport, results }),
-      signal: AbortSignal.timeout(8000)
-    });
-    const data = await r.json();
-    if (data.ok) console.log(`✅ Calibration updated: ${data.playersUpdated} players, ${data.totalTracked} total tracked`);
-  } catch(e) { console.log('Calibration write failed:', e.message); }
 }
 
 // Fetch live injury data from ESPN free public API — no key needed
@@ -1023,16 +904,16 @@ async function fetchESPNInjuries(sp) {
   const path = sportPaths[sp] || 'basketball/nba';
   const map = {};
 
-  // Helper: add player to injury map — full name only, no last-name keys
-  // Last-name keys cause cross-sport contamination when merged into _injuryCache
+  // Helper: add player to injury map with all name variants
   function addToMap(name, status) {
     if (!name || !status) return;
     const n = name.toLowerCase().trim();
     map[n] = status;
     const parts = n.split(' ');
-    if (parts.length >= 2) {
-      map[`${parts[0]} ${parts[parts.length-1]}`] = status;  // first + last
-    }
+    const last = parts[parts.length - 1];
+    if (last.length > 3) map[last] = status;
+    if (parts.length >= 2) map[`${parts[0][0]} ${last}`] = status;
+    if (parts.length >= 2) map[`${parts[0]} ${last}`] = status;
   }
 
   // SOURCE 1: ESPN injuries endpoint (active injuries)
@@ -1103,10 +984,6 @@ function parseCsv(text){
   const ai=hdr.findIndex(h=>h.includes('avg'));
   // DraftKings sometimes includes injury status in the CSV
   const statusI=hdr.findIndex(h=>h.includes('status')||h.includes('injury'));
-  const idI=hdr.findIndex(h=>h==='id');
-  const rosterI=hdr.findIndex(h=>h==='roster_position');
-  // DK's injury_indicator column — 'O' = confirmed OUT on DK's platform
-  const injI=hdr.findIndex(h=>h.includes('injury_indicator')||h==='injury');
 
   return lines.slice(start+1).map(l=>{
     const v=l.split(',').map(c=>c.trim().replace(/"/g,''));
@@ -1117,11 +994,6 @@ function parseCsv(text){
     const salary=parseInt(v[si])||0;
     if(!name||salary<2000) return null;
     const gi2=v[gi]||'', myTeam=v[ti]||'';
-    const dkId = idI >= 0 ? (v[idI]||'').replace(/\D/g,'') : '';
-    const rosterPos = rosterI >= 0 ? (v[rosterI]||'').trim().toUpperCase() : '';
-    // DK's own injury indicator — 'O' means DK has confirmed this player OUT
-    const dkInjury = injI >= 0 ? (v[injI]||'').trim().toUpperCase() : '';
-    const dkConfirmedOut = dkInjury === 'O' || dkInjury === 'OUT';
     const teams=gi2.split('@').map(s=>s.trim().split(' ')[0]);
     const opp=teams.find(t=>t&&t!==myTeam)||'';
     // Get status from dedicated status/injury column
@@ -1165,49 +1037,14 @@ function parseCsv(text){
     // 2. avgPts = 0 = never played this season = not in lineup
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
-    // avgPts === 0 means DK has zero-projected this player — strong OUT signal at any salary.
-    // Raise threshold to $6,000 to catch mid-tier scratches (e.g. $4,400 players like Paredes).
-    // Exception: keep high-salary stars ($6,000+) since they could be newly added.
-    // Block non-starters using DK's own data — always in the CSV, never fails
-    // Signal 1: DK injury_indicator = 'O' (confirmed out by DK)
-    // Signal 2: avgPts = 0 (never scored = not in rotation)
-    // Signal 3: avgPts < 2.5 (Grichuk 0.5, Outman 1.4, Hernaiz 1.0 = bench only)
-    // Signal 4: avgPts < 4 + salary < $3,500 (cheap + cold = bench filler)
     const isBenchPlayer = rawPos !== 'P' && (
-      avgPtsVal === 0 ||
-      (avgPtsVal > 0 && avgPtsVal < 2.5) ||
-      (avgPtsVal > 0 && avgPtsVal < 4.0 && salary < 3500)
+      (salary > 0 && salary < 3300) ||         // cheap = bench
+      (avgPtsVal === 0 && salary < 4500)        // never scored = not starting
     );
-    // Pitcher-specific exclusions (applied before MLB optimizer runs)
-    // Sub-$5,500 pitchers are never starters on DK — they're long relievers or openers.
-    // avgPts === 0 = no history this season = not in rotation.
-    // Multi-signal SUB/spot-starter detection
-    // DK's UI shows "SUB" badge but CSV roster_position column uses position codes (SP/RP/P)
-    // Detect spot starters via multiple signals:
-    const isReliever = rawPos === 'P' && (
-      rosterPos === 'RP' ||        // DK marks true relievers as RP in CSV
-      rosterPos.includes('RP')     // any RP designation
-    );
-    // Spot starters: only block clear non-starters
-    // Must have BOTH low avgPts AND low salary to be a spot starter
-    // A $7,200 pitcher averaging 12pts might just be a streaky real starter
-    const salaryToPtsRatio = salary > 0 ? avgPtsVal / (salary / 1000) : 0;
-    // Spot starter: performance signal only — salary is not the signal
-    // A pitcher averaging < 10 DK pts regardless of price is a spot/volatile starter
-    const isSpotStarter = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 10;
-    // True new call-ups: in rotation but 0 DK history — caught by avgPts=0 gate
-    const isSubPitcher = isReliever || (rosterPos === 'SUB') || isSpotStarter;
-    // Bad pitcher: performance signals only
-    const isBadPitcher = rawPos === 'P' && (
-      avgPtsVal === 0 ||           // zero history = not in rotation
-      isSubPitcher                 // reliever, spot starter, or SUB badge
-    );
-    // Additional bench check: any hitter averaging under 3 DK pts is bench-only
-    // This catches players the above rules miss (e.g. avg=2.1 on $3,500 salary)
-    const isDeepBench = rawPos !== 'P' && avgPtsVal > 0 && avgPtsVal < 3.0;
-    // Near-zero but nonzero FPPG = spot starter / unreliable — cap score, don't exclude
-    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal > 0 && avgPtsVal < 2;
-    const finalIsOut = isOut || dkConfirmedOut || isBenchPlayer || isDeepBench || isBadPitcher || isManuallyOut(name);
+    // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
+    // Don't exclude but mark so calcEdgeScore caps them
+    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
+    const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
     const gameInfoLow = gi2.toLowerCase();
@@ -1215,7 +1052,7 @@ function parseCsv(text){
       || gameInfoLow.includes('suspended') || gameInfoLow.includes('cancelled');
     const finalStatus = isRainGame ? 'PPD' : status;
     const finalIsOutWithRain = finalIsOut || isRainGame;
-    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:avgPtsVal,status:finalStatus,isOut:finalIsOutWithRain,terriblePitcher,dkId};
+    return{name,salary,pos,team:myTeam,opp:opp?`vs ${opp}`:'',gameInfo:gi2,avgPts:avgPtsVal,status:finalStatus,isOut:finalIsOutWithRain,terriblePitcher};
   }).filter(Boolean);
 }
 
@@ -1953,19 +1790,7 @@ function analyzeLineupDNA(lineup, sp) {
     }
   }
 
-  // 5. MLB: game concentration check
-    const gameGroups = {};
-    valid.filter(l => l.player.pos !== 'P').forEach(l => {
-      const g = l.player.gameInfo || '';
-      gameGroups[g] = (gameGroups[g] || 0) + 1;
-    });
-    const maxGameCount = Math.max(0, ...Object.values(gameGroups));
-    if (maxGameCount >= 6) {
-      dnaScore -= 5;
-      warnings.push(`${maxGameCount} hitters from one game — high variance, one bad game ends the lineup`);
-    }
-
-  // 5b. MLB: 4+ hitters from same team
+  // 5. MLB: 4+ hitters from same team
   if (sp === 'mlb') {
     const teamCounts = {};
     valid.filter(l => l.player.pos !== 'P').forEach(l => {
@@ -2735,14 +2560,8 @@ function enrich(raw) {
     // Use Kalman-filtered projection as our best estimate
     // Kalman = optimal linear estimator combining all sources (Bayesian, Vegas, recent form)
     p._bayesianMean = bayesianMean;    // stored for reference
-    p._kalmanProjection = kalmanProjection; // ← THIS is what ceiling calc uses
+    p._kalmanProjection = kalmanProjection; // ← THIS is what ceiling calc should use
     p._projSigma = projSigma;
-
-    // engineProj = projPts (DK avg/Sleeper) as the display/selection projection
-    // Kalman is used internally for ceiling calculations only (via _kalmanProjection)
-    // NOT blended into projPts — Vegas team totals (4-5 runs) drag individual
-    // projections below DK pricing in early season, breaking lineup construction
-    const engineProj = projPts;
 
     // ── TIER 1 SIGNALS ──
     const recentForm   = calcRecentForm(p);
@@ -2763,59 +2582,6 @@ function enrich(raw) {
     const injuryRisk     = calcInjuryRiskPenalty(p);
     const practiceBoost  = calcPracticeBoost(p);
     const parkFactor     = calcParkFactorBoost(p, sport);
-
-    // ── STATCAST SIGNALS (MLB only) ───────────────────────────────
-    // xStats regression: if xBA >> BA, player is unlucky and due to improve
-    // Barrel% and hard hit% signal sustainable power
-    let statcastBoost = 0;
-    if (sport === 'mlb' && p.pos !== 'P' && statcastData?.players) {
-      const norm = (p.name||'').toLowerCase().replace(/\./g,'');
-      const sc = statcastData.players[norm] ||
-                 statcastData.players[norm.split(' ').slice(0,2).join(' ')];
-      if (sc) {
-        // Luck adjustment: under 0 = bad luck, above 0 = due for positive regression
-        if (sc.luckAdjust > 0.025) statcastBoost += 2;   // xBA > BA by 25pts = +2
-        if (sc.luckAdjust > 0.050) statcastBoost += 2;   // 50pts lucky gap = +4 total
-        if (sc.barrel > 12)  statcastBoost += 1;          // Elite barrel rate
-        if (sc.barrel > 18)  statcastBoost += 1;          // Elite+ barrel rate
-        if (sc.hardHit > 45) statcastBoost += 1;          // Hard contact above avg
-        if (sc.luckAdjust < -0.030) statcastBoost -= 2;  // Negative regression due
-        p._statcast = sc;
-      }
-    }
-
-    // ── UMPIRE SIGNALS (MLB pitchers only) ────────────────────────
-    // Pitcher-friendly umps boost K projection → higher ceiling
-    let umpireBoost = 0;
-    if (sport === 'mlb' && p.pos === 'P' && umpireData?.umps) {
-      // Match game to umpire by gameInfo string
-      const gameKey = Object.keys(umpireData.umps).find(k => {
-        const [away, home] = k.split('@');
-        return (p.gameInfo||'').includes(away) || (p.gameInfo||'').includes(home);
-      });
-      if (gameKey) {
-        const ump = umpireData.umps[gameKey];
-        // kRate > 0 = ump calls more Ks = pitcher gets more Ks = more DK pts
-        umpireBoost = Math.round((ump.kRate || 0) * 15); // ±8 pts for extreme umps
-        p._ump = ump;
-      }
-    }
-
-    // ── CALIBRATION CORRECTION ────────────────────────────────────
-    // After 5+ games, apply learned correction factor from historical errors
-    // If we consistently under-project a player, boost their projection
-    let calibrationBoost = 0;
-    if (calibrationData?.corrections) {
-      const key = (p.name||'').toLowerCase();
-      const cal = calibrationData.corrections[key];
-      if (cal && cal.count >= 5) {
-        // avgError = actual - projected. Positive = we under-projected
-        // Apply 60% of the correction to avoid overfitting
-        calibrationBoost = Math.round(cal.avgError * 0.6);
-        calibrationBoost = Math.max(-5, Math.min(5, calibrationBoost)); // cap at ±5
-        p._calibration = cal;
-      }
-    }
 
     // ── ADVANCED SIGNALS (no other tool uses) ──
     const propsDivergence    = calcPropsDivergence(p);          // Vegas props vs DK projection gap
@@ -2851,26 +2617,10 @@ function enrich(raw) {
     const isOut = p.isOut || ['out','o','ir','il','il10','il60','il-10','il-60','injured list','injured reserve','injured','inactive','na','sus','suspended','did not play','dnp','scratched','out indefinitely'].includes((status||'').toLowerCase().trim());
 
     // Combined flat boosts applied to projected points
-    // Recent H2H penalty: if this player's team has scored ≤2 runs in their last
-    // 2+ games against this specific opponent, penalize heavily.
-    // HOU vs COL: HOU scored 1 run 3 times — the engine keeps picking HOU because
-    // season-long DVP says COL pitching is bad, but recent form says otherwise.
-    let recentH2HPenalty = 0;
-    if (sport === 'mlb' && p.pos !== 'P' && p.recentFormData) {
-      const last5 = p.recentFormData.last5 || [];
-      const recentBusts = last5.slice(0, 3).filter(pts => pts <= 3).length;
-      if (recentBusts >= 2) {
-        // Player has scored ≤3 pts in 2 of their last 3 games = cold streak
-        recentH2HPenalty = -3;
-      }
-    }
-
     const flatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
                       weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
-                      Math.round(coachBoost * 0.4) + recentH2HPenalty +
-                      statcastBoost + umpireBoost + calibrationBoost;
-    // Use engineProj (Kalman-blended) as base, then apply signal boosts on top
-    const adjProjPts = Math.max(0, Math.round((engineProj + flatBoost) * 10) / 10);
+                      Math.round(coachBoost * 0.4); // 40% of coach signal into proj pts
+    const adjProjPts = Math.max(0, Math.round((projPts + flatBoost) * 10) / 10);
 
     const enriched = {
       ...p,
@@ -3566,23 +3316,7 @@ function score(p) { return calcEdgeScore(p); }
 function optimize(all, sp) {
   if (!all || !all.length) return [];
   const slots = SLOTS[sp];
-  // Final safety net: re-apply injury cache and manual OUT list at optimize time.
-  // This catches any player that slipped through earlier checks.
-  const eligible = all.filter(p => {
-    if (p.isOut || p.edgeScore <= 0) return false;
-    if (isManuallyOut(p.name)) return false;
-    // Re-check against live DK injury cache (populated by dk_status call)
-    if (window._injuryCache) {
-      const n = p.name.toLowerCase();
-      const idKey = p.dkId ? `id:${p.dkId}` : null;
-      // Full name match only — last-name matching causes cross-sport false positives
-      // (273 ESPN injuries includes all sports; "Smith" in NBA blocks "Cam Smith" in MLB)
-      if (window._injuryCache[n] || (idKey && window._injuryCache[idKey])) {
-        return false;
-      }
-    }
-    return true;
-  });
+  const eligible = all.filter(p => !p.isOut && p.edgeScore > 0);
 
   // ── MLB: TWO-PHASE OPTIMIZER ─────────────────────────────────────
   // Phase 1: Independently find best 2 pitchers
@@ -3592,21 +3326,7 @@ function optimize(all, sp) {
   // The stack team is chosen by which team's hitters have the most
   // viable DK slots and highest combined edge scores.
   if (sp === 'mlb') {
-    // Pitcher gates:
-    //   - salary >= $5,500 (DK starter floor)
-    //   - avgPts > 0 (has scored this season = in rotation)
-    //   - projPts >= 14 (projects a meaningful fantasy score — 9.6 pt pitchers are not GPP plays)
-    // Sort by blended score: 60% edge (ownership-adjusted upside) + 40% projection quality.
-    // Prevents ownership multiplier from floating bad-projection pitchers to the top.
-    const PITCHER_MIN_PROJ = 14;
-    const pitcherBlend = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts / 30) * 99) * 0.40;
-    const pitchers    = eligible
-      .filter(p =>
-        p.pos === 'P' && (p.avgPts || 0) > 0 &&
-        (p.projPts || 0) >= PITCHER_MIN_PROJ &&
-        p.dvpLabel?.badge !== 'bad matchup'
-      )
-      .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
+    const pitchers    = eligible.filter(p => p.pos === 'P').sort((a,b) => b.edgeScore - a.edgeScore);
     const hitters     = eligible.filter(p => p.pos !== 'P');
     const hitterSlots = slots.filter(s => s !== 'P');
 
@@ -3620,20 +3340,6 @@ function optimize(all, sp) {
     });
     // stackTeam is determined inside the pitcher loop (depends on which pitchers are picked)
     let bestMLBScore = -1, bestMLBLineup = null;
-    if (!pitchers.length) {
-      // No valid pitchers — means all pitchers in CSV have 0 avgPts or sub-$5,500 salary.
-      // This can happen with very early-season CSVs before pitchers have logged innings.
-      // In that case, relax to allow pitchers with salary >= 5500 regardless of avgPts.
-      const fallbackPitchers = eligible
-        .filter(p => p.pos === 'P' && (p.projPts || 0) >= PITCHER_MIN_PROJ)
-        .sort((a,b) => pitcherBlend(b) - pitcherBlend(a));
-      if (fallbackPitchers.length) {
-        console.warn('No pitchers with avgPts > 0 — using salary-only filter (early season slate)');
-        pitchers.push(...fallbackPitchers);
-      } else {
-        return null; // truly no pitchers available
-      }
-    }
     const topPitchers = pitchers.slice(0, 8);
 
     for (let i = 0; i < topPitchers.length; i++) {
@@ -3667,10 +3373,8 @@ function optimize(all, sp) {
           })
           .map(([team, t]) => {
             const viablePlayers = t.players.filter(p => p.edgeScore >= MIN_STACK_EDGE);
-            // Rank teams by composite score (edge + proj) so stacks have real upside
-            const compScore = p => p.edgeScore * 0.60 + Math.min(99, (p.projPts||0) * 5.5) * 0.40;
-            const top4avg = viablePlayers.sort((a,b)=>compScore(b)-compScore(a))
-              .slice(0,4).reduce((s,p)=>s+compScore(p),0) / Math.min(4, viablePlayers.length);
+            const top4avg = viablePlayers.sort((a,b)=>b.edgeScore-a.edgeScore)
+              .slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, viablePlayers.length);
             const coverage = Math.min(1.3, 1 + new Set(viablePlayers.map(p=>p.pos)).size * 0.05);
             return [team, top4avg * coverage];
           }).sort((a,b)=>b[1]-a[1]);
@@ -3692,32 +3396,14 @@ function optimize(all, sp) {
               .filter(h =>
                 h.team === stackOpponent &&
                 h.edgeScore >= 75 &&
-                h.salary >= 3500 &&
-                h.projPts >= 11 &&          // raised from 8 — Moniak-type busts eliminated
-                (h.avgPts || 0) >= 9 &&     // must have a real hit history, not just proj
-                h.dvpLabel?.badge !== 'bad matchup'
+                h.salary >= 3200 &&
+                h.projPts >= 8
               ).sort((a,b) => b.edgeScore - a.edgeScore)
           : [];
         const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
-        // Anti-correlation: if a pitcher is elite (proj >= 22), their game's hitters
-        // tend to score less — pitchers dominate → fewer runs → hitters bust.
-        // Nimmo in TEX/SEA 1-2 game is the textbook example.
-        // Penalize hitters from the same game as a high-proj pitcher we're using.
-        const elitePitcherGames = new Set();
-        [p1, p2].forEach(pitcher => {
-          if ((pitcher.projPts || 0) >= 22 && pitcher.gameInfo) {
-            elitePitcherGames.add(pitcher.gameInfo);
-          }
-        });
-        const availHitters = hitters.filter(h => !usedPitchers.has(h.name)).map(h => {
-          // If hitter is in a game where our pitcher is elite, reduce their effective edge
-          if (elitePitcherGames.has(h.gameInfo) && h.team !== stackTeam) {
-            return { ...h, edgeScore: Math.max(0, h.edgeScore - 15) };
-          }
-          return h;
-        });
+        const availHitters = hitters.filter(h => !usedPitchers.has(h.name));
 
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
@@ -3789,16 +3475,19 @@ function optimize(all, sp) {
     return (p.avgPts || 0) > 2; // pitchers must avg > 2 DK pts (very lenient)
   };
 
-  // viablePool: filter by performance signals only, not salary
-  // DK's pricing already reflects expected performance — trust it
   const viablePool = eligible.filter(p =>
-    hasValidHistory(p) &&
+    p.salary >= minSalaryFloor(p) &&
+    hasValidHistory(p) &&           // pitchers must have > 2 FPPG history
     (p.projPts || 0) >= minPts(p) &&
     (p.avgPts || p.projPts || 0) >= minAvgPts(p)
   );
+  // Never fall back to full eligible pool — that defeats all our filters.
+  // If viablePool is too small, relax thresholds incrementally but keep floor.
   let searchPool = viablePool;
   if (viablePool.length < slots.length + 2) {
+    // Relaxed pool: lower pts bar but keep salary floor (no bench players ever)
     searchPool = eligible.filter(p =>
+      p.salary >= minSalaryFloor(p) &&
       (p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 6 : 7) : 12) &&
       p.edgeScore >= 55
     );
@@ -3986,53 +3675,11 @@ function optimize(all, sp) {
 
 // Greedy slot filler — used by MLB pitcher-first optimizer
 function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringBackCandidate = null) {
-  // Sort by composite value: 60% edge (ownership leverage) + 40% projection quality.
-  const playerValue = p => {
-    const projScore = Math.min(99, (p.projPts || 0) * (p.pos === 'P' ? 3.3 : 5.5));
-    return p.edgeScore * 0.60 + projScore * 0.40;
-  };
-  // Dynamic hitter floor: use the 40th percentile of actual hitter projections on this slate
-  // Early season (few games) = low averages = lower floor automatically
-  // Prevents the 11pt fixed floor from wiping out the entire hitter pool
-  const hitterProjs = pool.filter(p => p.pos !== 'P' && (p.projPts||0) > 0)
-    .map(p => p.projPts).sort((a,b) => a-b);
-  const p30idx = Math.floor(hitterProjs.length * 0.30);
-  const slateHitterP30 = hitterProjs[p30idx] || 6;
-  // Clamp: min 5 (early-season small samples), max 13
-  // Early April: DK avgs are from 5-8 games — many legitimate players average 4-7
-  const hitterFloor = Math.min(13, Math.max(5, Math.round(slateHitterP30)));
-
-  // Catchers get a lower floor — thin position, early-season projs are 5-9pts
-  const catcherFloor = Math.max(3, hitterFloor - 4);
-
-  const filteredPool = pool.filter(p => {
-    if (p.pos === 'P') return true;
-    const floor = (p.pos === 'C') ? catcherFloor : hitterFloor;
-    if ((p.projPts || 0) < floor) return false;
-    if (p.dvpLabel?.badge === 'bad matchup') return false;
-    return true;
-  });
-
-  // Ensure every required position has at least one player in the pool
-  // If a position is completely filtered out, add the best available for that pos
-  const requiredPos = [...new Set(slots.filter(s => !['FLEX','UTIL','G','F'].includes(s)))];
-  const poolWithPos = [...filteredPool];
-  for (const pos of requiredPos) {
-    const hasPos = poolWithPos.some(p => p.pos === pos);
-    if (!hasPos) {
-      const best = pool.filter(p => p.pos === pos && !p.isOut)
-        .sort((a,b) => b.edgeScore - a.edgeScore)[0];
-      if (best) poolWithPos.push(best);
-    }
-  }
-
-  const sortBase = poolWithPos.length >= slots.length ? poolWithPos : pool;
-  const sorted = [...sortBase].sort((a,b) => playerValue(b) - playerValue(a));
+  const sorted = [...pool].sort((a,b) => b.edgeScore - a.edgeScore);
   const used   = new Set();
   let salLeft  = budget;
   const lineup = [];
   const MIN    = 2500;
-  const DK_MAX_PER_TEAM = 5; // DraftKings rule: max 5 players from same team
 
   // ── IDENTIFY STACK TEAM ───────────────────────────────────────────
   // Best team = highest avg edge score among top-4 hitters at 3+ positions
@@ -4075,26 +3722,19 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     const mustStack = needStack && stackCount < 4 && stackSlots < needMore;
     const wantStack = needStack && stackCount < 4;
 
-    // Count how many players per team are already in the lineup
-    const teamCount = {};
-    lineup.forEach(l => { if (l.player?.team) teamCount[l.player.team] = (teamCount[l.player.team] || 0) + 1; });
-    const teamFull = t => (teamCount[t] || 0) >= DK_MAX_PER_TEAM;
-
     if (needStack) {
       if (mustStack || wantStack) {
         // Find best stack team player at this position
         const stackPick = sorted.find(p =>
           !used.has(p.name) && p.salary <= maxBudget &&
-          positions.includes(p.pos) && p.team === stackTeam &&
-          !teamFull(p.team)
+          positions.includes(p.pos) && p.team === stackTeam
         );
         // ALWAYS pick stack player when building toward 4-man stack
         // The +60 stack bonus outweighs individual edge score differences
         // Only skip if stack player is completely unavailable (injured/no player at position)
         // C slot has naturally lower scores — use lower threshold for catchers
         const stackMinEdge = positions.includes('C') ? 50 : 60;
-        // Use same floor as hitterFloor — stack picks must meet the same standard
-        const stackMinPts  = positions.includes('C') ? Math.max(8, hitterFloor - 3) : hitterFloor;
+        const stackMinPts  = positions.includes('C') ? 6  : 7;
         if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || 0) >= stackMinPts) {
           pick = stackPick;
         }
@@ -4109,64 +3749,15 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       const isBringBackSlot = ['OF','FLEX','UTIL'].includes(slot);
       if (stackDone && isBringBackSlot && positions.includes(bringBackCandidate.pos)
           && bringBackCandidate.salary <= maxBudget
-          && bringBackCandidate.edgeScore >= 75
-          && !teamFull(bringBackCandidate.team)) {  // DK team cap
+          && bringBackCandidate.edgeScore >= 75) {
         pick = bringBackCandidate;
       }
     }
 
     // Best available fallback
-    // Hard floors: edge >= 72, hitters must project >= 8 pts, DK team cap
-    const EDGE_FLOOR    = 72;
-    const HITTER_PROJ = sp === 'mlb' ? 11 : sp === 'nba' ? 18 : 10;
-    const hitterOk = p => {
-      if (p.pos === 'P') return true;
-      if ((p.projPts || 0) < HITTER_PROJ) return false;
-      if (p.dvpLabel?.badge === 'bad matchup') return false;
-      return true;
-    };
-
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && p.edgeScore >= EDGE_FLOOR && hitterOk(p) && !teamFull(p.team)
-      );
-    }
-    // Relax edge floor but keep projection and team cap
-    if (!pick) {
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && hitterOk(p) && !teamFull(p.team)
-      );
-    }
-    // Last resort: bad matchup is always blocked, keep 8pt floor
-    if (!pick) {
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team)
-        && p.dvpLabel?.badge !== 'bad matchup'
-        && (p.pos === 'P' || (p.projPts||0) >= 8)
-      );
-    }
-    // True last resort: relax proj floor but never take bad matchup
-    if (!pick) {
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team) && p.dvpLabel?.badge !== 'bad matchup'
-      );
-    }
-    // Absolute emergency: still block bad matchup — a scratched slot is better than a bad matchup
-    if (!pick) {
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team) && p.dvpLabel?.badge !== 'bad matchup'
-      );
-    }
-    // True absolute last (only if ALL remaining players have bad matchup — extremely rare)
-    if (!pick) {
-      pick = sorted.find(p =>
-        !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos)
-        && !teamFull(p.team)
       );
     }
 
@@ -4192,28 +3783,19 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 
     // Prefer upgrading within stack team first to maintain the stack
     const inStack = cur.team === stackTeam && slot !== 'P';
-    // Recount team usage for upgrade pass (excluding current player being replaced)
-    const upgTeamCount = {};
-    lineup.forEach((l, li) => {
-      if (li !== i && l.player?.team) upgTeamCount[l.player.team] = (upgTeamCount[l.player.team] || 0) + 1;
-    });
-    const upgTeamFull = t => (upgTeamCount[t] || 0) >= DK_MAX_PER_TEAM;
-
     const upgrade = sorted.find(p =>
       !used.has(p.name) &&
       p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
       positions.includes(p.pos) &&
       p.edgeScore >= cur.edgeScore - 5 &&
-      !upgTeamFull(p.team) &&          // DK team cap
-      (!inStack || p.team === stackTeam)
+      (!inStack || p.team === stackTeam) // stay within stack if already in it
     ) || sorted.find(p =>
       !used.has(p.name) &&
       p.salary > cur.salary &&
       p.salary <= cur.salary + salLeft - 200 &&
       positions.includes(p.pos) &&
-      p.edgeScore >= cur.edgeScore - 5 &&
-      !upgTeamFull(p.team)             // DK team cap
+      p.edgeScore >= cur.edgeScore - 5
     );
 
     if (upgrade) {
@@ -4234,46 +3816,29 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 // Slate-relative position ceiling maxima
 let slatePosCeilMax = {};
 
-async function buildAndRender(quickRebuild = false) {
+async function buildAndRender() {
   // Guard: don't run if no players loaded yet
   if (!players || !players.length) {
     setDot('');
     setStatus('Upload a DraftKings CSV to build your lineup', 'var(--t3)');
     return;
   }
-  const scratchCount = manualOutNames.size;
-  if (scratchCount > 6) {
-    setStatus(`⚠️ ${scratchCount} players scratched — player pool is depleted. Clear scratches and re-scratch only OUT players.`, 'var(--red)');
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  setStatus(quickRebuild ? 'Rebuilding lineup...' : 'Building lineup...', 'var(--amber)');
+  setStatus('Building lineup...', 'var(--amber)');
   await new Promise(r => setTimeout(r, 30));
   try {
-    if (!quickRebuild) {
-      // Full build: recompute Nash, MC, and all ceilings
-      nashData = runNashSimulation((players || []).filter(p => !p.isOut).slice(0, 120), sport, 150);
+    nashData = runNashSimulation((players || []).filter(p => !p.isOut).slice(0, 120), sport, 150);
 
-      const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
-        .sort((a,b) => b.edgeScore - a.edgeScore).slice(0, 80);
-      const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
+    const eligibleForMC = players.filter(p => !p.isOut && p.projPts > 0)
+      .sort((a,b) => b.edgeScore - a.edgeScore).slice(0, 80);
+    const mcProbs = monteCarloFirstPlaceScore(eligibleForMC, sport, 300);
 
-      // Pass 1: ceilings
-      players = players.map(p => {
-        p._mcFirstPlaceProb = mcProbs[p.name] || 0;
-        const mates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-        p._ceiling = calcPlayerCeiling(p, mates);
-        return p;
-      });
-    } else {
-      // Quick rebuild: reuse existing ceilings/MC — only recalculate for players
-      // whose isOut status changed (scratched player + anyone who might replace them)
-      players = players.map(p => {
-        if (p.isOut) return p;
-        const mates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
-        p._ceiling = calcPlayerCeiling(p, mates);
-        return p;
-      });
-    }
+    // Pass 1: ceilings
+    players = players.map(p => {
+      p._mcFirstPlaceProb = mcProbs[p.name] || 0;
+      const mates = players.filter(t => t.name !== p.name && t.team === p.team && !t.isOut);
+      p._ceiling = calcPlayerCeiling(p, mates);
+      return p;
+    });
 
     // Build slate-relative position maxima
     slatePosCeilMax = {};
@@ -4292,238 +3857,78 @@ async function buildAndRender(quickRebuild = false) {
     // Pass 2: re-score
     players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
 
-    // ── SILENT OPTIMIZATION LOOP ─────────────────────────────────────
-    // Builds lineups silently until ALL rules pass, then presents the result.
-    // Never shows a lineup that fails any rule — keeps trying until it's right.
-    //
-    // Rules a lineup must pass before display:
-    //   1. No OUT / injured players
-    //   2. No player in live injury cache (game-day scratches)
-    //   3. Every individual player edge >= 72
-    //   4. Average edge across all 10 players >= 97
-    //
-    // Strategy: up to 25 attempts with growing jitter (±4 → ±28 pts).
-    // Wider jitter on later attempts forces the optimizer into different
-    // pitcher pairs and stack teams, not just noise around the same solution.
-    // Best qualifying lineup is presented; if none qualifies after 25 tries,
-    // the best-scoring attempt is shown with an honest gap message.
-
-    // Dynamic target: use the 85th percentile edge score of the eligible player pool
-    // This means we always target the top 15% of tonight's slate specifically,
-    // rather than a fixed number that may be easy or impossible depending on the slate.
-    // Floor at 95 (always a good lineup), ceiling at 108 (only on elite slates).
-    const eligibleScores = players
-      .filter(p => !p.isOut && p.edgeScore > 0)
-      .map(p => p.edgeScore)
-      .sort((a,b) => a - b);
-    const p85idx = Math.floor(eligibleScores.length * 0.85);
-    const slateP85 = eligibleScores[p85idx] || 95;
-    const BASE_TARGET = Math.min(99, Math.max(90, Math.round(slateP85)));
-    console.log(`Slate 85th percentile edge: ${slateP85.toFixed(1)} → target: ${BASE_TARGET}`);
-    // Individual edge floor: target 99 but relax based on what the slate supports
-    // 99 is the ideal — every player should have genuine leverage
-    // But if the slate's 70th pct edge is 85, requiring 99 blocks everyone
-    // So: use 99 as the starting floor, relax down to 75 via the adaptive target
-    // The adaptive TARGET_SCORE already handles relaxation per-attempt
-    const MIN_INDIV_EDGE = sport === 'mlb' ? 72 : sport === 'nba' ? 75 : 72;
-    const MAX_ATTEMPTS   = 25;
-
-    // Composite score: 65% edge (ownership leverage) + 35% projection quality
-    // This is what we actually optimize for — not pure edge, not pure projection.
-    const compositeScore = (candidate) => {
-      const valid = candidate.filter(l => l.player);
-      if (!valid.length) return 0;
-      const avgEdge = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
-      const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
-      return avgEdge * 0.65 + Math.min(99, totalProj / 2) * 0.35;
-    };
-
-    // Helper: run all pass/fail rules against a candidate lineup
-    function lineupPassesRules(candidate, targetScore) {
-      const valid = candidate.filter(l => l.player);
-      if (!valid.length) return false;
-
-      // Rule 1+2: no OUT players, no injury cache hits
-      for (const l of valid) {
-        const p = l.player;
-        if (p.isOut || p.edgeScore === 0) return false;
-        const n = p.name.toLowerCase();
-        const last = n.split(' ').pop();
-        // Full name only — last-name matching causes cross-sport false positives
-        if (window._injuryCache?.[n]) return false;
-      }
-
-      // Rule 3: individual edge floor
-      if (valid.some(l => l.player.edgeScore < MIN_INDIV_EDGE)) return false;
-
-      // Rule 4: average edge target (adaptive)
-      const avg = valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
-      if (avg < targetScore) return false;
-
-      // Rule 5: total projected points floor.
-      const totalProj = valid.reduce((s,l) => s + (l.player.projPts || 0), 0);
-      const MIN_TOTAL_PROJ = sport === 'mlb' ? 160 : sport === 'nba' ? 280 : 140;
-      if (totalProj < MIN_TOTAL_PROJ) return false;
-
-      // Rule 6: per-player projection floor + no bad matchup players
-      // NBA floor: 18pts (position avg is 28+, rarely changes)
-      // MLB floor: dynamic — 40th percentile of slate hitters (7-14 range)
-      // Early season has lower averages; fixed 11pt floor wipes out the whole pool
-      const HITTER_MIN_PROJ = sport === 'nba' ? 18 : sport === 'nfl' ? 10 : (() => {
-        const hProjs = players.filter(p => !p.isOut && p.pos !== 'P' && (p.projPts||0) > 0)
-          .map(p => p.projPts).sort((a,b) => a-b);
-        const idx = Math.floor(hProjs.length * 0.30);
-        return Math.min(13, Math.max(5, Math.round(hProjs[idx] || 6)));
-      })();
-      for (const l of valid) {
-        if (l.player.pos === 'P') continue;
-        if ((l.player.projPts || 0) < HITTER_MIN_PROJ) return false;
-        if (l.player.dvpLabel?.badge === 'bad matchup') return false;
-      }
-
-      // Rule 7: DraftKings team cap — max 5 players from any single team
-      const teamCounts = {};
-      for (const l of valid) {
-        const t = l.player.team || '';
-        teamCounts[t] = (teamCounts[t] || 0) + 1;
-        if (teamCounts[t] > 5) return false;
-      }
-
-      // Rule 8: Game concentration — max 6 hitters from same game
-      // 7+ from one game = catastrophic single-point-of-failure exposure
-      if (sport === 'mlb') {
-        const gameCounts = {};
-        for (const l of valid) {
-          if (l.player.pos === 'P') continue;
-          const g = l.player.gameInfo || '';
-          gameCounts[g] = (gameCounts[g] || 0) + 1;
-          if (gameCounts[g] > 6) return false;
-        }
-      }
-      return true;
-    }
-
-    function scoreCandidate(candidate) {
-      const valid = candidate.filter(l => l.player);
-      if (!valid.length) return 0;
-      return valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length;
-    }
-
+    // ── 97+ SCORE GATE ────────────────────────────────────────────────
+    // Only accept lineups scoring 97+. Try up to 3 passes.
+    // Each pass slightly varies the MC boost to explore different combos.
+    const MIN_ACCEPTABLE_SCORE = 97;
+    let attempts = 0;
     let bestLineupSoFar = null;
-    let bestCompSoFar   = 0;
-    let bestCleanLineup = null;
-    let bestCleanComp   = 0;
-    let qualifyingLineup = null;
+    let bestScoreSoFar = 0;
 
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // Adaptive target: relax by 1 every 8 attempts so the engine finds something real
-      // Relax 2pts every 3 attempts — reaches realistic floor by attempt 12
-      // Relax 2pts every 3 attempts. Floor at 80 allows thin early-season slates to build
-      // Relax 1pt per attempt — never below 85 (no more 75-edge lineups)
-      const TARGET_SCORE = Math.max(85, BASE_TARGET - attempt);
-      setStatus(`Building lineup… attempt ${attempt + 1}/${MAX_ATTEMPTS} (target: ${TARGET_SCORE})`, 'var(--amber)');
-      await new Promise(r => setTimeout(r, 0));
-
+    while (attempts < 3) {
       const candidate = optimize(players, sport);
-      if (!candidate?.length) { attempt++; continue; }
-
+      if (!candidate || !candidate.length) { attempts++; continue; }
       const candidateValid = candidate.filter(l => l.player);
-      const comp = compositeScore(candidate);  // 65% edge + 35% projection
-
-      // Track best by composite score — emergency fallback
-      // Apply minimum proj floor even here so bestLineupSoFar is never garbage
-      // Fallback only requires no OUT players and basic viability
-      // Proj floor is intentionally loose here — we'd rather show something
-      // than show "not enough eligible players"
-      const fallbackProjOk = candidateValid.every(l => {
-        const minP = sport === 'mlb' ? 5 : sport === 'nba' ? 12 : 5;
-        return l.player.pos === 'P' || (l.player.projPts || 0) >= minP;
-      });
-      const noOutInFallback = candidateValid.every(l => !l.player.isOut && l.player.edgeScore > 0);
-      const avgEdgeFallback = candidateValid.reduce((s,l)=>s+l.player.edgeScore,0)/candidateValid.length;
-      if (comp > bestCompSoFar && noOutInFallback && fallbackProjOk && avgEdgeFallback >= 82) {
-        bestCompSoFar   = comp;
+      if (!candidateValid.length) { attempts++; continue; }
+      const candidateScore = Math.round(
+        candidateValid.reduce((s,l) => s + l.player.edgeScore, 0) / candidateValid.length
+      );
+      if (candidateScore > bestScoreSoFar) {
+        bestScoreSoFar = candidateScore;
         bestLineupSoFar = candidate;
       }
-      // Track best clean lineup (every hitter ≥ 8 proj) by composite score
-      // Early season: use same dynamic floor as greedyFillSlots
-      // Fixed 11 blocks entire early-season hitter pools
-      const cleanHitterProjs = players.filter(p=>!p.isOut&&p.pos!=='P'&&(p.projPts||0)>0)
-        .map(p=>p.projPts).sort((a,b)=>a-b);
-      const cleanP30 = cleanHitterProjs[Math.floor(cleanHitterProjs.length*0.30)] || 6;
-      const cleanMinProj = sport === 'nba' ? 18 : sport === 'nfl' ? 10
-        : Math.min(13, Math.max(5, Math.round(cleanP30)));
-      const passesHitterFloor = candidateValid.every(l => {
-        if (l.player.pos === 'P') return true;
-        if ((l.player.projPts || 0) < cleanMinProj) return false;
-        if (l.player.dvpLabel?.badge === 'bad matchup') return false;
-        return true;
-      });
-      if (passesHitterFloor && comp > bestCleanComp) {
-        bestCleanComp   = comp;
-        bestCleanLineup = candidate;
-      }
-
-      // If all rules pass — we're done
-      if (lineupPassesRules(candidate, TARGET_SCORE)) {
-        qualifyingLineup = candidate;
-        const avgEdge = Math.round(candidateValid.reduce((s,l)=>s+l.player.edgeScore,0)/candidateValid.length);
-        const totalProj = Math.round(candidateValid.reduce((s,l)=>s+(l.player.projPts||0),0));
-        console.log(`✅ Qualifying lineup on attempt ${attempt+1} — edge ${avgEdge}, proj ${totalProj}`);
-        break;
-      }
-
-      console.log(`Attempt ${attempt + 1}: composite ${comp.toFixed(1)}, target edge ${TARGET_SCORE} — retrying`);
-
-      // Jitter grows with each attempt to explore more of the solution space
-      // Attempts 1-5: ±4-8 (nearby combos) | 6-15: ±10-20 (different stacks) | 16+: ±22-28 (wholesale change)
-      const jitter = 4 + attempt * 1.6;
+      if (candidateScore >= MIN_ACCEPTABLE_SCORE) break;
+      // Below threshold — jitter MC probs slightly to explore alternatives
       players = players.map(p => ({
         ...p,
-        edgeScore: Math.min(99, Math.max(0,
-          (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * jitter * 2 - jitter)
-        )),
-        _baseEdgeScore: p._baseEdgeScore ?? p.edgeScore,
+        _mcFirstPlaceProb: Math.min(0.99, (p._mcFirstPlaceProb || 0) * (0.9 + Math.random() * 0.2))
       }));
+      attempts++;
     }
+    lineup = bestLineupSoFar || optimize(players, sport) || [];
 
-    // Restore original edge scores — jitter was exploration only
-    players = players.map(p => {
-      if (p._baseEdgeScore !== undefined) {
-        const { _baseEdgeScore, ...rest } = p;
-        return { ...rest, edgeScore: _baseEdgeScore };
-      }
-      return p;
-    });
-
-    // Use qualifying lineup if found, otherwise best we got
-    // If no qualifying lineup found, try one final optimize with relaxed rules
-    if (!qualifyingLineup && !bestCleanLineup && !bestLineupSoFar) {
-      console.warn('All quality gates failed — building best-available lineup');
-      const lastChance = optimize(players, sport);
-      if (lastChance?.filter(l=>l.player).length > 0) {
-        bestLineupSoFar = lastChance;
-      }
-    }
-    lineup = qualifyingLineup || bestCleanLineup || bestLineupSoFar || [];
-
-    if (!lineup.length) {
+    // Show warning if we couldn't hit 97+
+    if (!lineup || !lineup.length) {
       setDot('error');
       setStatus('Not enough eligible players — check that lineups are posted on DK', 'var(--red)');
       return;
     }
-
     const finalValid = lineup.filter(l => l.player);
-    const finalScore = Math.round(
-      finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length
-    );
+    const finalScore = finalValid.length
+      ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
+      : 0;
 
-    if (!qualifyingLineup) {
-      const shownLineup = bestCleanLineup || bestLineupSoFar || [];
-      const shownValid  = shownLineup.filter(l => l.player);
-      const shownEdge   = shownValid.length ? Math.round(shownValid.reduce((s,l) => s + l.player.edgeScore, 0) / shownValid.length) : 0;
-      const shownProj   = Math.round(shownValid.reduce((s,l) => s + (l.player.projPts||0), 0));
-      setStatus(`Best available: ${shownEdge} edge / ${shownProj} proj pts — re-upload CSV closer to lock for better projections.`, 'var(--amber)');
+    // Flag any individual weak players in final lineup
+    // HARD BLOCK: refuse to render lineup if any OUT player slipped through
+    const outPlayers = finalValid.filter(l => l.player.isOut || l.player.edgeScore === 0);
+    if (outPlayers.length > 0) {
+      const names = outPlayers.map(l => l.player.name).join(', ');
+      setStatus(`🚨 OUT players detected: ${names} — rebuild required`, 'var(--red)');
+      setDot('error');
+      // Force remove them and rebuild once
+      players = players.map(p => 
+        outPlayers.some(l => l.player.name === p.name) 
+          ? { ...p, isOut: true, edgeScore: 0 } 
+          : p
+      );
+      lineup = optimize(players, sport);
+      // If still has bad players after one more attempt, stop and show error
+      const retryValid = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
+      if (retryValid.length < lineup.filter(l=>l.player).length) {
+        setStatus('Could not build valid lineup — some players may be unavailable', 'var(--amber)');
+      }
+    }
+
+    const weakPlayers = finalValid.filter(l =>
+      l.player.edgeScore < 60 ||
+      (l.player.projPts < 7 && l.player.pos !== 'P') ||
+      l.player.dvpLabel?.badge === 'bad matchup'
+    );
+    if (weakPlayers.length > 0) {
+      const names = weakPlayers.map(l => l.player.name).join(', ');
+      setStatus(`⚠️ Weak players in lineup: ${names} — consider rebuilding`, 'var(--amber)');
+    } else if (finalScore < MIN_ACCEPTABLE_SCORE) {
+      setStatus(`Best available: ${finalScore} edge — slate may not support 97+ tonight`, 'var(--amber)');
     }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
@@ -4541,8 +3946,6 @@ async function buildAndRender(quickRebuild = false) {
     if (currentScreen === 'signals') renderSignalDashboard();
     setDot('ok');
     setStatus('', '');
-    // Run AI validation agent after lineup renders
-    runLineupValidationAgent().catch(() => {});
   } catch(err) {
     console.error('EdgeIQ error:', err);
     setDot('error');
@@ -4552,7 +3955,17 @@ async function buildAndRender(quickRebuild = false) {
 
 function rebuildLineup() {
   if (!players || !players.length) { setStatus('Upload a CSV first', 'var(--amber)'); return; }
-  buildAndRender(true); // quickRebuild: reuse signals, run full optimization loop
+  players = players.map(p => ({
+    ...p,
+    edgeScore: p.isOut ? 0 : Math.max(30, Math.min(99, p.edgeScore + Math.round((Math.random()-0.5)*10)))
+  }));
+  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
+  lineup = optimize(players, sport);
+  const entropyScore = calcEntropyScore(lineup, nashData);
+  const valid = lineup.filter(l=>l.player);
+  const avgEdge = valid.length ? Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length) : 0;
+  const kelly = calcKellyAllocation(avgEdge, 150000, 5);
+  renderLineup(entropyScore, kelly);
 }
 
 function saveAndRebuild() {
@@ -4570,27 +3983,13 @@ function excludePlayer(name) {
     }
     return p;
   });
-  buildAndRender(true);
+  buildAndRender();
   setStatus(`🚫 ${name} banned — rebuilding without them`, 'var(--amber)');
 }
 
 // Manual OUT list — applied during CSV parse
-// Persist scratched players across sessions — Paredes stays out until manually cleared
-let manualOutNames = new Set(JSON.parse(localStorage.getItem('edgeiq_scratched') || '[]'));
+let manualOutNames = new Set();
 
-// Persist manual OUTs across CSV re-uploads (not page refresh — that clears the slate)
-function markPlayerOut(name) {
-  if (!name) return;
-  const n = name.toLowerCase().trim();
-  manualOutNames.add(n);
-  manualOutNames.add(n.split(' ').pop());
-  players = players.map(p =>
-    p.name.toLowerCase() === n ? { ...p, isOut: true, edgeScore: 0 } : p
-  );
-  localStorage.setItem('edgeiq_scratched', JSON.stringify([...manualOutNames]));
-  setStatus(`🚨 ${name} scratched — rebuilding...`, 'var(--red)');
-  buildAndRender(true);
-}
 
 function isManuallyOut(name) {
   if (!name) return false;
@@ -4604,18 +4003,6 @@ function clearExclusions() {
   excludedPlayers.clear();
   localStorage.removeItem('edgeiq_banned');
   setStatus('All bans cleared — re-upload CSV to rebuild', 'var(--cyan)');
-}
-
-function clearScratches() {
-  manualOutNames.clear();
-  localStorage.removeItem('edgeiq_scratched');
-  // Re-enable scratched players in the active pool
-  players = players.map(p => {
-    if (isManuallyOut(p.name)) return { ...p, isOut: false };
-    return p;
-  });
-  setStatus('Scratches cleared — rebuilding...', 'var(--cyan)');
-  buildAndRender(true);
 }
 
 // ── RENDER LINEUP ─────────────────────────────────────────────────
@@ -4668,26 +4055,13 @@ function renderLineup(entropyScore, kelly, dna, contest) {
 
     const dvpRankText = p.dvpRank ? `#${p.dvpRank} vs ${p.pos}` : '';
 
-    // Warn if DK's own avgPts is suspiciously low vs engine projection — possible same-day scratch
-    // If avgPts from CSV == 0 or <2 but engine projects >8, player may be OUT
-    const dkAvg = p.avgPts || 0;
-    const projDivergence = dkAvg > 0 && p.projPts > dkAvg * 3;
-    const possiblyOut = dkAvg === 0 && p.projPts > 5 && p.pos !== 'P';
-    const divergenceWarn = possiblyOut
-      ? `<div style="font-size:10px;color:var(--red);margin-top:2px">⚠️ DK shows 0 pts — verify not OUT</div>`
-      : projDivergence
-      ? `<div style="font-size:10px;color:var(--amber);margin-top:2px">⚠️ DK avg ${dkAvg.toFixed(1)} — verify status</div>`
-      : '';
-
     return `<div class="player-card">
       <div class="slot-pos pos-${l.slot}">${l.slot}</div>
       <div class="player-info">
         <div class="player-name">
           ${p.name} ${chips}
-          <button class="scratch-btn" onclick="markPlayerOut('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
-            title="Mark ${p.name} as scratched — removes from lineup immediately">✕ scratch</button>
-          <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}');event.stopPropagation()"
-            style="background:none;border:none;cursor:pointer;font-size:11px;opacity:0.3;margin-left:2px;padding:0;vertical-align:middle"
+          <button onclick="excludePlayer('${p.name.replace(/'/g,"\'")}')" 
+            style="background:none;border:none;cursor:pointer;font-size:12px;opacity:0.4;margin-left:4px;padding:0;vertical-align:middle" 
             title="Ban ${p.name} from future lineups">🚫</button>
         </div>
         <div class="player-meta">
@@ -4695,7 +4069,6 @@ function renderLineup(entropyScore, kelly, dna, contest) {
           ${p.opp?`<span style="color:${p.dvpLabel?.color||'var(--t2)'}">${p.dvpLabel?.label||p.opp}</span>`:''}
           ${dvpRankText?`<span style="font-size:10px;color:var(--t3)">${dvpRankText}</span>`:''}
         </div>
-        ${divergenceWarn}
       </div>
       <div class="player-right">
         <div class="player-pts" title="Ceiling: ${(p._ceiling||p.projPts).toFixed(1)}">${p.projPts.toFixed(1)}<span style="font-size:9px;color:var(--green);margin-left:3px">↑${(p._ceiling||p.projPts).toFixed(0)}</span></div>
@@ -4707,26 +4080,6 @@ function renderLineup(entropyScore, kelly, dna, contest) {
       </div>
     </div>`;
   }).join('');
-
-  // ── VERIFICATION BANNER ──────────────────────────────────────────
-  // Game-day scratches (like Paredes resting) are NOT in any free API.
-  // Show a persistent warning so user always checks DK before submitting.
-  const verifyBanner = `
-    <div id="verify-banner" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:11px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
-        <div style="font-weight:700;color:var(--amber)">⚠️ Verify before submitting</div>
-        ${manualOutNames.size > 0 ? `<button onclick="clearScratches()" style="background:none;border:1px solid rgba(245,158,11,.4);border-radius:4px;cursor:pointer;font-size:9px;color:var(--amber);padding:2px 6px">Clear ${manualOutNames.size} scratch${manualOutNames.size>1?'es':''}</button>` : ''}
-      </div>
-      <div style="color:var(--t2);line-height:1.5">Check each player has no OUT badge on DraftKings. Use <b style="color:var(--red)">✕ scratch</b> to remove them — persists until cleared.</div>
-      ${manualOutNames.size > 0 ? `<div style="margin-top:6px;font-size:10px;color:var(--red)">Currently scratched: ${[...manualOutNames].filter(n => n.length > 4).join(', ')}</div>` : ''}
-    </div>`;
-  const existingBanner = document.getElementById('verify-banner');
-  if (!existingBanner) {
-    const lineupEl = document.getElementById('lineup-list');
-    if (lineupEl && !document.getElementById('verify-banner')) {
-      lineupEl.insertAdjacentHTML('beforebegin', verifyBanner);
-    }
-  }
 
   // Kelly + DNA + Contest recommendation panel
   const kellyEl = document.getElementById('export-section');
@@ -5055,226 +4408,9 @@ function saveHistory() {
 }
 
 // ── EXPORT ────────────────────────────────────────────────────────
-
-// ── AI LINEUP VALIDATION AGENT ────────────────────────────────────────
-// Uses Claude API to review the final lineup before export.
-// Checks for game-day scratches, SUB pitchers, stack quality,
-// ownership concerns, and any DFS red flags the engine might miss.
-
-async function runLineupValidationAgent() {
-  const panel = document.getElementById('ai-validation');
-  if (!panel) return;
-
-  const valid = lineup.filter(l => l.player);
-  if (!valid.length) return;
-
-  // Build lineup summary for agents
-  const lineupSummary = valid.map(l => {
-    const p = l.player;
-    const tags = [
-      p.recentFormData?.trend === 'hot' ? 'HOT' : p.recentFormData?.trend === 'cold' ? 'COLD' : '',
-      p.dvpLabel?.badge || '',
-      p._ump ? `UMP:${p._ump.note}` : '',
-      p._statcast ? `xBA_gap:${(p._statcast.luckAdjust*1000).toFixed(0)}pts` : '',
-      p._calibration ? `cal:${p._calibration.avgError > 0 ? '+' : ''}${p._calibration.avgError.toFixed(1)}` : '',
-    ].filter(Boolean).join(', ');
-    return `${l.slot}: ${p.name} (${p.team}, $${p.salary}, proj ${p.projPts.toFixed(1)}, ${p.projOwn}% own, edge ${p.edgeScore}${tags ? ' ['+tags+']' : ''})`;
-  }).join('\n');
-
-  const totalProj = valid.reduce((s,l)=>s+(l.player.projPts||0),0).toFixed(1);
-  const avgOwn   = (valid.reduce((s,l)=>s+(l.player.projOwn||0),0)/valid.length).toFixed(1);
-  const avgEdge  = Math.round(valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length);
-  const teamCounts = {};
-  valid.filter(l=>l.player.pos!=='P').forEach(l=>{teamCounts[l.player.team]=(teamCounts[l.player.team]||0)+1;});
-  const stackInfo = Object.entries(teamCounts).sort((a,b)=>b[1]-a[1]).map(([t,n])=>`${t}×${n}`).join(', ');
-
-  // Show loading with 3 agent status
-  panel.style.display = 'block';
-  panel.innerHTML = `
-    <div style="background:rgba(0,0,0,.25);border:1px solid rgba(34,211,238,.2);
-      border-radius:10px;padding:14px;margin-bottom:8px;font-size:12px">
-      <div style="font-weight:700;color:var(--cyan);margin-bottom:10px;font-size:13px">
-        ⚡ AI Agent Team Analyzing...
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-        <div style="text-align:center;padding:8px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:6px">
-          <div style="font-size:10px;color:var(--green);font-weight:600">🐂 BULL</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:2px">Building case...</div>
-        </div>
-        <div style="text-align:center;padding:8px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:6px">
-          <div style="font-size:10px;color:var(--red);font-weight:600">🐻 BEAR</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:2px">Finding holes...</div>
-        </div>
-        <div style="text-align:center;padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px">
-          <div style="font-size:10px;color:var(--amber);font-weight:600">⚖️ JUDGE</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:2px">Waiting...</div>
-        </div>
-      </div>
-    </div>`;
-
-  try {
-    const response = await fetch('/api/proxy?action=ai_debate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lineupSummary, sport, totalProj, avgOwn, avgEdge, stackInfo }),
-      signal: AbortSignal.timeout(35000)
-    });
-    const data = await response.json();
-    if (!data.success) throw new Error(data.error || 'failed');
-
-    // Parse judge score
-    const scoreMatch = data.judge?.match(/SCORE:\s*(\d+)/i);
-    const score = scoreMatch ? parseInt(scoreMatch[1]) : 5;
-    const scoreColor = score >= 8 ? 'var(--green)' : score >= 6 ? 'var(--amber)' : 'var(--red)';
-    const riskMatch = data.judge?.match(/RISK:\s*([^|]+)/i);
-    const swapMatch = data.judge?.match(/SWAP:\s*(.+)/i);
-    const risk = riskMatch ? riskMatch[1].trim() : '';
-    const swap = swapMatch ? swapMatch[1].trim() : 'none';
-
-    const fmt = t => (t||'').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>');
-
-    panel.innerHTML = `
-      <div style="background:rgba(0,0,0,.25);border:1px solid var(--border);
-        border-radius:10px;overflow:hidden;margin-bottom:8px;font-size:11px">
-        <div style="padding:10px 14px;border-bottom:1px solid var(--border);
-          display:flex;align-items:center;justify-content:space-between">
-          <div style="font-weight:700;font-size:13px">⚡ AI Agent Debate</div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <span style="font-size:16px;font-weight:800;color:${scoreColor}">${score}/10</span>
-            <button onclick="runLineupValidationAgent()"
-              style="background:none;border:1px solid var(--border);color:var(--cyan);
-                cursor:pointer;font-size:10px;padding:3px 8px;border-radius:4px">Re-run</button>
-            <button onclick="document.getElementById('ai-validation').style.display='none'"
-              style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:16px;padding:0">×</button>
-          </div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--border)">
-          <div style="padding:10px 12px;border-right:1px solid var(--border)">
-            <div style="font-weight:700;color:var(--green);margin-bottom:6px;font-size:11px">🐂 BULL CASE</div>
-            <div style="color:var(--t2);line-height:1.5">${fmt(data.bull)}</div>
-          </div>
-          <div style="padding:10px 12px">
-            <div style="font-weight:700;color:var(--red);margin-bottom:6px;font-size:11px">🐻 BEAR CASE</div>
-            <div style="color:var(--t2);line-height:1.5">${fmt(data.bear)}</div>
-          </div>
-        </div>
-        <div style="padding:10px 14px;background:rgba(245,158,11,.05)">
-          <div style="font-weight:700;color:var(--amber);margin-bottom:6px;font-size:11px">⚖️ JUDGE VERDICT</div>
-          ${risk ? `<div style="margin-bottom:4px"><span style="color:var(--t3)">Risk: </span><span style="color:var(--t1)">${risk}</span></div>` : ''}
-          ${swap && swap.toLowerCase() !== 'none' ? `<div style="color:var(--amber)">⚡ Swap: ${swap}</div>` : `<div style="color:var(--green)">✅ No swaps needed</div>`}
-        </div>
-        <div style="padding:6px 14px;border-top:1px solid var(--border);
-          display:flex;justify-content:space-between;font-size:10px;color:var(--t3)">
-          <span>Groq llama-3.3-70b · 3 agents · EdgeIQ</span>
-          <button onclick="showResultLogger()"
-            style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:10px;padding:0">
-            Log last night's results →
-          </button>
-        </div>
-      </div>`;
-
-  } catch(e) {
-    panel.innerHTML = `
-      <div style="background:rgba(0,0,0,.1);border:1px solid var(--border);
-        border-radius:8px;padding:10px 14px;margin-bottom:8px;font-size:11px;color:var(--t3)">
-        AI validation unavailable — verify manually before submitting
-      </div>`;
-  }
-}
-
-// ── RESULT LOGGER ─────────────────────────────────────────────────
-// Allows entering actual scores after contest to feed calibration engine
-function showResultLogger() {
-  const valid = lineup.filter(l => l.player);
-  if (!valid.length) { alert('Build a lineup first to log results'); return; }
-
-  const rows = valid.map(l => {
-    const p = l.player;
-    return `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;
-        border-bottom:1px solid var(--border)">
-      <span style="font-size:12px;min-width:34px;padding:2px 5px;border-radius:4px;
-        text-align:center;background:rgba(34,211,238,.1);color:var(--cyan)">${l.slot}</span>
-      <span style="flex:1;font-size:12px;font-weight:500">${p.name}</span>
-      <span style="font-size:11px;color:var(--t3);min-width:40px">${p.projPts.toFixed(1)} proj</span>
-      <input type="number" placeholder="actual" step="0.25"
-        id="result_${p.name.replace(/[^a-z]/gi,'_')}"
-        style="width:70px;padding:4px 6px;border-radius:4px;border:1px solid var(--border);
-          background:var(--bg2);color:var(--t1);font-size:12px;text-align:center">
-    </div>`;
-  }).join('');
-
-  const modal = document.createElement('div');
-  modal.id = 'result-logger-modal';
-  modal.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:9999;
-    display:flex;align-items:center;justify-content:center;padding:20px`;
-  modal.innerHTML = `
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;
-      width:100%;max-width:420px;max-height:80vh;overflow-y:auto">
-      <div style="padding:14px 16px;border-bottom:1px solid var(--border);
-        display:flex;align-items:center;justify-content:space-between">
-        <div>
-          <div style="font-weight:700;font-size:14px">📊 Log Contest Results</div>
-          <div style="font-size:11px;color:var(--t3);margin-top:2px">
-            Enter actual DK scores to train the calibration engine
-          </div>
-        </div>
-        <button onclick="document.getElementById('result-logger-modal').remove()"
-          style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:20px">×</button>
-      </div>
-      <div style="padding:12px 16px">${rows}</div>
-      <div style="padding:12px 16px;border-top:1px solid var(--border)">
-        <button onclick="submitResults()"
-          style="width:100%;padding:10px;background:var(--cyan);color:#000;border:none;
-            border-radius:8px;font-weight:700;font-size:13px;cursor:pointer">
-          Submit Results → Train Engine
-        </button>
-        <div id="result-status" style="text-align:center;font-size:11px;color:var(--t3);margin-top:8px"></div>
-      </div>
-    </div>`;
-  document.body.appendChild(modal);
-}
-
-async function submitResults() {
-  const valid = lineup.filter(l => l.player);
-  const results = [];
-  for (const l of valid) {
-    const p = l.player;
-    const inputId = 'result_' + p.name.replace(/[^a-z]/gi,'_');
-    const input = document.getElementById(inputId);
-    const actual = input ? parseFloat(input.value) : null;
-    if (actual !== null && !isNaN(actual)) {
-      results.push({
-        name: p.name,
-        projected: p.projPts,
-        actual,
-        pos: p.pos,
-        team: p.team,
-        date: new Date().toISOString().split('T')[0],
-      });
-    }
-  }
-  if (!results.length) {
-    document.getElementById('result-status').textContent = 'Enter at least one actual score';
-    return;
-  }
-  document.getElementById('result-status').textContent = 'Saving...';
-  await writeCalibrationResults(sport, results);
-  document.getElementById('result-status').textContent =
-    `✅ ${results.length} results saved — engine will auto-correct projections`;
-  setTimeout(() => document.getElementById('result-logger-modal')?.remove(), 2000);
-}
-
 function exportLineup() {
   const valid = lineup.filter(l=>l.player);
   if (!valid.length) return;
-
-  // Confirmation gate: force user to verify player statuses before export.
-  // Game-day scratches are invisible to automated checks — this is the safety net.
-  const names = valid.map(l => l.player.name).join('\n• ');
-  const confirmed = window.confirm(
-    `Before submitting to DraftKings:\n\nVerify NONE of these players show an OUT badge in DK:\n\n• ${names}\n\nIf any show OUT, close this and tap ✕ scratch on that player.\n\nAll active? Click OK to export.`
-  );
-  if (!confirmed) return;
   const rows = ['Position,Name,Salary,ProjectedPts,EdgeScore,OwnershipPct,Fatigue,CircadianScore',
     ...valid.map(l=>`${l.slot},${l.player.name},${l.player.salary},${l.player.projPts},${l.player.edgeScore},${l.player.projOwn},${l.player.fatigue},${l.player.circadian}`)];
   const blob = new Blob([rows.join('\n')], {type:'text/csv'});
@@ -5295,12 +4431,6 @@ function var_(n) { const m={green:'var(--green)',amber:'var(--amber)',red:'var(-
 
 // ── AUTO REFRESH ──────────────────────────────────────────────────
 let autoRefreshTimer = null;
-let _lastPlayerPoolHash = '';
-
-function _hashPlayerPool(playerList) {
-  // Fingerprint the pool by name+isOut+salary so we only rebuild when data changes.
-  return playerList.map(p => `${p.name}:${p.isOut?1:0}:${p.salary}`).sort().join('|');
-}
 
 function startAutoRefresh() {
   stopAutoRefresh();
@@ -5311,24 +4441,18 @@ function startAutoRefresh() {
     if (!dgId) return;
     try {
       const r = await fetch(`/api/proxy?dgId=${dgId}&sport=${sport}`, {signal:AbortSignal.timeout(25000)});
-      if (!r.ok) { console.warn('Auto-refresh proxy error', r.status); return; }
       const json = await r.json();
       if (json.success && json.players?.length) {
         const newPlayers = enrich(parse(json.players));
-        const newHash = _hashPlayerPool(newPlayers);
-        if (newHash === _lastPlayerPoolHash) {
-          // Data hasn't changed — update timestamp but skip expensive rebuild
-          setStatus(`Checked · no changes · ${new Date().toLocaleTimeString()}`, 'var(--green)');
-          return;
-        }
-        _lastPlayerPoolHash = newHash;
         const prevOut = players.filter(p=>p.isOut).map(p=>p.name);
         const newOut  = newPlayers.filter(p=>p.isOut).map(p=>p.name);
         const justOut = newOut.filter(n=>!prevOut.includes(n));
         players = newPlayers;
         setStatus('Building lineup...', 'var(--amber)');
-        await new Promise(resolve => setTimeout(resolve, 20));
-        nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
+  // Use setTimeout so status update renders before blocking computation
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  nashData = runNashSimulation(players.filter(p=>!p.isOut).slice(0,120), sport, 150);
         lineup = optimize(players, sport);
         renderLineup(calcEntropyScore(lineup, nashData));
         renderIntelLive();
@@ -5338,7 +4462,7 @@ function startAutoRefresh() {
           setStatus(`Auto-updated · ${new Date().toLocaleTimeString()}`, 'var(--green)');
         }
       }
-    } catch(e) { console.warn('Auto-refresh failed:', e.message); }
+    } catch(e) { /* silent */ }
   }, 5*60*1000);
 }
 
@@ -5639,151 +4763,73 @@ function generateMultiLineups() {
 
   const maxExposure = parseInt(document.getElementById('exposure-slider').value) / 100;
   const n = multiLineupCount;
+  const slots = SLOTS[sport];
 
-  document.getElementById('multi-status').textContent = `Building ${n} lineups...`;
-  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px" id="multi-progress">Initializing...</div>`;
+  document.getElementById('multi-status').textContent = `Generating ${n} lineups...`;
+  document.getElementById('multi-results').innerHTML = `<div style="text-align:center;padding:20px;color:var(--t2);font-size:13px">Running optimizer ${n} times...</div>`;
 
-  // Run async so progress updates render
-  buildMultipleLineups(n, maxExposure).then(results => {
-    multiLineups = results;
+  // Run async to not block UI
+  setTimeout(() => {
+    multiLineups = buildMultipleLineups(n, maxExposure, slots);
     renderMultiLineups();
-  });
+  }, 50);
 }
 
-async function buildMultipleLineups(n, maxExposure) {
-  const slots = SLOTS[sport];
+function buildMultipleLineups(n, maxExposure, slots) {
   const eligible = players.filter(p => !p.isOut && p.edgeScore > 0);
   const results = [];
+
+  // Track exposure counts
   const exposureCounts = {};
   const maxAppearances = Math.ceil(n * maxExposure);
-  const usedStackTeams = new Set(); // track primary stack teams across lineups
 
-  // Identify the best stack teams ranked by composite score
-  const teamScores = {};
-  eligible.filter(p => p.pos !== 'P').forEach(p => {
-    if (!teamScores[p.team]) teamScores[p.team] = [];
-    teamScores[p.team].push(p.edgeScore * 0.6 + Math.min(99, (p.projPts||0) * 5.5) * 0.4);
+  // Get unique game stacks to target
+  const games = {};
+  eligible.forEach(p => {
+    if (p.gameInfo) games[p.gameInfo] = (games[p.gameInfo] || 0) + 1;
   });
-  const rankedTeams = Object.entries(teamScores)
-    .filter(([, scores]) => scores.length >= 3)
-    .map(([team, scores]) => {
-      const top4 = [...scores].sort((a,b)=>b-a).slice(0,4);
-      return [team, top4.reduce((s,v)=>s+v,0)/top4.length];
-    })
-    .sort((a,b) => b[1]-a[1])
-    .map(([team]) => team);
+  const gameList = Object.keys(games).sort((a,b) => games[b] - games[a]);
 
   for (let i = 0; i < n; i++) {
-    const progressEl = document.getElementById('multi-progress');
-    if (progressEl) progressEl.textContent = `Building lineup ${i+1} of ${n}...`;
-    await new Promise(r => setTimeout(r, 0)); // yield to browser
+    // Rotate which game stack to target
+    const targetGame = gameList[i % gameList.length];
 
-    // Determine target stack for this lineup
-    // Each lineup gets a different primary stack team — forces true diversification
-    const availableTeams = rankedTeams.filter(t => !usedStackTeams.has(t));
-    const targetTeam = availableTeams[0] || rankedTeams[i % rankedTeams.length];
-
-    // Build adjusted player pool:
-    // 1. Exposure cap — block overused players
-    // 2. Heavily boost target stack team so optimizer is forced to use them
-    // 3. Penalize players already used too many times
-    const adjustedPlayers = players.map(p => {
-      if (p.isOut) return p;
+    // Apply exposure limits — if player is at max, reduce their edge score
+    const adjustedPlayers = eligible.map(p => {
       const count = exposureCounts[p.name] || 0;
-      if (count >= maxAppearances) return { ...p, edgeScore: 0, isOut: true };
-
-      const diversityBoost = count === 0 ? 6 : count === 1 ? 2 : -3;
-      // Strong stack force: target team hitters get +25 boost to guarantee selection
-      const stackForce = (p.pos !== 'P' && p.team === targetTeam) ? 25 : 0;
+      if (count >= maxAppearances) {
+        return { ...p, edgeScore: 0 }; // blocked from further lineups
+      }
+      // Diversity bonus — players not yet used get a small boost
+      const diversityBoost = count === 0 ? 5 : count === 1 ? 2 : 0;
+      // Stack incentive — boost players from target game
+      const stackBoost = p.gameInfo === targetGame ? 8 : 0;
       return {
         ...p,
-        edgeScore: Math.min(120, Math.max(0, p.edgeScore + diversityBoost + stackForce)),
-        _multiTargetTeam: targetTeam,
+        edgeScore: Math.min(99, p.edgeScore + diversityBoost + stackBoost),
+        _targetGame: targetGame,
+        _inTargetStack: p.gameInfo === targetGame,
       };
     });
 
-    // Run the full silent optimization loop with all quality gates
-    // This ensures each lineup passes the same rules as the main lineup
-    const savedPlayers = players;
-    players = adjustedPlayers;
+    // Run optimizer on adjusted pool
+    const lineupResult = optimize(adjustedPlayers, sport);
+    const valid = lineupResult.filter(l => l.player);
 
-    let bestLineup = null;
-    let bestScore = 0;
-    const TARGET = 90; // slightly relaxed for multi — main lineup gets full 95+ target
-
-    for (let attempt = 0; attempt < 15; attempt++) {
-      const candidate = optimize(players, sport);
-      if (!candidate?.length) continue;
-      const valid = candidate.filter(l => l.player);
-      if (!valid.length) continue;
-
-      // Check quality gates
-      const avgEdge = valid.reduce((s,l)=>s+l.player.edgeScore,0)/valid.length;
-      const totalProj = valid.reduce((s,l)=>s+(l.player.projPts||0),0);
-      const hasOutPlayer = valid.some(l => l.player.isOut || l.player.edgeScore <= 0);
-      const hasBadHitter = valid.some(l => l.player.pos !== 'P' && (l.player.projPts||0) < 8);
-      const hasBadMatchup = valid.some(l => l.player.pos !== 'P' && l.player.dvpLabel?.badge === 'bad matchup');
-      const hasStackTeam = valid.some(l => l.player.team === targetTeam && l.player.pos !== 'P');
-
-      // Team cap check
-      const teamCounts = {};
-      valid.forEach(l => { const t = l.player.team||''; teamCounts[t]=(teamCounts[t]||0)+1; });
-      const violatesTeamCap = Object.values(teamCounts).some(c => c > 5);
-
-      const comp = avgEdge * 0.6 + Math.min(99, totalProj/2) * 0.4;
-      const passes = !hasOutPlayer && !hasBadHitter && !hasBadMatchup &&
-                     !violatesTeamCap && avgEdge >= TARGET && totalProj >= 140 && hasStackTeam;
-
-      if (comp > bestScore && !hasOutPlayer && !hasBadHitter && !violatesTeamCap) {
-        bestScore = comp;
-        bestLineup = candidate;
-      }
-      if (passes) break;
-
-      // Jitter for next attempt
-      players = players.map(p => ({
-        ...p,
-        edgeScore: Math.min(120, Math.max(0,
-          (p._baseEdgeScore ?? p.edgeScore) + (Math.random() * 8 - 4)
-        )),
-        _baseEdgeScore: p._baseEdgeScore ?? p.edgeScore,
-      }));
-    }
-
-    // Restore original player pool
-    players = savedPlayers;
-
-    if (bestLineup) {
-      const valid = bestLineup.filter(l => l.player);
-      // Restore original edge scores for display
-      const displayLineup = bestLineup.map(l => {
-        if (!l.player) return l;
-        const orig = savedPlayers.find(p => p.name === l.player.name);
-        return orig ? { ...l, player: orig } : l;
-      });
-      const displayValid = displayLineup.filter(l => l.player);
-
-      // Identify the actual primary stack team used
-      const hitterTeams = {};
-      displayValid.filter(l=>l.player.pos!=='P').forEach(l => {
-        hitterTeams[l.player.team] = (hitterTeams[l.player.team]||0)+1;
-      });
-      const primaryStack = Object.entries(hitterTeams).sort((a,b)=>b[1]-a[1])[0]?.[0] || targetTeam;
-
+    if (valid.length >= Math.floor(slots.length * 0.75)) {
       results.push({
-        lineup: displayLineup,
+        lineup: lineupResult,
         num: i + 1,
-        targetTeam,
-        primaryStack,
-        totalPts: Math.round(displayValid.reduce((s,l)=>s+(l.player.projPts||0),0)*10)/10,
-        avgEdge: Math.round(displayValid.reduce((s,l)=>s+l.player.edgeScore,0)/displayValid.length),
-        avgOwn:  Math.round(displayValid.reduce((s,l)=>s+(l.player.projOwn||0),0)/displayValid.length),
-        totalSal: displayValid.reduce((s,l)=>s+l.player.salary,0),
+        targetGame,
+        totalPts: valid.reduce((s,l) => s + l.player.projPts, 0),
+        avgEdge: Math.round(valid.reduce((s,l) => s + l.player.edgeScore, 0) / valid.length),
+        avgOwn: Math.round(valid.reduce((s,l) => s + l.player.projOwn, 0) / valid.length),
+        totalSal: valid.reduce((s,l) => s + l.player.salary, 0),
       });
 
-      usedStackTeams.add(primaryStack);
-      displayValid.forEach(l => {
-        exposureCounts[l.player.name] = (exposureCounts[l.player.name]||0) + 1;
+      // Update exposure counts
+      valid.forEach(l => {
+        exposureCounts[l.player.name] = (exposureCounts[l.player.name] || 0) + 1;
       });
     }
   }
@@ -5847,19 +4893,17 @@ function renderMultiLineups() {
       </div>`;
     }).join('');
 
-    const edgeColor = ml.avgEdge >= 100 ? 'var(--green)' : ml.avgEdge >= 90 ? 'var(--amber)' : 'var(--red)';
-    const projColor = ml.totalPts >= 160 ? 'var(--green)' : ml.totalPts >= 140 ? 'var(--amber)' : 'var(--red)';
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:10px">
       <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
         <div>
-          <span style="font-size:13px;font-weight:700">Lineup ${ml.num}</span>
-          <span style="font-size:11px;background:rgba(34,211,238,.12);color:var(--cyan);padding:2px 7px;border-radius:4px;margin-left:8px;font-weight:600">${ml.primaryStack||ml.targetTeam} stack</span>
+          <span style="font-size:13px;font-weight:600">Lineup ${ml.num}</span>
+          <span style="font-size:11px;color:var(--t3);margin-left:8px">stack: ${ml.targetGame?.split(' ')[0]||'mixed'}</span>
         </div>
-        <div style="display:flex;gap:10px;font-size:11px;font-family:var(--mono)">
-          <span style="color:${projColor}">${ml.totalPts.toFixed(1)}pts</span>
-          <span style="color:${edgeColor}">edge ${ml.avgEdge}</span>
-          <span style="color:var(--t2)">${ml.avgOwn}% own</span>
-          <span style="color:var(--t3)">$${(ml.totalSal/1000).toFixed(1)}K</span>
+        <div style="display:flex;gap:12px;font-size:11px;font-family:var(--mono)">
+          <span style="color:var(--green)">${ml.totalPts.toFixed(1)} pts</span>
+          <span>edge ${ml.avgEdge}</span>
+          <span style="color:var(--green)">${ml.avgOwn}% own</span>
+          <span style="color:var(--cyan)">$${(ml.totalSal/1000).toFixed(1)}K</span>
         </div>
       </div>
       <div style="padding:8px 14px">
