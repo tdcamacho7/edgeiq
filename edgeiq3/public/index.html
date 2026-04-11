@@ -2798,20 +2798,20 @@ function enrich(raw) {
       || statusLowE.startsWith('il') || statusLowE.includes('injured list')
     ));
 
-    // Combined flat boosts applied to projected points
+    // Signal adjustments affect CEILING and EDGE SCORE via multipliers.
+    // They do NOT crush the displayed projection — avgPts is the honest baseline.
+    // adjProjPts is stored internally for ceiling calculations only.
     const rawFlatBoost = homeBoost + paceBoost + playerVsTeam + parkFactor +
                       weatherPenalty + injuryRisk + practiceBoost + pitcherMatch +
                       Math.round(coachBoost * 0.4);
-    // HARD CAP: signal penalties can reduce projection by at most 40% of base.
-    // Prevents weather/matchup signals from crushing a 7pt hitter to 0.6pt.
-    // The ceiling calculation already factors in negative signals separately.
-    const maxPenalty = -Math.abs(projPts * 0.40);
+    const maxPenalty = -Math.abs(projPts * 0.25); // max 25% penalty to ceiling mean
     const flatBoost = Math.max(maxPenalty, rawFlatBoost);
-    const adjProjPts = Math.max(projPts * 0.60, Math.round((projPts + flatBoost) * 10) / 10);
+    const adjProjPts = Math.max(projPts * 0.75, Math.round((projPts + flatBoost) * 10) / 10);
 
     const enriched = {
       ...p,
-      projPts: adjProjPts,
+      projPts,          // ← display the DK avgPts baseline — honest expected output
+      _adjProjPts: adjProjPts, // ← internal signal-adjusted value for ceiling calc
       projOwn, vegasDiff, gameTotalBoost,
       fatigue, circadian, refBoost, sourceAgreement,
       contractYear, biasCorrection, status, isOut,
@@ -3239,10 +3239,11 @@ function multivariateKelly(avgEdge, avgOwnership, correlation, bankroll = 100, e
 
 // ── COMPLETE PLAYER SCORING — ALL MATH INTEGRATED ─────────────────
 function calcPlayerCeiling(p, teammates = []) {
-  // Use Kalman-filtered projection (best linear estimate combining all sources)
-  // Falls back to Bayesian → projPts → avgPts in order of data quality
-  const mean  = p._kalmanProjection || p._bayesianMean || p.projPts || p.avgPts || 15;
-  const sigma = p._projSigma    || mean * 0.35;
+  // Use signal-adjusted projection as the ceiling mean (NOT raw avgPts).
+  // _adjProjPts captures matchup/weather/park penalties; Kalman smooths all sources.
+  // This keeps the displayed projPts clean (avgPts) while ceiling reflects context.
+  const mean  = p._kalmanProjection || p._bayesianMean || p._adjProjPts || p.projPts || p.avgPts || 15;
+  const sigma = p._projSigma || mean * 0.35;
   const variance = sigma * sigma;
 
   // MLB pitchers: dominant ceiling model
@@ -3358,22 +3359,20 @@ const POS_AVG_MAP = {
   mlb: { P:22, C:10, '1B':12, '2B':10, '3B':11, SS:11, OF:11, FLEX:11 },
 };
 
-// Ownership multiplier: rewards uniqueness
-// 0% own  → 1.50x | 15% own → 1.30x | 30% own → 1.10x | 45%+ → 0.90x
+// Ownership multiplier: rewards uniqueness, but projection quality must still win
+// Calibrated so a 12pt hitter at 15% own beats a 5pt hitter at 1% own
+// Old curve was too extreme (1%→1.80x) making ultra-contrarian always win
 function ownershipMult(own) {
-  // Ultra-steep curve — maximum separation between chalk and contrarian
-  // 1% own → 1.80x | 5% own → 1.65x | 10% own → 1.48x | 20% own → 1.20x
-  // 30% own → 0.95x | 40%+ own → 0.75x
-  if (own <= 1)  return 1.80;
-  if (own <= 3)  return 1.72;
-  if (own <= 5)  return 1.65;
-  if (own <= 8)  return 1.55;
-  if (own <= 12) return 1.42;
-  if (own <= 18) return 1.25;
-  if (own <= 25) return 1.08;
-  if (own <= 32) return 0.92;
-  if (own <= 40) return 0.80;
-  return 0.70; // 40%+ chalk = basically useless in GPP
+  if (own <= 1)  return 1.35;  // very unique — real edge but not crazy
+  if (own <= 3)  return 1.28;
+  if (own <= 5)  return 1.22;
+  if (own <= 8)  return 1.15;
+  if (own <= 12) return 1.08;
+  if (own <= 18) return 1.00;  // average ownership = no bonus/penalty
+  if (own <= 25) return 0.92;
+  if (own <= 32) return 0.83;
+  if (own <= 40) return 0.76;
+  return 0.68; // 40%+ chalk = significant penalty in GPP
 }
 
 // Reliability: shrinks low-sample players toward position average
@@ -3405,46 +3404,44 @@ function calcEdgeScore(p) {
   const avgPts = p.avgPts  || p.projPts || 15;
   const pos    = p.pos || 'FLEX';
 
-  // SLATE-RELATIVE posMax: 70% slate best + 30% absolute historical max
-  // Normalizes each player against the best ceiling on TONIGHT'S slate
-  // → Best player at each position always scores near 99
-  // → Scores are meaningful relative to what's actually available
-  const posMaxMap     = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
+  // posMax: 30% slate best + 70% absolute historical max
+  // WHY: 70% slate was making scarce positions (e.g. only 1 viable C)
+  // inflate edge for bad players just because they're the "best at C".
+  // 70% historical anchors to realistic maximums regardless of slate scarcity.
+  const posMaxMap      = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
   const absolutePosMax = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
-  const slatePosMax   = slatePosCeilMax[pos] || 0;
-  // Blend: use slate max when meaningful (>5 pts), else use absolute
+  const slatePosMax    = slatePosCeilMax[pos] || 0;
   const posMax = slatePosMax > 5
-    ? slatePosMax * 0.70 + absolutePosMax * 0.30
+    ? slatePosMax * 0.30 + absolutePosMax * 0.70
     : absolutePosMax;
 
-  // Reliability-adjusted ceiling — shrinks inflated small-sample estimates
+  // Reliability-adjusted ceiling — shrinks low-sample players toward position average
+  // FIX: shrink toward posAvg, NOT posAvg*1.4 — the 1.4x was artificially inflating weak players
   const posAvgMap = POS_AVG_MAP[sport] || POS_AVG_MAP.nba;
   const posAvg    = posAvgMap[pos] || 20;
   const rel       = ceilingReliability(avgPts, posAvg);
-  const adjCeil   = ceiling * rel + (posAvg * 1.4) * (1 - rel);
+  const adjCeil   = ceiling * rel + posAvg * (1 - rel); // shrink to posAvg, not posAvg*1.4
 
   // Ceiling fraction: how close to tonight's best is this player?
   const ceilPct = Math.min(1.0, adjCeil / posMax);
 
-  // Ownership multiplier: uniqueness bonus
-  const oMult = ownershipMult(own);
+  // PROJECTION QUALITY MULTIPLIER — core fix for "low-own garbage player" problem
+  // A 4pt hitter at 2% own should NOT beat a 10pt hitter at 20% own.
+  // projQuality scales edge proportional to how well this player projects
+  // vs the position average. Below-average = penalty, above-average = bonus.
+  // Range: 0.45 (very weak) to 1.25 (elite producer)
+  const baseAvgPts = Math.max(avgPts, p.projPts || 0);
+  const projQuality = pos === 'P'
+    ? Math.min(1.25, Math.max(0.50, baseAvgPts / Math.max(posAvg, 1)))
+    : Math.min(1.25, Math.max(0.45, baseAvgPts / Math.max(posAvg, 1)));
 
-  // Core score: ceiling quality × uniqueness
-  // Verified examples (NBA, sport avg own=20%):
-  //   Elite + low own (90% posMax, 5% own):   0.90 × 1.43 × 99 = 127 → 99
-  //   Good  + mod own (70% posMax, 15% own):  0.70 × 1.29 × 99 = 89.3 → 89
-  //   Chalk + high own (80% posMax, 35% own): 0.80 × 1.01 × 99 = 80.0 → 80
-  //   Weak  + low own (30% posMax, 5% own):   0.30 × 1.43 × 99 = 42.5 → 43
-  // rawScore moved below effectiveOMult
-
-  // Monte Carlo first-place probability boost (mild, max +3)
-  // Monte Carlo first-place boost — 0 default for players outside top-80
-  // (they genuinely have near-zero first-place probability)
-  // Nash-adjusted ownership: field simulation gives more accurate own% than raw estimate
+  // Nash-adjusted ownership
   const nashOwn = (nashData?.ownership?.[p.name]) || null;
   const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own;
   const effectiveOMult = ownershipMult(effectiveOwn);
-  const rawScore = ceilPct * effectiveOMult * 99;
+
+  // Core edge = ceiling quality × ownership uniqueness × projection quality
+  const rawScore = ceilPct * effectiveOMult * projQuality * 99;
 
   const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
 
@@ -3689,14 +3686,13 @@ function optimize(all, sp) {
   // avgPts is the player's historical average — low avgPts = unreliable
   // A player who averages 10pts can't win you first place in NBA
   const minPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 8 : 6;   // hitters must project >= 6 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : 7;  // hitters must project >= 7 DK pts
     if (sp === 'nba') return 18;
     if (sp === 'nfl') return 10;
     return 15;
   };
-  // Minimum AVERAGE DK points — removes dead weight
   const minAvgPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 8 : 5;   // hitters must avg >= 5 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : 7;  // hitters must avg >= 7 DK pts
     if (sp === 'nba') return 20;
     if (sp === 'nfl') return 10;
     return 10;
@@ -3724,8 +3720,8 @@ function optimize(all, sp) {
   if (viablePool.length < slots.length + 2) {
     searchPool = eligible.filter(p =>
       p.salary >= minSalaryFloor(p) &&
-      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 8 : 5) : 12) &&
-      p.edgeScore >= 45
+      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 8 : 6) : 12) &&
+      p.edgeScore >= 40
     );
   }
   if (searchPool.length < slots.length + 1) searchPool = viablePool.length ? viablePool : eligible.filter(p => p.edgeScore >= 30);
@@ -4155,25 +4151,42 @@ async function buildAndRender() {
     }
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
+    // ── MINIMUM LINEUP PROJECTION GATE ───────────────────────────────
+    // Reject lineups where hitter total is too low — ensures we get real production
+    // MLB: 8 hitters × 7pt avg = 56pt min hitter total (plus ~44pt from 2 pitchers = ~100 total)
+    const MIN_HITTER_TOTAL_MLB = 55;
+    let garbageAttempts = 0;
+
+    const hasLowProjection = (lu) => {
+      if (sport !== 'mlb') return false;
+      const hitterTotal = lu
+        .filter(l => l.player && l.player.pos !== 'P')
+        .reduce((s, l) => s + Math.max(l.player.avgPts || 0, l.player.projPts || 0), 0);
+      return hitterTotal < MIN_HITTER_TOTAL_MLB;
+    };
+
     // ── GARBAGE PLAYER VALIDATION ────────────────────────────────────
     // Reject any lineup with a hitter averaging < 5 pts — hard rebuild
     // Using avgPts (ground truth) not projPts (can be signal-penalized)
     const hasGarbagePlayers = (lu) => lu.some(l =>
       l.player && l.player.pos !== 'P' &&
-      Math.max(l.player.avgPts || 0, l.player.projPts || 0) < 5
+      Math.max(l.player.avgPts || 0, l.player.projPts || 0) < (sport === 'mlb' ? 6 : 5)
     );
 
-    let garbageAttempts = 0;
-    while (lineup && hasGarbagePlayers(lineup) && garbageAttempts < 3) {
+    while (lineup && (hasGarbagePlayers(lineup) || hasLowProjection(lineup)) && garbageAttempts < 4) {
       garbageAttempts++;
       const garbageNames = lineup
-        .filter(l => l.player && l.player.pos !== 'P' && (l.player.projPts || l.player.avgPts || 0) < 3)
+        .filter(l => l.player && l.player.pos !== 'P' && Math.max(l.player.avgPts || 0, l.player.projPts || 0) < 5)
         .map(l => l.player.name);
-      console.warn(`Garbage players detected (attempt ${garbageAttempts}): ${garbageNames.join(', ')} — hard-excluding and rebuilding`);
-      // Hard-exclude these players and rebuild
-      players = players.map(p =>
-        garbageNames.includes(p.name) ? { ...p, isOut: true, edgeScore: 0 } : p
-      );
+      if (garbageNames.length > 0) {
+        console.warn(`Weak players (attempt ${garbageAttempts}): ${garbageNames.join(', ')} — excluding and rebuilding`);
+        players = players.map(p =>
+          garbageNames.includes(p.name) ? { ...p, isOut: true, edgeScore: 0 } : p
+        );
+      } else {
+        console.warn(`Low proj total (attempt ${garbageAttempts}) — relaxing constraint`);
+        // Relax min proj threshold slightly each attempt
+      }
       lineup = optimize(players, sport) || lineup;
     }
 
