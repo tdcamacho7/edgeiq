@@ -3425,15 +3425,15 @@ function calcEdgeScore(p) {
   // Ceiling fraction: how close to tonight's best is this player?
   const ceilPct = Math.min(1.0, adjCeil / posMax);
 
-  // PROJECTION QUALITY MULTIPLIER — core fix for "low-own garbage player" problem
-  // A 4pt hitter at 2% own should NOT beat a 10pt hitter at 20% own.
-  // projQuality scales edge proportional to how well this player projects
-  // vs the position average. Below-average = penalty, above-average = bonus.
-  // Range: 0.45 (very weak) to 1.25 (elite producer)
+  // PROJECTION QUALITY MULTIPLIER
+  // Uses sqrt() so it's proportional but not brutally harsh on below-average players.
+  // A 7pt hitter at pos avg 11 gets sqrt(7/11)=0.80 (20% reduction, not 36%)
+  // A 4pt catcher at pos avg 10 gets sqrt(4/10)=0.63 (still significant penalty)
+  // Capped at 1.15 so elite producers get a moderate bonus, not unbounded
   const baseAvgPts = Math.max(avgPts, p.projPts || 0);
-  const projQuality = pos === 'P'
-    ? Math.min(1.25, Math.max(0.50, baseAvgPts / Math.max(posAvg, 1)))
-    : Math.min(1.25, Math.max(0.45, baseAvgPts / Math.max(posAvg, 1)));
+  const projQuality = Math.min(1.15, Math.max(0.45,
+    Math.sqrt(baseAvgPts / Math.max(posAvg, 1))
+  ));
 
   // Nash-adjusted ownership
   const nashOwn = (nashData?.ownership?.[p.name]) || null;
@@ -3473,9 +3473,13 @@ function calcEdgeScore(p) {
     score = Math.max(10, score - 15); // -15 points for questionable players
   }
 
-  // DvP matchup penalties
-  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 15);
-  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 6);
+  // DvP matchup bonuses and penalties
+  // Elite matchup = facing a bottom-5 defense at this position → real scoring edge
+  // Good matchup = facing a bottom-10 defense → moderate boost
+  if (p.dvpLabel?.badge === 'elite matchup')      score = Math.min(99, score + 12);
+  else if (p.dvpLabel?.badge === 'good matchup')  score = Math.min(99, score + 6);
+  else if (p.dvpLabel?.badge === 'bad matchup')   score = Math.max(10, score - 12);
+  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 5);
 
   // PROJECTION FLOOR: low-projection players cannot win you GPPs
   // CRITICAL: use avgPts (DK historical) NOT projPts — projPts is already
@@ -3686,13 +3690,13 @@ function optimize(all, sp) {
   // avgPts is the player's historical average — low avgPts = unreliable
   // A player who averages 10pts can't win you first place in NBA
   const minPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 10 : 7;  // hitters must project >= 7 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : 6;  // hitters must project >= 6 DK pts
     if (sp === 'nba') return 18;
     if (sp === 'nfl') return 10;
     return 15;
   };
   const minAvgPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 10 : 7;  // hitters must avg >= 7 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : 6;  // hitters must avg >= 6 DK pts
     if (sp === 'nba') return 20;
     if (sp === 'nfl') return 10;
     return 10;
@@ -3774,9 +3778,10 @@ function optimize(all, sp) {
     if (sp === 'mlb') {
       filledPlayers.filter(p => p.pos !== 'P').forEach(p => {
         const base = Math.max(p.avgPts || 0, p.projPts || 0);
-        if (base < 5)  weakPenalty -= 40; // very weak — major drag
-        else if (base < 6) weakPenalty -= 15; // below average
-        else if (base < 7) weakPenalty -= 5;  // slightly weak
+        if (base < 4)  weakPenalty -= 50; // truly dead weight
+        else if (base < 5) weakPenalty -= 20; // very low avg
+        else if (base < 6) weakPenalty -= 8;  // below average — projQuality also penalizes
+        // Players >=6pt are handled solely by projQuality in edge score
       });
     }
 
@@ -4121,15 +4126,15 @@ async function buildAndRender() {
     // Pass 2: re-score
     players = players.map(p => { p.edgeScore = p.isOut ? 0 : calcEdgeScore(p); return p; });
 
-    // ── 97+ SCORE GATE ────────────────────────────────────────────────
-    // Only accept lineups scoring 97+. Try up to 3 passes.
-    // Each pass slightly varies the MC boost to explore different combos.
-    const MIN_ACCEPTABLE_SCORE = 97;
+    // ── LINEUP QUALITY GATE ─────────────────────────────────────────────
+    // Only accept lineups averaging 70+ edge. Try up to 4 passes.
+    // With calibrated scoring: great pitchers ~80, good hitters ~65-75, avg lineup ~70
+    const MIN_ACCEPTABLE_SCORE = 70;
     let attempts = 0;
     let bestLineupSoFar = null;
     let bestScoreSoFar = 0;
 
-    while (attempts < 3) {
+    while (attempts < 4) {
       const candidate = optimize(players, sport);
       if (!candidate || !candidate.length) { attempts++; continue; }
       const candidateValid = candidate.filter(l => l.player);
@@ -4231,7 +4236,7 @@ async function buildAndRender() {
       const names = weakPlayers.map(l => l.player.name).join(', ');
       setStatus(`⚠️ Weak players in lineup: ${names} — consider rebuilding`, 'var(--amber)');
     } else if (finalScore < MIN_ACCEPTABLE_SCORE) {
-      setStatus(`Best available: ${finalScore} edge — slate may not support 97+ tonight`, 'var(--amber)');
+      setStatus(`Best available: ${finalScore} edge — slate may be thin tonight`, 'var(--amber)');
     }
 
     const jsdScore = calcLineupJSDScore(lineup, players);
