@@ -3324,19 +3324,25 @@ function calcPlayerCeiling(p, teammates = []) {
     : 1.0;
 
   // Ensemble ceiling: weighted average of all three methods
-  // GEV is most theoretically rigorous, gets highest weight
-  const rawCeil = (gevCeil * 0.45 + gammaCeil * 0.35 + signalCeil * 0.20) * stackBoost;
+  // For MLB hitters: weight signalCeil more (it scales to 2.5x properly)
+  // GEV/Gamma are theoretically rigorous but too conservative for DFS (give ~1.4x avg)
+  const rawCeil = (sport === 'mlb' && p.pos !== 'P')
+    ? (signalCeil * 0.50 + gevCeil * 0.30 + gammaCeil * 0.20) * stackBoost
+    : (gevCeil * 0.45 + gammaCeil * 0.35 + signalCeil * 0.20) * stackBoost;
 
-  // Cap at realistic sport-specific maximum
-  // MLB hitters: 4x (can score 40-50 on HR+multi-hit nights from 10pt avg)
-  // MLB pitchers handled separately above
-  // NBA: 2.5x (great game = 2.5x average)
-  // NFL: 3.0x (explosive games possible for WR/QB)
   const maxMultiplier = sport === 'mlb' ? 4.5
     : sport === 'nba' ? 2.5
     : sport === 'nfl' ? 3.0
     : 2.5;
   const cappedCeil = Math.min(rawCeil, mean * maxMultiplier);
+
+  // MLB hitter GPP ceiling floor: realistic outcome on a great night
+  // A 10pt avg hitter can score 25-35pt (HR + doubles + RBIs + runs)
+  // GEV/Gamma underestimate this — enforce 2.8x minimum for GPP purposes
+  if (sport === 'mlb' && p.pos !== 'P') {
+    const gppFloor = mean * 2.8;
+    return Math.round(Math.max(gppFloor, cappedCeil) * 10) / 10;
+  }
 
   return Math.round(Math.max(mean, cappedCeil) * 10) / 10;
 }
@@ -3612,7 +3618,25 @@ function optimize(all, sp) {
             const vegasBoost = vegasImplied > 5 ? 1.20 : gameTotal > 9.5 ? 1.15 : gameTotal > 8.5 ? 1.08 : 1.0;
             return [team, top4avg * coverage * vegasBoost];
           }).sort((a,b)=>b[1]-a[1]);
-        const stackTeam = validTeamRankings[0]?.[0] || null;
+
+        // Fallback: if no team has 4 viable players, try 3-player teams at 2+ positions
+        let stackTeam = validTeamRankings[0]?.[0] || null;
+        if (!stackTeam) {
+          const fallbackRankings = Object.entries(teamData)
+            .filter(([team, t]) => {
+              if (blockedFromStack.has(team)) return false;
+              const vp = t.players.filter(p =>
+                p.edgeScore >= 40 && Math.max(p.avgPts || 0, p.projPts || 0) >= 5
+              );
+              return vp.length >= 3 && new Set(vp.map(p => p.pos)).size >= 2;
+            })
+            .map(([team, t]) => {
+              const vp = t.players.filter(p => p.edgeScore >= 40).sort((a,b) => b.edgeScore - a.edgeScore);
+              const vegasBoost = (vp[0]?.gameTotal || 0) > 9 ? 1.10 : 1.0;
+              return [team, vp.slice(0,3).reduce((s,p) => s + p.edgeScore, 0) / 3 * vegasBoost];
+            }).sort((a,b) => b[1] - a[1]);
+          stackTeam = fallbackRankings[0]?.[0] || null;
+        }
 
         // ── BRING-BACK: Game-stack the OPPOSING team of our main stack ──
         // Winner's structure: Bellinger(NYY) + Ramirez+Edwards(MIA) = both teams in MIA@NYY
@@ -4013,9 +4037,9 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
         (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 6)
       ) || sorted.find(p =>
-        // True last resort: relax to avgPts >= 4
+        // Last resort: 5.5pt minimum — never pick bench/garbage players
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
-        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 4)
+        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 5.5)
       );
     }
 
@@ -4129,7 +4153,7 @@ async function buildAndRender() {
     // ── LINEUP QUALITY GATE ─────────────────────────────────────────────
     // Only accept lineups averaging 70+ edge. Try up to 4 passes.
     // With calibrated scoring: great pitchers ~80, good hitters ~65-75, avg lineup ~70
-    const MIN_ACCEPTABLE_SCORE = 70;
+    const MIN_ACCEPTABLE_SCORE = 60;
     let attempts = 0;
     let bestLineupSoFar = null;
     let bestScoreSoFar = 0;
