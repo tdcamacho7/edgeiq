@@ -3477,17 +3477,18 @@ function calcEdgeScore(p) {
   }
 
   // DvP matchup penalties
-  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 20);
-  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 10);
+  if (p.dvpLabel?.badge === 'bad matchup')       score = Math.max(10, score - 15);
+  else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 6);
 
   // PROJECTION FLOOR: low-projection players cannot win you GPPs
-  // Low ownership doesn't help if a player scores 0-3 pts.
-  // These caps prevent sub-5pt hitters from getting inflated edge scores.
+  // CRITICAL: use avgPts (DK historical) NOT projPts — projPts is already
+  // penalized by signals and can be artificially crushed to 4pt from a real 7pt hitter.
+  // avgPts is the ground truth: what this player actually scores on average.
   if (pos !== 'P') {
-    const projPtsCheck = p.projPts || p.avgPts || 0;
-    if (projPtsCheck < 3)  score = Math.min(score, 20); // basically zero — dead play
-    if (projPtsCheck < 5)  score = Math.min(score, 45); // very low projection — huge risk
-    if (projPtsCheck < 7)  score = Math.min(score, 65); // below average — soft cap
+    const baseCheck = Math.max(p.avgPts || 0, p.projPts || 0); // highest of raw or adjusted
+    if (baseCheck < 3)  score = Math.min(score, 20); // never played = dead play
+    if (baseCheck < 5)  score = Math.min(score, 45); // truly very low avg
+    // Removed the < 7 cap — normal MLB hitters avg 6-10pts and shouldn't be capped at 65
   }
 
   // Terrible pitcher (negative FPPG avg) — hard cap, never pick
@@ -3586,25 +3587,28 @@ function optimize(all, sp) {
 
         // Re-rank stack teams excluding all blocked teams
         // Score = avg edge of top-4 viable hitters × positional coverage × Vegas boost
-        // REQUIRE: team must have 3+ players with edge >= 50 at 3+ positions
-        const MIN_STACK_EDGE = 45; // slightly looser — stack bonus compensates
+        // REQUIRE: team must have 4+ players with edge >= 45 AND avgPts >= 6
+        const MIN_STACK_EDGE = 45;
         const validTeamRankings = Object.entries(teamData)
           .filter(([team, t]) => {
             if (blockedFromStack.has(team)) return false;
-            const viablePlayers = t.players.filter(p => p.edgeScore >= MIN_STACK_EDGE && (p.projPts || p.avgPts || 0) >= 5);
+            const viablePlayers = t.players.filter(p =>
+              p.edgeScore >= MIN_STACK_EDGE &&
+              Math.max(p.avgPts || 0, p.projPts || 0) >= 6
+            );
             const viablePositions = new Set(viablePlayers.map(p => p.pos));
-            return viablePlayers.length >= 3 && viablePositions.size >= 3;
+            // Need 4 viable players at 3+ positions — guarantees a real 4-man stack exists
+            return viablePlayers.length >= 4 && viablePositions.size >= 3;
           })
           .map(([team, t]) => {
             const viablePlayers = t.players
-              .filter(p => p.edgeScore >= MIN_STACK_EDGE && (p.projPts || p.avgPts || 0) >= 5)
+              .filter(p => p.edgeScore >= MIN_STACK_EDGE && Math.max(p.avgPts || 0, p.projPts || 0) >= 6)
               .sort((a,b) => b.edgeScore - a.edgeScore);
             const top4avg = viablePlayers.slice(0,4).reduce((s,p)=>s+p.edgeScore,0) / Math.min(4, viablePlayers.length);
             const coverage = Math.min(1.3, 1 + new Set(viablePlayers.map(p=>p.pos)).size * 0.05);
-            // Vegas boost: teams with high implied runs are better stacks
             const vegasImplied = viablePlayers[0]?.vegasImplied || 0;
             const gameTotal = viablePlayers[0]?.gameTotal || 0;
-            const vegasBoost = vegasImplied > 5 ? 1.15 : gameTotal > 9 ? 1.10 : 1.0;
+            const vegasBoost = vegasImplied > 5 ? 1.20 : gameTotal > 9.5 ? 1.15 : gameTotal > 8.5 ? 1.08 : 1.0;
             return [team, top4avg * coverage * vegasBoost];
           }).sort((a,b)=>b[1]-a[1]);
         const stackTeam = validTeamRankings[0]?.[0] || null;
@@ -3624,9 +3628,9 @@ function optimize(all, sp) {
           ? hitters
               .filter(h =>
                 h.team === stackOpponent &&
-                h.edgeScore >= 75 &&
+                h.edgeScore >= 70 &&
                 h.salary >= 3200 &&
-                h.projPts >= 8
+                Math.max(h.avgPts || 0, h.projPts || 0) >= 7
               ).sort((a,b) => b.edgeScore - a.edgeScore)
           : [];
         const bringBackCandidate = bringBackCandidates[0] || null;
@@ -3711,22 +3715,20 @@ function optimize(all, sp) {
 
   const viablePool = eligible.filter(p =>
     p.salary >= minSalaryFloor(p) &&
-    hasValidHistory(p) &&           // pitchers must have > 2 FPPG history
-    (p.projPts || 0) >= minPts(p) &&
-    (p.avgPts || p.projPts || 0) >= minAvgPts(p)
+    hasValidHistory(p) &&
+    // Use avgPts as ground truth — projPts can be crushed by signals
+    Math.max(p.avgPts || 0, p.projPts || 0) >= minPts(p) &&
+    (p.avgPts || 0) >= minAvgPts(p)
   );
-  // Never fall back to full eligible pool — that defeats all our filters.
-  // If viablePool is too small, relax thresholds incrementally but keep floor.
   let searchPool = viablePool;
   if (viablePool.length < slots.length + 2) {
-    // Relaxed pool: lower pts bar but keep salary floor (no bench players ever)
     searchPool = eligible.filter(p =>
       p.salary >= minSalaryFloor(p) &&
-      (p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 6 : 7) : 12) &&
-      p.edgeScore >= 55
+      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 8 : 5) : 12) &&
+      p.edgeScore >= 45
     );
   }
-  if (searchPool.length < slots.length + 1) searchPool = viablePool.length ? viablePool : eligible.filter(p => p.edgeScore >= 40);
+  if (searchPool.length < slots.length + 1) searchPool = viablePool.length ? viablePool : eligible.filter(p => p.edgeScore >= 30);
 
   // Rebuild slot pools from viable pool
   const slotPools = slots.map(slot => {
@@ -3769,6 +3771,18 @@ function optimize(all, sp) {
 
     // Individual edge score sum
     const individualSum = filledPlayers.reduce((s,p) => s + (p.edgeScore || 0), 0);
+
+    // Weak player penalty: every hitter with avgPts < 6 drags the lineup score down
+    // This prevents low-edge / low-projection players from slipping in via stack forcing
+    let weakPenalty = 0;
+    if (sp === 'mlb') {
+      filledPlayers.filter(p => p.pos !== 'P').forEach(p => {
+        const base = Math.max(p.avgPts || 0, p.projPts || 0);
+        if (base < 5)  weakPenalty -= 40; // very weak — major drag
+        else if (base < 6) weakPenalty -= 15; // below average
+        else if (base < 7) weakPenalty -= 5;  // slightly weak
+      });
+    }
 
     // Correlation bonus: stacked players hit ceiling together (Gumbel copula)
     // QB+WR same team, NBA same-game players, MLB same-team hitters
@@ -3828,7 +3842,7 @@ function optimize(all, sp) {
     const diffBonus = Math.max(-20, Math.min(20, (25 - avgOwn) * 0.8));
 
     // Final lineup score: average per-player score + bonuses per player
-    return (individualSum + corrBonus + diffBonus) / n;
+    return (individualSum + corrBonus + diffBonus + weakPenalty) / n;
   }
 
   function search(slotIdx, salLeft, currentScore, currentLineup, usedNames) {
@@ -3967,13 +3981,14 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
         // The +60 stack bonus outweighs individual edge score differences
         // Lower thresholds vs non-stack fill — we NEED the stack to win GPPs
         const stackMinEdge = positions.includes('C') ? 40 : 50;
-        const stackMinPts  = positions.includes('C') ? 4  : 5;
-        if (stackPick && stackPick.edgeScore >= stackMinEdge && (stackPick.projPts || stackPick.avgPts || 0) >= stackMinPts) {
+        const stackMinAvg  = positions.includes('C') ? 4  : 6; // avgPts floor for stack players
+        if (stackPick && stackPick.edgeScore >= stackMinEdge &&
+            Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= stackMinAvg) {
           pick = stackPick;
         }
-        // If no viable stack player at this threshold, take any stack player
-        // (a weak stack player is still better than breaking the stack)
-        if (!pick && mustStack && stackPick && (stackPick.projPts || stackPick.avgPts || 0) >= 3) {
+        // If mustStack and no viable player, take any stack player with avgPts >= 4
+        if (!pick && mustStack && stackPick &&
+            Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= 4) {
           pick = stackPick;
         }
       }
@@ -3991,16 +4006,15 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
       }
     }
 
-    // Best available fallback — minimum projection floor enforced
-    // Never pick a hitter projecting < 5 pts as a fallback fill
+    // Best available fallback — minimum projection floor enforced using avgPts as ground truth
     if (!pick) {
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
-        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 5)
+        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 6)
       ) || sorted.find(p =>
-        // True last resort: relax projection floor but still require > 3 pts
+        // True last resort: relax to avgPts >= 4
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
-        (slot === 'P' || (p.projPts || p.avgPts || 0) >= 3)
+        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 4)
       );
     }
 
@@ -4142,11 +4156,11 @@ async function buildAndRender() {
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // ── GARBAGE PLAYER VALIDATION ────────────────────────────────────
-    // Reject any lineup with a hitter projecting < 3 pts — rebuild until clean
-    // This catches Chapman-type situations where signal penalties crush a projection
+    // Reject any lineup with a hitter averaging < 5 pts — hard rebuild
+    // Using avgPts (ground truth) not projPts (can be signal-penalized)
     const hasGarbagePlayers = (lu) => lu.some(l =>
       l.player && l.player.pos !== 'P' &&
-      (l.player.projPts || l.player.avgPts || 0) < 3
+      Math.max(l.player.avgPts || 0, l.player.projPts || 0) < 5
     );
 
     let garbageAttempts = 0;
