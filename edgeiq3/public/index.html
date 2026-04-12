@@ -3500,16 +3500,13 @@ function calcEdgeScore(p) {
   // Terrible pitcher (negative FPPG avg) — hard cap, never pick
   if (p.terriblePitcher) score = Math.min(score, 30);
 
-  // GPP PITCHER CHALK KILLER: pitchers above 25% own are terrible GPP plays
-  // Burns at 41.8% — if he hits, everyone wins with you. Zero leverage.
-  // Hard cap: >35% own pitcher → max 55 edge | >25% own → -20 penalty
+  // GPP PITCHER CHALK KILLER: only penalize truly extreme pitcher chalk (35%+)
   if (pos === 'P') {
-    // Minimum-salary / spot starter pitchers — never worth GPP rostering
     if ((p.salary || 0) < 6500)        score = Math.min(score, 25);
     if ((p.avgPts || 0) < 10)          score = Math.min(score, 30);
-    if (own > 35) score = Math.min(55, score);
-    else if (own > 25) score = Math.max(10, score - 20);
-    else if (own > 18) score = Math.max(10, score - 8);
+    if (own > 45) score = Math.min(45, score);       // extreme chalk — hard cap
+    else if (own > 35) score = Math.max(10, score - 15); // very high chalk — penalty
+    // Removed 18-25% penalty — normal pitcher ownership, no reason to penalize
   }
 
   return Math.max(10, Math.min(99, score));
@@ -3661,15 +3658,26 @@ function optimize(all, sp) {
 
         const usedPitchers = new Set([p1.name, p2.name]);
         // Block hitters from pitcher games — EXCEPT catchers.
-        // C is so scarce (1-2 viable per slate) that blocking them leaves C empty.
-        // A catcher on a pitcher's team doesn't meaningfully correlate with pitcher success.
-        const availHitters = hitters.filter(h =>
+        let availHitters = hitters.filter(h =>
           !usedPitchers.has(h.name) &&
           (h.pos === 'C' || !blockedFromStack.has(h.team))
         );
 
+        // If no eligible catchers in pool, inject rawCatchers directly
+        // Catchers are often excluded by injury/roster checks — inject before optimizer runs
+        if (typeof rawCatchers !== 'undefined' && rawCatchers.length > 0 &&
+            !availHitters.some(h => h.pos === 'C')) {
+          const injected = rawCatchers
+            .filter(rc => !usedPitchers.has(rc.name))
+            .map(rc => hitters.find(h => h.name === rc.name) ||
+              { ...rc, isOut: false, edgeScore: Math.max(rc.edgeScore||0, 40),
+                projPts: Math.max(rc.projPts||0, rc.avgPts||5), status: 'C-Raw' });
+          availHitters = [...availHitters, ...injected];
+        }
+
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
-        if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
+        // Accept lineup even if C is empty — catcher insurance fills it later
+        if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length - 1) continue;
 
         // ── 2-OPT SWAP OPTIMIZATION ───────────────────────────────────
         // After greedy fill, try swapping each player with a better alternative.
@@ -4106,15 +4114,26 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
     // Best available fallback — minimum projection floor enforced using avgPts as ground truth
     if (!pick) {
       const isC = positions.includes('C') && positions.length === 1;
-      const minAvg = isC ? 0 : 6; // catchers: take anything available; others: 6pt floor
+      const minAvg = isC ? 0 : 6;
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
         (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= minAvg)
       ) || sorted.find(p =>
-        // Last resort for non-C: 5.5pt minimum
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
         (isC || slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 5.5)
       );
+
+      // CATCHER DIRECT FILL: if C slot still empty, pull directly from rawCatchers
+      // This bypasses all injury/roster/lineup filters — C must always be filled
+      if (!pick && isC && typeof rawCatchers !== 'undefined' && rawCatchers.length > 0) {
+        const rawC = rawCatchers.find(p => !used.has(p.name) && p.salary <= maxBudget);
+        if (rawC) {
+          // Enrich the raw catcher enough to use it
+          pick = { ...rawC, isOut: false, edgeScore: Math.max(rawC.edgeScore || 0, 40),
+            projPts: Math.max(rawC.projPts || 0, rawC.avgPts || 5), status: 'C-Direct' };
+          console.log(`greedyFillSlots: C slot filled from rawCatchers: ${rawC.name}`);
+        }
+      }
     }
 
     if (pick) {
@@ -4442,18 +4461,32 @@ async function buildAndRender() {
             }
           }
 
-          // Step 3: force-remove cheapest hitter slot, insert cheapest catcher
-          if (!bestC2) {
-            const hitters3 = lineup
-              .filter(l => l.player && !l.player.isOut && l.slot !== 'P' && l.slot !== 'C')
-              .sort((a,b) => a.player.salary - b.player.salary);
-            const cheapH = hitters3[0];
-            const cheapC = rawCatchers[0]; // best catcher regardless of salary
-            if (cheapH && cheapC) {
-              lineup[lineup.indexOf(cheapH)] = { slot: cheapH.slot, player: null };
-              bestC2 = cheapC;
-              console.log(`C insurance step 3: removed ${cheapH.player.name} slot`);
+          // Step 3: find ANY hitter+catcher combo that stays under $50K cap
+          // Sort catchers cheapest first, hitters most expensive first
+          const sortedCatchers = [...rawCatchers].sort((a,b) => a.salary - b.salary).filter(p => !usedNames2.has(p.name));
+          const hitters3 = lineup
+            .filter(l => l.player && !l.player.isOut && l.slot !== 'P' && l.slot !== 'C')
+            .sort((a,b) => b.player.salary - a.player.salary); // most expensive first = most budget freed
+
+          let step3C = null, step3H = null;
+          outer3: for (const c of sortedCatchers) {
+            for (const h of hitters3) {
+              const netChange = c.salary - h.player.salary;
+              if (usedSal2 + netChange <= CAP) {
+                step3C = c; step3H = h;
+                break outer3;
+              }
             }
+          }
+          if (step3H && step3C) {
+            lineup[lineup.indexOf(step3H)] = { slot: step3H.slot, player: null };
+            bestC2 = step3C;
+            console.log(`C insurance step 3: swapped out ${step3H.player.name} ($${step3H.player.salary}) for ${step3C.name} ($${step3C.salary})`);
+          } else {
+            // Absolute last resort: use cheapest catcher regardless
+            bestC2 = sortedCatchers[0];
+            if (hitters3[0]) lineup[lineup.indexOf(hitters3[0])] = { slot: hitters3[0].slot, player: null };
+            console.warn(`C insurance: budget overflow unavoidable, using ${bestC2?.name}`);
           }
 
           if (bestC2) {
