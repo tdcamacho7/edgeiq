@@ -4404,86 +4404,78 @@ async function buildAndRender() {
     // Runs after pre-render audit so validation cannot remove it.
     if (sport === 'mlb') {
       const cSlotIdx2 = lineup.findIndex(l => l.slot === 'C');
-      const cFilled2  = cSlotIdx2 >= 0 && lineup[cSlotIdx2]?.player;
+      // cFilled = only true if there's a real, non-excluded player in C slot
+      const cFilled2 = cSlotIdx2 >= 0 && !!lineup[cSlotIdx2]?.player && !lineup[cSlotIdx2]?.player?.isOut && lineup[cSlotIdx2]?.player?.edgeScore > 0;
+      console.log(`Catcher check: slotIdx=${cSlotIdx2}, filled=${cFilled2}, rawCatchers=${rawCatchers.length}`);
 
       if (!cFilled2 && rawCatchers.length > 0) {
-        const usedNames2 = new Set(lineup.filter(l => l.player).map(l => l.player.name));
-        const usedSal2   = lineup.filter(l => l.player).reduce((s,l) => s + l.player.salary, 0);
-        let remaining2   = CAP - usedSal2;
+        try {
+          const usedNames2 = new Set(lineup.filter(l => l.player && !l.player.isOut).map(l => l.player.name));
+          const usedSal2   = lineup.filter(l => l.player && !l.player.isOut).reduce((s,l) => s + l.player.salary, 0);
+          let remaining2 = CAP - usedSal2;
+          console.log(`C insurance running: $${remaining2} remaining, ${rawCatchers.length} catchers`);
 
-        // Find best fitting catcher — ignore isOut entirely
-        let bestC2 = rawCatchers.find(p => p.salary <= remaining2 && !usedNames2.has(p.name));
+          // Step 1: catcher fits in remaining budget
+          let bestC2 = rawCatchers.find(p => p.salary <= remaining2 && !usedNames2.has(p.name));
 
-        // Swap cheapest hitter if no catcher fits budget
-        if (!bestC2) {
-          const hitterSlots2 = lineup
-            .filter(l => l.player && l.slot !== 'P' && l.slot !== 'C')
-            .sort((a,b) => a.player.salary - b.player.salary);
-
-          for (const swapSlot2 of hitterSlots2) {
-            const freed2 = remaining2 + swapSlot2.player.salary;
-            const cCand2 = rawCatchers.find(p => p.salary <= freed2 && !usedNames2.has(p.name));
-            if (!cCand2) continue;
-
-            const swapPos2 = swapSlot2.slot === 'FLEX' ? (FLEX_POS[sport]||[]) : [swapSlot2.slot];
-            const budgetAfterC2 = freed2 - cCand2.salary;
-            const excl2 = new Set([...usedNames2, cCand2.name]);
-            excl2.delete(swapSlot2.player.name);
-
-            const repl2 = players.filter(p => !p.isOut && swapPos2.includes(p.pos) &&
-              p.salary <= budgetAfterC2 && !excl2.has(p.name) &&
-              Math.max(p.avgPts||0, p.projPts||0) >= 4)
-              .sort((a,b) => b.edgeScore - a.edgeScore)[0];
-
-            if (repl2) {
-              lineup[lineup.indexOf(swapSlot2)] = { slot: swapSlot2.slot, player: repl2 };
-              bestC2 = cCand2;
-              break;
+          // Step 2: swap cheapest hitter to free budget
+          if (!bestC2) {
+            const hitters2 = lineup
+              .filter(l => l.player && !l.player.isOut && l.slot !== 'P' && l.slot !== 'C')
+              .sort((a,b) => a.player.salary - b.player.salary);
+            for (const hs of hitters2) {
+              const freed = remaining2 + hs.player.salary;
+              const cc = rawCatchers.find(p => p.salary <= freed && !usedNames2.has(p.name));
+              if (!cc) continue;
+              const spos = hs.slot === 'FLEX' ? (FLEX_POS[sport]||[]) : [hs.slot];
+              const bac = freed - cc.salary;
+              const excl = new Set([...usedNames2, cc.name]);
+              excl.delete(hs.player.name);
+              const repl = players.filter(p => !p.isOut && spos.includes(p.pos) &&
+                p.salary <= bac && !excl.has(p.name) && Math.max(p.avgPts||0,p.projPts||0) >= 4)
+                .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+              if (repl) {
+                lineup[lineup.indexOf(hs)] = { slot: hs.slot, player: repl };
+                bestC2 = cc;
+                break;
+              }
             }
           }
-        }
 
-        // Last resort: must remove cheapest hitter to make room — NEVER exceed cap
-        if (!bestC2) {
-          const hitterSlots3 = lineup
-            .filter(l => l.player && l.slot !== 'P' && l.slot !== 'C')
-            .sort((a,b) => a.player.salary - b.player.salary);
-          const cheapestHitter = hitterSlots3[0];
-          const cheapestC = rawCatchers.find(p => !usedNames2.has(p.name));
-          if (cheapestHitter && cheapestC) {
-            // Remove cheapest hitter, insert cheapest catcher regardless of replacement
-            const freed3 = remaining2 + cheapestHitter.player.salary;
-            if (cheapestC.salary <= freed3) {
-              lineup[lineup.indexOf(cheapestHitter)] = { slot: cheapestHitter.slot, player: { ...cheapestHitter.player, isOut: true, edgeScore: 0 } };
-              bestC2 = cheapestC;
+          // Step 3: force-remove cheapest hitter slot, insert cheapest catcher
+          if (!bestC2) {
+            const hitters3 = lineup
+              .filter(l => l.player && !l.player.isOut && l.slot !== 'P' && l.slot !== 'C')
+              .sort((a,b) => a.player.salary - b.player.salary);
+            const cheapH = hitters3[0];
+            const cheapC = rawCatchers[0]; // best catcher regardless of salary
+            if (cheapH && cheapC) {
+              lineup[lineup.indexOf(cheapH)] = { slot: cheapH.slot, player: null };
+              bestC2 = cheapC;
+              console.log(`C insurance step 3: removed ${cheapH.player.name} slot`);
             }
           }
-        }
 
-        if (bestC2) {
-          const base2 = players.find(p => p.name === bestC2.name) || bestC2;
-          // ALWAYS force valid salary-safe insertion
-          const currentSal = lineup.filter(l => l.player && !l.player.isOut).reduce((s,l) => s + l.player.salary, 0);
-          if (currentSal + bestC2.salary > CAP + 100) {
-            console.warn(`Catcher salary overflow — skipping ${bestC2.name} ($${bestC2.salary}), sal=${currentSal}`);
-          } else {
+          if (bestC2) {
+            const base2 = players.find(p => p.name === bestC2.name) || bestC2;
             const forcedC = { ...base2, isOut: false, status: 'C-Insurance',
-              edgeScore: Math.max(base2.edgeScore || 0, 40),
-              projPts: Math.max(base2.projPts || 0, base2.avgPts || 5) };
+              edgeScore: Math.max(base2.edgeScore || 0, 50),
+              projPts: Math.max(base2.projPts || 0, base2.avgPts || 6) };
             if (cSlotIdx2 >= 0) lineup[cSlotIdx2] = { slot: 'C', player: forcedC };
             else lineup.splice(2, 0, { slot: 'C', player: forcedC });
             console.log(`✅ Catcher inserted: ${forcedC.name} ($${forcedC.salary})`);
-
-            // Re-normalize edge scores after inserting catcher
-            const allEdges = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0).map(l => l.player.edgeScore);
-            const maxE = allEdges.length ? Math.max(...allEdges) : 99;
+            // Re-normalize after catcher insertion
+            const allE = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0).map(l => l.player.edgeScore);
+            const maxE = allE.length ? Math.max(...allE) : 99;
             if (maxE > 0 && maxE < 99) {
               const sf = 99 / maxE;
-              lineup = lineup.map(l => l.player ? {
-                ...l, player: { ...l.player, edgeScore: l.player.isOut ? 0 : Math.min(99, Math.round(l.player.edgeScore * sf)) }
-              } : l);
+              lineup = lineup.map(l => l.player ? { ...l, player: { ...l.player, edgeScore: l.player.isOut ? 0 : Math.min(99, Math.round(l.player.edgeScore * sf)) } } : l);
             }
+          } else {
+            console.error('❌ Catcher insurance failed all 3 steps');
           }
+        } catch(cErr) {
+          console.error('Catcher insurance error:', cErr.message);
         }
       }
     }
