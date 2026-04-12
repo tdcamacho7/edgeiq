@@ -3571,7 +3571,7 @@ function optimize(all, sp) {
     });
     // stackTeam is determined inside the pitcher loop (depends on which pitchers are picked)
     let bestMLBScore = -1, bestMLBLineup = null;
-    const topPitchers = pitchers.slice(0, 8);
+    const topPitchers = pitchers.slice(0, 12); // test more pitcher pairs for better coverage
 
     for (let i = 0; i < topPitchers.length; i++) {
       for (let j = i + 1; j < topPitchers.length; j++) {
@@ -3672,9 +3672,49 @@ function optimize(all, sp) {
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
         if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
 
+        // ── 2-OPT SWAP OPTIMIZATION ───────────────────────────────────
+        // After greedy fill, try swapping each player with a better alternative.
+        // This fixes the greedy "fill left-to-right" problem where early slots
+        // consume budget that leaves cheap/weak players at OF slots.
+        // Each swap is accepted if it improves total lineup edge.
+        const optimizedHitters = [...hitterLineup];
+        const usedNamesSwap = new Set(optimizedHitters.filter(l=>l.player).map(l=>l.player.name));
+        let swapBudget = remainingBudget - optimizedHitters.reduce((s,l) => s+(l.player?.salary||0), 0);
+
+        let swapImproved = true;
+        let swapPasses = 0;
+        while (swapImproved && swapPasses < 3) {
+          swapImproved = false; swapPasses++;
+          for (let si = 0; si < optimizedHitters.length; si++) {
+            const cur = optimizedHitters[si].player; if (!cur) continue;
+            const sslot = optimizedHitters[si].slot;
+            const spos = sslot === 'FLEX' ? (FLEX_POS[sp]||[]) : [sslot];
+            const curBudget = swapBudget + cur.salary;
+
+            // Find best swap candidate — higher edge, fits budget, not already used
+            const candidate = availHitters
+              .filter(p =>
+                !usedNamesSwap.has(p.name) &&
+                spos.includes(p.pos) &&
+                p.salary <= curBudget &&
+                p.edgeScore > cur.edgeScore + 5 && // only swap if meaningfully better
+                Math.max(p.avgPts||0, p.projPts||0) >= 5.5
+              )
+              .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+
+            if (candidate) {
+              usedNamesSwap.delete(cur.name);
+              usedNamesSwap.add(candidate.name);
+              swapBudget = curBudget - candidate.salary;
+              optimizedHitters[si] = { slot: sslot, player: candidate };
+              swapImproved = true;
+            }
+          }
+        }
+
         const fullLineup = [
           { slot: 'P', player: p1 }, { slot: 'P', player: p2 },
-          ...hitterLineup,
+          ...optimizedHitters,
         ];
         const allPlayers = fullLineup.filter(l=>l.player).map(l=>l.player);
         const lineupScore = calcLineupFirstPlaceScore(allPlayers, sp);
@@ -3740,19 +3780,34 @@ function optimize(all, sp) {
   const viablePool = eligible.filter(p =>
     p.salary >= minSalaryFloor(p) &&
     hasValidHistory(p) &&
-    // Use avgPts as ground truth — projPts can be crushed by signals
     Math.max(p.avgPts || 0, p.projPts || 0) >= minPts(p) &&
     (p.avgPts || 0) >= minAvgPts(p)
   );
   let searchPool = viablePool;
-  if (viablePool.length < slots.length + 2) {
+  const needed = slots.length + 2;
+
+  if (searchPool.length < needed) {
+    // Level 1: lower pts bar to 5, keep salary floor
     searchPool = eligible.filter(p =>
       p.salary >= minSalaryFloor(p) &&
-      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 8 : 6) : 12) &&
-      p.edgeScore >= 40
+      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 8 : 5) : 12)
     );
   }
-  if (searchPool.length < slots.length + 1) searchPool = viablePool.length ? viablePool : eligible.filter(p => p.edgeScore >= 30);
+  if (searchPool.length < needed) {
+    // Level 2: drop to 4pt avg, keep salary floor
+    searchPool = eligible.filter(p =>
+      p.salary >= minSalaryFloor(p) &&
+      Math.max(p.avgPts || 0, p.projPts || 0) >= (sp === 'mlb' ? (p.pos === 'P' ? 6 : 4) : 10)
+    );
+  }
+  if (searchPool.length < needed) {
+    // Level 3: salary floor only — no projection requirement
+    searchPool = eligible.filter(p => p.salary >= minSalaryFloor(p));
+  }
+  if (searchPool.length < slots.length) {
+    // Level 4: all eligible
+    searchPool = eligible;
+  }
 
   // Rebuild slot pools from viable pool
   const slotPools = slots.map(slot => {
@@ -3997,24 +4052,39 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 
     if (needStack) {
       if (mustStack || wantStack) {
-        // Find best stack team player at this position
         const stackPick = sorted.find(p =>
           !used.has(p.name) && p.salary <= maxBudget &&
           positions.includes(p.pos) && p.team === stackTeam
         );
-        // ALWAYS pick stack player when building toward 4-man stack
-        // The +60 stack bonus outweighs individual edge score differences
-        // Lower thresholds vs non-stack fill — we NEED the stack to win GPPs
         const stackMinEdge = positions.includes('C') ? 40 : 50;
-        const stackMinAvg  = positions.includes('C') ? 4  : 6; // avgPts floor for stack players
-        if (stackPick && stackPick.edgeScore >= stackMinEdge &&
-            Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= stackMinAvg) {
-          pick = stackPick;
-        }
-        // If mustStack and no viable player, take any stack player with avgPts >= 4
-        if (!pick && mustStack && stackPick &&
-            Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= 4) {
-          pick = stackPick;
+        const stackMinAvg  = positions.includes('C') ? 4  : 6;
+
+        if (mustStack) {
+          // MUST stack: take any viable stack player
+          if (stackPick && stackPick.edgeScore >= stackMinEdge &&
+              Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= stackMinAvg) {
+            pick = stackPick;
+          }
+          // Last resort for must-stack: take any stack player with avgPts >= 4
+          if (!pick && stackPick && Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= 4) {
+            pick = stackPick;
+          }
+        } else if (wantStack) {
+          // WANT stack (not required): compare vs best non-stack alternative
+          // The 4th stack player adds +35 corrBonus / 10 players = +3.5 per player
+          // Only take stack player if we're not giving up more than 12 edge for it
+          const bestNonStack = sorted.find(p =>
+            !used.has(p.name) && p.salary <= maxBudget &&
+            positions.includes(p.pos) && p.team !== stackTeam &&
+            Math.max(p.avgPts || 0, p.projPts || 0) >= stackMinAvg
+          );
+          const STACK_SACRIFICE_LIMIT = 12; // max edge we'll sacrifice for 4th stack player
+          const stackWorthIt = !bestNonStack ||
+            stackPick?.edgeScore >= (bestNonStack.edgeScore - STACK_SACRIFICE_LIMIT);
+          if (stackPick && stackWorthIt && stackPick.edgeScore >= stackMinEdge &&
+              Math.max(stackPick.avgPts || 0, stackPick.projPts || 0) >= stackMinAvg) {
+            pick = stackPick;
+          }
         }
       }
     }
@@ -4181,25 +4251,22 @@ async function buildAndRender() {
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // ── MINIMUM LINEUP PROJECTION GATE ───────────────────────────────
-    // Reject lineups where hitter total is too low — ensures we get real production
-    // MLB: 8 hitters × 7pt avg = 56pt min hitter total (plus ~44pt from 2 pitchers = ~100 total)
-    const MIN_HITTER_TOTAL_MLB = 55;
+    // Detects when hitter pool is too thin and progressively relaxes constraints
+    const MIN_HITTER_TOTAL_MLB = 48; // lowered: 8 hitters × 6pt avg = 48
     let garbageAttempts = 0;
 
     const hasLowProjection = (lu) => {
       if (sport !== 'mlb') return false;
-      const hitterTotal = lu
-        .filter(l => l.player && l.player.pos !== 'P')
-        .reduce((s, l) => s + Math.max(l.player.avgPts || 0, l.player.projPts || 0), 0);
+      const hitters = lu.filter(l => l.player && l.player.pos !== 'P');
+      if (hitters.length < 6) return true; // not enough hitters = problem
+      const hitterTotal = hitters.reduce((s, l) => s + Math.max(l.player.avgPts || 0, l.player.projPts || 0), 0);
       return hitterTotal < MIN_HITTER_TOTAL_MLB;
     };
 
     // ── GARBAGE PLAYER VALIDATION ────────────────────────────────────
-    // Reject any lineup with a hitter averaging < 5 pts — hard rebuild
-    // Using avgPts (ground truth) not projPts (can be signal-penalized)
     const hasGarbagePlayers = (lu) => lu.some(l =>
       l.player && l.player.pos !== 'P' &&
-      Math.max(l.player.avgPts || 0, l.player.projPts || 0) < (sport === 'mlb' ? 6 : 5)
+      Math.max(l.player.avgPts || 0, l.player.projPts || 0) < (sport === 'mlb' ? 5 : 5)
     );
 
     while (lineup && (hasGarbagePlayers(lineup) || hasLowProjection(lineup)) && garbageAttempts < 4) {
@@ -4207,14 +4274,28 @@ async function buildAndRender() {
       const garbageNames = lineup
         .filter(l => l.player && l.player.pos !== 'P' && Math.max(l.player.avgPts || 0, l.player.projPts || 0) < 5)
         .map(l => l.player.name);
+
       if (garbageNames.length > 0) {
-        console.warn(`Weak players (attempt ${garbageAttempts}): ${garbageNames.join(', ')} — excluding and rebuilding`);
+        console.warn(`Weak players (attempt ${garbageAttempts}): ${garbageNames.join(', ')} — excluding`);
         players = players.map(p =>
           garbageNames.includes(p.name) ? { ...p, isOut: true, edgeScore: 0 } : p
         );
       } else {
-        console.warn(`Low proj total (attempt ${garbageAttempts}) — relaxing constraint`);
-        // Relax min proj threshold slightly each attempt
+        // Low total but no garbage players — pool is just thin after exclusions.
+        // Progressively re-enable players with lower avgPts thresholds.
+        const relaxThreshold = garbageAttempts === 1 ? 5 : garbageAttempts === 2 ? 4 : 3;
+        console.warn(`Low proj total (attempt ${garbageAttempts}) — relaxing avgPts floor to ${relaxThreshold}`);
+        // Re-admit players that were excluded by the avgPts filter but have some history
+        players = players.map(p => {
+          if (!p.isOut) return p;
+          if (p.status === 'Excluded') return p; // keep manually excluded
+          const base = Math.max(p.avgPts || 0, p.projPts || 0);
+          // Re-admit if they have enough history and were only excluded by avgPts gate
+          if (base >= relaxThreshold && p.salary >= 3000 && p.pos !== 'P') {
+            return { ...p, isOut: false, edgeScore: calcEdgeScore({...p, isOut: false}) };
+          }
+          return p;
+        });
       }
       lineup = optimize(players, sport) || lineup;
     }
