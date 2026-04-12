@@ -511,6 +511,7 @@ input,button{font-family:var(--ui)}
 let sport = 'nfl';
 let players = [];
 let lineup = [];
+let rawCatchers = []; // ALL catchers from CSV before any filtering — catcher insurance fallback
 
 // ── CORE UTILITIES — must be defined before everything else ───────
 function setStatus(msg, color) {
@@ -694,6 +695,14 @@ async function handleCsv(input){
   reader.onload= async e=>{
     const raw=parseCsv(e.target.result);
     if(!raw.length){ setStatus('Could not read CSV — try re-downloading from DraftKings','var(--red)'); setDot('error'); return; }
+
+    // Store ALL catchers from raw CSV immediately — before any injury/roster/lineup filtering
+    // This is the definitive fallback for catcher insurance
+    if (sport === 'mlb') {
+      rawCatchers = raw.filter(p => p.pos === 'C' && !p.isOut && p.salary >= 3000)
+        .sort((a,b) => (b.avgPts||0) - (a.avgPts||0));
+      console.log(`Raw catchers stored: ${rawCatchers.length} (${rawCatchers.map(p=>p.name).join(', ')})`);
+    }
 
     setStatus(`${raw.length} players found · fetching live data...`,'var(--amber)');
 
@@ -4246,65 +4255,64 @@ async function buildAndRender() {
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // ── CATCHER INSURANCE ─────────────────────────────────────────────
-    // Guaranteed: C slot will ALWAYS be filled.
-    // If empty after optimization, swap the cheapest non-pitcher for a catcher.
+    // Uses rawCatchers (stored at CSV parse time, before ALL filtering)
+    // as the guaranteed catcher source. Always fills C slot.
     if (sport === 'mlb') {
       const cSlotIdx = lineup.findIndex(l => l.slot === 'C');
       const cFilled  = cSlotIdx >= 0 && lineup[cSlotIdx]?.player;
-      if (!cFilled) {
+
+      if (!cFilled && rawCatchers.length > 0) {
         const usedNames = new Set(lineup.filter(l => l.player).map(l => l.player.name));
         const usedSal   = lineup.filter(l => l.player).reduce((s,l) => s + l.player.salary, 0);
         let remaining   = CAP - usedSal;
 
-        // Find all catchers in the full player list (ignoring isOut)
-        const allCatchers = players
-          .filter(p => p.pos === 'C' && !usedNames.has(p.name))
-          .sort((a,b) => (b.avgPts||0) - (a.avgPts||0));
+        // Step 1: try catchers that fit remaining budget
+        let bestC = rawCatchers.find(p => p.salary <= remaining && !usedNames.has(p.name));
 
-        // Try catchers that fit current budget first
-        let bestC = allCatchers.find(p => p.salary <= remaining);
-
-        // If none fit, free budget by swapping out the cheapest hitter in lineup
+        // Step 2: swap cheapest hitter to free budget for catcher
         if (!bestC) {
-          const hitterSlots = lineup.filter(l => l.player && l.slot !== 'P' && l.slot !== 'C');
-          hitterSlots.sort((a,b) => a.player.salary - b.player.salary); // cheapest first
+          const hitterSlots = lineup
+            .filter(l => l.player && l.slot !== 'P' && l.slot !== 'C')
+            .sort((a,b) => a.player.salary - b.player.salary);
+
           for (const swapSlot of hitterSlots) {
             const freed = remaining + swapSlot.player.salary;
-            const cCandidate = allCatchers.find(p => p.salary <= freed && !usedNames.has(p.name));
-            if (cCandidate) {
-              // Do the swap: remove cheap hitter, add catcher
-              const swapIdx = lineup.indexOf(swapSlot);
-              // Find replacement for the swapped slot
-              const swappedPos = swapSlot.slot;
-              const swappedPositions = swappedPos === 'FLEX' ? (FLEX_POS[sport]||[]) : [swappedPos];
-              const newRemaining = freed - cCandidate.salary;
-              const replacement = players
-                .filter(p => !p.isOut && swappedPositions.includes(p.pos) &&
-                  p.salary <= newRemaining && !usedNames.has(p.name) &&
-                  p.name !== cCandidate.name && p.avgPts > 0)
-                .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+            const cCandidate = rawCatchers.find(p => p.salary <= freed && !usedNames.has(p.name));
+            if (!cCandidate) continue;
 
-              if (replacement) {
-                lineup[swapIdx] = { slot: swappedPos, player: replacement };
-                usedNames.add(replacement.name);
-                usedNames.delete(swapSlot.player.name);
-                bestC = cCandidate;
-                break;
-              }
+            const swappedPositions = swapSlot.slot === 'FLEX' ? (FLEX_POS[sport]||[]) : [swapSlot.slot];
+            const budgetAfterC = freed - cCandidate.salary;
+            const excl = new Set([...usedNames, cCandidate.name]);
+            excl.delete(swapSlot.player.name);
+
+            const replacement = players
+              .filter(p => !p.isOut && swappedPositions.includes(p.pos) &&
+                p.salary <= budgetAfterC && !excl.has(p.name) &&
+                Math.max(p.avgPts||0, p.projPts||0) >= 4)
+              .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+
+            if (replacement) {
+              lineup[lineup.indexOf(swapSlot)] = { slot: swapSlot.slot, player: replacement };
+              bestC = cCandidate;
+              break;
             }
           }
         }
 
+        // Step 3: absolute last resort — ignore salary cap
+        if (!bestC) bestC = rawCatchers.find(p => !usedNames.has(p.name));
+
         if (bestC) {
-          if (cSlotIdx >= 0) {
-            lineup[cSlotIdx] = { slot: 'C', player: bestC };
-          } else {
-            lineup.push({ slot: 'C', player: bestC });
-          }
-          console.log(`✅ Catcher insurance: ${bestC.name} ($${bestC.salary}, ${bestC.avgPts}avg)`);
+          // Use enriched version if available, else raw
+          const enrichedC = players.find(p => p.name === bestC.name) || bestC;
+          if (cSlotIdx >= 0) lineup[cSlotIdx] = { slot: 'C', player: enrichedC };
+          else lineup.splice(2, 0, { slot: 'C', player: enrichedC });
+          console.log(`✅ Catcher filled: ${enrichedC.name} ($${enrichedC.salary})`);
         } else {
-          console.error('❌ Could not fill C slot — no catchers available on slate');
+          console.error('❌ rawCatchers empty — no C in CSV?');
         }
+      } else if (!cFilled) {
+        console.error('❌ rawCatchers not populated — CSV not parsed before buildAndRender');
       }
     }
 
