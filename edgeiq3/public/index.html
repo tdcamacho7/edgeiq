@@ -1197,12 +1197,13 @@ function parseCsv(text){
     // 2. avgPts = 0 = never played this season = not in lineup
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
+    // avgPts = 0 means: never played this season = not in lineup / just called up / non-roster
+    // DK prices these players but they are NOT playable — exclude them at parse time
+    const isZeroAvg = avgPtsVal === 0 && salary < 5000; // exclude cheap 0-avg players always
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3300) ||         // cheap = bench
-      (avgPtsVal === 0 && salary < 4500)        // never scored = not starting
+      (salary > 0 && salary < 3300) ||  // cheap = bench pricing
+      isZeroAvg                          // 0 avg = no track record
     );
-    // Negative or near-zero FPPG for pitchers = terrible pitcher, very low ceiling
-    // Don't exclude but mark so calcEdgeScore caps them
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
     const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
@@ -2679,14 +2680,22 @@ function enrich(raw) {
   cachedOwnership = {};
 
   return raw.map((p, i) => {
-    // ── HARD BLOCK: OUT/IL players get zeroed and returned immediately ──
-    // This is the final safety gate — should never reach optimize() with isOut=true
+    // ── HARD BLOCK: OUT/IL players ──────────────────────────────────
+    // Permanently zero them — they NEVER re-enter via relaxation
     const finalIsOut = p.isOut || isManuallyOut(p.name) ||
-      (p.edgeScore === 0 && p.status && ['out','ir','il','inactive','suspended'].some(s =>
-        (p.status||'').toLowerCase().includes(s)
-      ));
+      (p.status && ['out','ir','il','inactive','suspended','not on active roster',
+        'not in starting lineup','ppd'].some(s => (p.status||'').toLowerCase().includes(s)));
     if (finalIsOut) {
-      return { ...p, isOut: true, edgeScore: 0, projPts: 0, projOwn: 99, _ceiling: 0 };
+      return { ...p, isOut: true, edgeScore: 0, projPts: 0, _ceiling: 0,
+        projOwn: p.fpOwnership != null ? Math.round(p.fpOwnership) : estimateOwnership(p, sport) };
+    }
+
+    // ── ZERO avgPts = no track record = exclude ──────────────────────
+    // These players have never accumulated DK points — they are not in the lineups
+    // DK assigns 0 avgPts to: newly called up, IL, non-rostered, position-ineligible
+    if ((p.avgPts || 0) === 0 && !p.realProjection) {
+      return { ...p, isOut: true, edgeScore: 0, projPts: 0, _ceiling: 0,
+        projOwn: p.fpOwnership != null ? Math.round(p.fpOwnership) : estimateOwnership(p, sport) };
     }
 
     const seed = (p.name.charCodeAt(0)||65)*31 + (p.salary%1000) + i*17;
@@ -4281,18 +4290,17 @@ async function buildAndRender() {
           garbageNames.includes(p.name) ? { ...p, isOut: true, edgeScore: 0 } : p
         );
       } else {
-        // Low total but no garbage players — pool is just thin after exclusions.
-        // Progressively re-enable players with lower avgPts thresholds.
         const relaxThreshold = garbageAttempts === 1 ? 5 : garbageAttempts === 2 ? 4 : 3;
         console.warn(`Low proj total (attempt ${garbageAttempts}) — relaxing avgPts floor to ${relaxThreshold}`);
-        // Re-admit players that were excluded by the avgPts filter but have some history
         players = players.map(p => {
           if (!p.isOut) return p;
-          if (p.status === 'Excluded') return p; // keep manually excluded
+          if (p.status === 'Excluded') return p; // never re-admit manually excluded
+          // NEVER re-admit 0-avgPts players — they have no track record
           const base = Math.max(p.avgPts || 0, p.projPts || 0);
-          // Re-admit if they have enough history and were only excluded by avgPts gate
-          if (base >= relaxThreshold && p.salary >= 3000 && p.pos !== 'P') {
-            return { ...p, isOut: false, edgeScore: calcEdgeScore({...p, isOut: false}) };
+          if (base === 0) return p;
+          if (base >= relaxThreshold && p.salary >= 3300 && p.pos !== 'P') {
+            const restored = { ...p, isOut: false };
+            return { ...restored, edgeScore: calcEdgeScore(restored) };
           }
           return p;
         });
@@ -4300,37 +4308,69 @@ async function buildAndRender() {
       lineup = optimize(players, sport) || lineup;
     }
 
-    // Show warning if we couldn't hit 97+
+    // ══ PRE-RENDER LINEUP AUDIT ══════════════════════════════════════
+    // Comprehensive validation before showing any lineup to the user.
+    // Any failure triggers a rebuild attempt, then a clear error if still failing.
     if (!lineup || !lineup.length) {
       setDot('error');
       setStatus('Not enough eligible players — check that lineups are posted on DK', 'var(--red)');
       return;
     }
+
+    // 1. Hard block: OUT or 0-edgeScore players
+    const outInLineup = lineup.filter(l => l.player && (l.player.isOut || l.player.edgeScore === 0));
+    if (outInLineup.length > 0) {
+      const names = outInLineup.map(l => l.player.name).join(', ');
+      console.error(`🚨 OUT players in lineup: ${names}`);
+      players = players.map(p =>
+        outInLineup.some(l => l.player.name === p.name)
+          ? { ...p, isOut: true, edgeScore: 0 } : p
+      );
+      lineup = optimize(players, sport) || lineup;
+    }
+
+    // 2. Hard block: players with 0 avgPts (no track record — not playing)
+    const zeroAvgInLineup = lineup.filter(l =>
+      l.player && l.player.pos !== 'P' && (l.player.avgPts || 0) === 0
+    );
+    if (zeroAvgInLineup.length > 0) {
+      const names = zeroAvgInLineup.map(l => l.player.name).join(', ');
+      console.error(`🚨 Zero-avgPts players in lineup: ${names}`);
+      players = players.map(p =>
+        zeroAvgInLineup.some(l => l.player.name === p.name)
+          ? { ...p, isOut: true, edgeScore: 0 } : p
+      );
+      lineup = optimize(players, sport) || lineup;
+    }
+
+    // 3. Hard block: players projecting 0.0 pts displayed
+    const zeroProj = lineup.filter(l =>
+      l.player && (l.player.projPts || 0) <= 0.1 && l.player.pos !== 'P'
+    );
+    if (zeroProj.length > 0) {
+      const names = zeroProj.map(l => l.player.name).join(', ');
+      console.error(`🚨 Zero-projection players in lineup: ${names}`);
+      players = players.map(p =>
+        zeroProj.some(l => l.player.name === p.name)
+          ? { ...p, isOut: true, edgeScore: 0 } : p
+      );
+      lineup = optimize(players, sport) || lineup;
+    }
+
+    // 4. Ownership sanity: 99% own means estimation broke — recalculate
+    lineup = lineup.map(l => {
+      if (!l.player) return l;
+      if ((l.player.projOwn || 0) > 60) {
+        const corrOwn = estimateOwnership(l.player, sport);
+        return { ...l, player: { ...l.player, projOwn: corrOwn } };
+      }
+      return l;
+    });
+
     const finalValid = lineup.filter(l => l.player);
     const finalScore = finalValid.length
       ? Math.round(finalValid.reduce((s,l) => s + l.player.edgeScore, 0) / finalValid.length)
       : 0;
-
-    // Flag any individual weak players in final lineup
-    // HARD BLOCK: refuse to render lineup if any OUT player slipped through
-    const outPlayers = finalValid.filter(l => l.player.isOut || l.player.edgeScore === 0);
-    if (outPlayers.length > 0) {
-      const names = outPlayers.map(l => l.player.name).join(', ');
-      setStatus(`🚨 OUT players detected: ${names} — rebuild required`, 'var(--red)');
-      setDot('error');
-      // Force remove them and rebuild once
-      players = players.map(p => 
-        outPlayers.some(l => l.player.name === p.name) 
-          ? { ...p, isOut: true, edgeScore: 0 } 
-          : p
-      );
-      lineup = optimize(players, sport);
-      // If still has bad players after one more attempt, stop and show error
-      const retryValid = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0);
-      if (retryValid.length < lineup.filter(l=>l.player).length) {
-        setStatus('Could not build valid lineup — some players may be unavailable', 'var(--amber)');
-      }
-    }
 
     const weakPlayers = finalValid.filter(l =>
       l.player.edgeScore < 60 ||
@@ -4449,7 +4489,8 @@ function renderLineup(entropyScore, kelly, dna, contest) {
     const p = l.player;
     const e = p.edgeScore;
     const oc = p.projOwn<=15?'var(--green)':p.projOwn<=28?'var(--t2)':'var(--amber)';
-    const isChalk = chalkSet.has(p.name);
+    // chalk trap: only flag genuinely high-owned players (25%+), not normal 15-20% players
+    const isChalk = chalkSet.has(p.name) && (p.projOwn || 0) >= 25;
     const chips = [
       p.isOut ? '<span class="chip" style="background:rgba(239,68,68,.3);color:#f87171">OUT</span>' : '',
       p.status && !p.isOut && p.status.toLowerCase().includes('quest') ? '<span class="chip chip-a">Q</span>' : '',
@@ -4457,9 +4498,9 @@ function renderLineup(entropyScore, kelly, dna, contest) {
       p.projOwn<=10 && !p.isOut ? '<span class="chip chip-c">low own</span>' : '',
       p.vegasDiff>4 && !p.isOut ? '<span class="chip chip-a">vegas edge</span>' : '',
       isChalk ? '<span class="chip chip-a">chalk trap</span>' : '',
-      p.fatigue>25 ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">fatigued</span>' : '',
-      p.recentForm?.trend === 'hot' ? '<span class="chip" style="background:rgba(16,185,129,.2);color:var(--green)">🔥 hot</span>' : '',
-      p.recentForm?.trend === 'cold' ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">❄️ cold</span>' : '',
+      // Only show hot/cold if it's from real game log data, not estimated
+      p.recentForm?.trend === 'hot' && !p.recentForm?.estimated ? '<span class="chip" style="background:rgba(16,185,129,.2);color:var(--green)">🔥 hot</span>' : '',
+      p.recentForm?.trend === 'cold' && !p.recentForm?.estimated ? '<span class="chip" style="background:rgba(239,68,68,.15);color:#f87171">❄️ cold</span>' : '',
       (p.propsDivergence||0) >= 7 ? '<span class="chip chip-g">props edge</span>' : '',
       (p.propsDivergence||0) <= -4 ? '<span class="chip chip-a">props fade</span>' : '',
       (p.injuryReturnBoost||0) > 0 ? '<span class="chip" style="background:rgba(167,139,250,.2);color:#a78bfa">return window</span>' : '',
