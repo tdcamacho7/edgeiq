@@ -4245,6 +4245,56 @@ async function buildAndRender() {
     }
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
+    // ── CATCHER INSURANCE ─────────────────────────────────────────────
+    // If C slot is empty after all optimization attempts, force-fill it
+    // with the best available catcher from the FULL player pool (no filters).
+    // Catcher is so scarce that we override all constraints to fill this slot.
+    if (sport === 'mlb') {
+      const cSlotIdx = lineup.findIndex(l => l.slot === 'C');
+      const cFilled  = cSlotIdx >= 0 && lineup[cSlotIdx].player;
+      if (!cFilled) {
+        const usedNames = new Set(lineup.filter(l => l.player).map(l => l.player.name));
+        const usedSal   = lineup.filter(l => l.player).reduce((s,l) => s + l.player.salary, 0);
+        const remaining = CAP - usedSal;
+        // Search ALL players (including those normally excluded) for a catcher
+        const allCatchers = players
+          .filter(p => p.pos === 'C' && !p.isOut && p.salary <= remaining && !usedNames.has(p.name))
+          .sort((a,b) => b.edgeScore - a.edgeScore);
+        // If no un-excluded catcher, try all catchers in the CSV ignoring isOut
+        const catcherPool = allCatchers.length > 0 ? allCatchers
+          : players.filter(p => p.pos === 'C' && p.salary <= remaining && !usedNames.has(p.name))
+              .sort((a,b) => (b.avgPts||0) - (a.avgPts||0));
+        const bestC = catcherPool[0];
+        if (bestC) {
+          if (cSlotIdx >= 0) {
+            lineup[cSlotIdx] = { slot: 'C', player: bestC };
+          } else {
+            lineup.push({ slot: 'C', player: bestC });
+          }
+          console.log(`Catcher insurance: inserted ${bestC.name} (${bestC.avgPts}avg, $${bestC.salary})`);
+        }
+      }
+    }
+
+    // ── EDGE SCORE NORMALIZATION ──────────────────────────────────────
+    // Scale all player edge scores so the best player on the slate = 99.
+    // This ensures the header edge score reflects the slate quality accurately.
+    const maxEdgeOnSlate = Math.max(...players.filter(p => !p.isOut && p.edgeScore > 0).map(p => p.edgeScore));
+    if (maxEdgeOnSlate > 0 && maxEdgeOnSlate < 99) {
+      const scaleFactor = 99 / maxEdgeOnSlate;
+      players = players.map(p => ({
+        ...p,
+        edgeScore: p.isOut ? 0 : Math.min(99, Math.round(p.edgeScore * scaleFactor))
+      }));
+      lineup = lineup.map(l => l.player ? {
+        ...l, player: {
+          ...l.player,
+          edgeScore: l.player.isOut ? 0 : Math.min(99, Math.round(l.player.edgeScore * scaleFactor))
+        }
+      } : l);
+    }
+
+
     // ── MINIMUM LINEUP PROJECTION GATE ───────────────────────────────
     // Detects when hitter pool is too thin and progressively relaxes constraints
     const MIN_HITTER_TOTAL_MLB = 48; // lowered: 8 hitters × 6pt avg = 48
@@ -4260,7 +4310,7 @@ async function buildAndRender() {
 
     // ── GARBAGE PLAYER VALIDATION ────────────────────────────────────
     const hasGarbagePlayers = (lu) => lu.some(l =>
-      l.player && l.player.pos !== 'P' &&
+      l.player && l.player.pos !== 'P' && l.player.pos !== 'C' && // catchers exempt
       Math.max(l.player.avgPts || 0, l.player.projPts || 0) < (sport === 'mlb' ? 5 : 5)
     );
 
@@ -4330,9 +4380,10 @@ async function buildAndRender() {
       lineup = optimize(players, sport) || lineup;
     }
 
-    // 3. Hard block: players projecting 0.0 pts displayed
+    // 3. Hard block: players projecting 0.0 pts (exempting catchers — scarce position)
     const zeroProj = lineup.filter(l =>
-      l.player && (l.player.projPts || 0) <= 0.1 && l.player.pos !== 'P'
+      l.player && (l.player.projPts || 0) <= 0.1 &&
+      l.player.pos !== 'P' && l.player.pos !== 'C'
     );
     if (zeroProj.length > 0) {
       const names = zeroProj.map(l => l.player.name).join(', ');
