@@ -4254,9 +4254,8 @@ async function buildAndRender() {
     }
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
-    // ── EDGE SCORE NORMALIZATION ──────────────────────────────────────
-    // Scale all player edge scores so the best player on the slate = 99.
-    // This ensures the header edge score reflects the slate quality accurately.
+    // ── EDGE SCORE NORMALIZATION (pass 1) ─────────────────────────────
+    // Scale so best player on slate = 99. Runs again after catcher insurance.
     const maxEdgeOnSlate = Math.max(...players.filter(p => !p.isOut && p.edgeScore > 0).map(p => p.edgeScore));
     if (maxEdgeOnSlate > 0 && maxEdgeOnSlate < 99) {
       const scaleFactor = 99 / maxEdgeOnSlate;
@@ -4444,18 +4443,47 @@ async function buildAndRender() {
           }
         }
 
-        // Last resort: take any catcher, ignore budget
-        if (!bestC2) bestC2 = rawCatchers.find(p => !usedNames2.has(p.name));
+        // Last resort: must remove cheapest hitter to make room — NEVER exceed cap
+        if (!bestC2) {
+          const hitterSlots3 = lineup
+            .filter(l => l.player && l.slot !== 'P' && l.slot !== 'C')
+            .sort((a,b) => a.player.salary - b.player.salary);
+          const cheapestHitter = hitterSlots3[0];
+          const cheapestC = rawCatchers.find(p => !usedNames2.has(p.name));
+          if (cheapestHitter && cheapestC) {
+            // Remove cheapest hitter, insert cheapest catcher regardless of replacement
+            const freed3 = remaining2 + cheapestHitter.player.salary;
+            if (cheapestC.salary <= freed3) {
+              lineup[lineup.indexOf(cheapestHitter)] = { slot: cheapestHitter.slot, player: { ...cheapestHitter.player, isOut: true, edgeScore: 0 } };
+              bestC2 = cheapestC;
+            }
+          }
+        }
 
         if (bestC2) {
-          // Force isOut=false and give reasonable edgeScore — immune to validation removal
           const base2 = players.find(p => p.name === bestC2.name) || bestC2;
-          const forcedC = { ...base2, isOut: false, status: 'C-Insurance',
-            edgeScore: Math.max(base2.edgeScore || 0, 40),
-            projPts: Math.max(base2.projPts || 0, base2.avgPts || 5) };
-          if (cSlotIdx2 >= 0) lineup[cSlotIdx2] = { slot: 'C', player: forcedC };
-          else lineup.splice(2, 0, { slot: 'C', player: forcedC });
-          console.log(`✅ Catcher inserted: ${forcedC.name} ($${forcedC.salary})`);
+          // ALWAYS force valid salary-safe insertion
+          const currentSal = lineup.filter(l => l.player && !l.player.isOut).reduce((s,l) => s + l.player.salary, 0);
+          if (currentSal + bestC2.salary > CAP + 100) {
+            console.warn(`Catcher salary overflow — skipping ${bestC2.name} ($${bestC2.salary}), sal=${currentSal}`);
+          } else {
+            const forcedC = { ...base2, isOut: false, status: 'C-Insurance',
+              edgeScore: Math.max(base2.edgeScore || 0, 40),
+              projPts: Math.max(base2.projPts || 0, base2.avgPts || 5) };
+            if (cSlotIdx2 >= 0) lineup[cSlotIdx2] = { slot: 'C', player: forcedC };
+            else lineup.splice(2, 0, { slot: 'C', player: forcedC });
+            console.log(`✅ Catcher inserted: ${forcedC.name} ($${forcedC.salary})`);
+
+            // Re-normalize edge scores after inserting catcher
+            const allEdges = lineup.filter(l => l.player && !l.player.isOut && l.player.edgeScore > 0).map(l => l.player.edgeScore);
+            const maxE = allEdges.length ? Math.max(...allEdges) : 99;
+            if (maxE > 0 && maxE < 99) {
+              const sf = 99 / maxE;
+              lineup = lineup.map(l => l.player ? {
+                ...l, player: { ...l.player, edgeScore: l.player.isOut ? 0 : Math.min(99, Math.round(l.player.edgeScore * sf)) }
+              } : l);
+            }
+          }
         }
       }
     }
