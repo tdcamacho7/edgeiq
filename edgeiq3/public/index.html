@@ -3374,24 +3374,22 @@ const POS_AVG_MAP = {
   mlb: { P:22, C:10, '1B':12, '2B':10, '3B':11, SS:11, OF:11, FLEX:11 },
 };
 
-// Ownership multiplier: rewards uniqueness, but projection quality must still win
-// Calibrated so a 12pt hitter at 15% own beats a 5pt hitter at 1% own
-// Old curve was too extreme (1%→1.80x) making ultra-contrarian always win
+// Ownership multiplier — ORIGINAL values that produced 95-99 edge scores
+// 1% own → 1.80x | 5% → 1.65x | 12% → 1.42x | 25% → 1.08x | 40%+ → 0.70x
 function ownershipMult(own) {
-  if (own <= 1)  return 1.35;  // very unique — real edge but not crazy
-  if (own <= 3)  return 1.28;
-  if (own <= 5)  return 1.22;
-  if (own <= 8)  return 1.15;
-  if (own <= 12) return 1.08;
-  if (own <= 18) return 1.00;  // average ownership = no bonus/penalty
-  if (own <= 25) return 0.92;
-  if (own <= 32) return 0.83;
-  if (own <= 40) return 0.76;
-  return 0.68; // 40%+ chalk = significant penalty in GPP
+  if (own <= 1)  return 1.80;
+  if (own <= 3)  return 1.72;
+  if (own <= 5)  return 1.65;
+  if (own <= 8)  return 1.55;
+  if (own <= 12) return 1.42;
+  if (own <= 18) return 1.25;
+  if (own <= 25) return 1.08;
+  if (own <= 32) return 0.92;
+  if (own <= 40) return 0.80;
+  return 0.70;
 }
 
 // Reliability: shrinks low-sample players toward position average
-// Prevents 3-game rookie averages from inflating projections
 function ceilingReliability(avgPts, posAvg) {
   return Math.min(1.0, Math.max(0.3, avgPts / Math.max(posAvg, 1)));
 }
@@ -3411,7 +3409,8 @@ function calcFirstPlaceScore(p) { return calcEdgeScore(p); }
 
 function calcEdgeScore(p) {
   if (p.isOut) return 0;
-  if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P') return 0; // hard block 0-avg hitters
+  // Hard block: hitters with 0 avgPts have no track record — not playing
+  if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P') return 0;
 
   const ceiling = p._ceiling || calcPlayerCeiling(p);
   p._ceiling    = ceiling;
@@ -3420,22 +3419,20 @@ function calcEdgeScore(p) {
   const avgPts = p.avgPts  || p.projPts || 15;
   const pos    = p.pos || 'FLEX';
 
-  // posMax: 50% slate best + 50% absolute historical max
-  // Balanced: gives slate context without over-rewarding scarce positions
+  // ORIGINAL posMax: 70% slate + 30% historical — gives 99 scores for slate leaders
   const posMaxMap      = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
   const absolutePosMax = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
   const slatePosMax    = slatePosCeilMax[pos] || 0;
   const posMax = slatePosMax > 5
-    ? slatePosMax * 0.50 + absolutePosMax * 0.50
+    ? slatePosMax * 0.70 + absolutePosMax * 0.30
     : absolutePosMax;
 
-  // Reliability-adjusted ceiling
+  // ORIGINAL adjCeil: shrinks toward posAvg * 1.4 (makes all positions viable)
   const posAvgMap = POS_AVG_MAP[sport] || POS_AVG_MAP.nba;
   const posAvg    = posAvgMap[pos] || 20;
   const rel       = ceilingReliability(avgPts, posAvg);
-  const adjCeil   = ceiling * rel + posAvg * (1 - rel);
+  const adjCeil   = ceiling * rel + (posAvg * 1.4) * (1 - rel);
 
-  // Ceiling fraction
   const ceilPct = Math.min(1.0, adjCeil / posMax);
 
   // Nash-adjusted ownership
@@ -3443,8 +3440,7 @@ function calcEdgeScore(p) {
   const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own;
   const effectiveOMult = ownershipMult(effectiveOwn);
 
-  // Core edge = ceiling quality × ownership uniqueness
-  // NO projQuality multiplier — it was killing scores for all normal players
+  // ORIGINAL core formula: ceiling × ownership → 99 for slate leaders
   const rawScore = ceilPct * effectiveOMult * 99;
 
   const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
