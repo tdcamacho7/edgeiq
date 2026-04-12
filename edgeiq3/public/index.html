@@ -4246,32 +4246,64 @@ async function buildAndRender() {
     lineup = bestLineupSoFar || optimize(players, sport) || [];
 
     // ── CATCHER INSURANCE ─────────────────────────────────────────────
-    // If C slot is empty after all optimization attempts, force-fill it
-    // with the best available catcher from the FULL player pool (no filters).
-    // Catcher is so scarce that we override all constraints to fill this slot.
+    // Guaranteed: C slot will ALWAYS be filled.
+    // If empty after optimization, swap the cheapest non-pitcher for a catcher.
     if (sport === 'mlb') {
       const cSlotIdx = lineup.findIndex(l => l.slot === 'C');
-      const cFilled  = cSlotIdx >= 0 && lineup[cSlotIdx].player;
+      const cFilled  = cSlotIdx >= 0 && lineup[cSlotIdx]?.player;
       if (!cFilled) {
         const usedNames = new Set(lineup.filter(l => l.player).map(l => l.player.name));
         const usedSal   = lineup.filter(l => l.player).reduce((s,l) => s + l.player.salary, 0);
-        const remaining = CAP - usedSal;
-        // Search ALL players (including those normally excluded) for a catcher
+        let remaining   = CAP - usedSal;
+
+        // Find all catchers in the full player list (ignoring isOut)
         const allCatchers = players
-          .filter(p => p.pos === 'C' && !p.isOut && p.salary <= remaining && !usedNames.has(p.name))
-          .sort((a,b) => b.edgeScore - a.edgeScore);
-        // If no un-excluded catcher, try all catchers in the CSV ignoring isOut
-        const catcherPool = allCatchers.length > 0 ? allCatchers
-          : players.filter(p => p.pos === 'C' && p.salary <= remaining && !usedNames.has(p.name))
-              .sort((a,b) => (b.avgPts||0) - (a.avgPts||0));
-        const bestC = catcherPool[0];
+          .filter(p => p.pos === 'C' && !usedNames.has(p.name))
+          .sort((a,b) => (b.avgPts||0) - (a.avgPts||0));
+
+        // Try catchers that fit current budget first
+        let bestC = allCatchers.find(p => p.salary <= remaining);
+
+        // If none fit, free budget by swapping out the cheapest hitter in lineup
+        if (!bestC) {
+          const hitterSlots = lineup.filter(l => l.player && l.slot !== 'P' && l.slot !== 'C');
+          hitterSlots.sort((a,b) => a.player.salary - b.player.salary); // cheapest first
+          for (const swapSlot of hitterSlots) {
+            const freed = remaining + swapSlot.player.salary;
+            const cCandidate = allCatchers.find(p => p.salary <= freed && !usedNames.has(p.name));
+            if (cCandidate) {
+              // Do the swap: remove cheap hitter, add catcher
+              const swapIdx = lineup.indexOf(swapSlot);
+              // Find replacement for the swapped slot
+              const swappedPos = swapSlot.slot;
+              const swappedPositions = swappedPos === 'FLEX' ? (FLEX_POS[sport]||[]) : [swappedPos];
+              const newRemaining = freed - cCandidate.salary;
+              const replacement = players
+                .filter(p => !p.isOut && swappedPositions.includes(p.pos) &&
+                  p.salary <= newRemaining && !usedNames.has(p.name) &&
+                  p.name !== cCandidate.name && p.avgPts > 0)
+                .sort((a,b) => b.edgeScore - a.edgeScore)[0];
+
+              if (replacement) {
+                lineup[swapIdx] = { slot: swappedPos, player: replacement };
+                usedNames.add(replacement.name);
+                usedNames.delete(swapSlot.player.name);
+                bestC = cCandidate;
+                break;
+              }
+            }
+          }
+        }
+
         if (bestC) {
           if (cSlotIdx >= 0) {
             lineup[cSlotIdx] = { slot: 'C', player: bestC };
           } else {
             lineup.push({ slot: 'C', player: bestC });
           }
-          console.log(`Catcher insurance: inserted ${bestC.name} (${bestC.avgPts}avg, $${bestC.salary})`);
+          console.log(`✅ Catcher insurance: ${bestC.name} ($${bestC.salary}, ${bestC.avgPts}avg)`);
+        } else {
+          console.error('❌ Could not fill C slot — no catchers available on slate');
         }
       }
     }
