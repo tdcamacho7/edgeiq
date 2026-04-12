@@ -1197,12 +1197,12 @@ function parseCsv(text){
     // 2. avgPts = 0 = never played this season = not in lineup
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
-    // 0 avgPts = player has never scored on DK this season = not playing / just called up / wrong position
-    // This is the DK historical average — if it's 0, the player is NOT a valid DFS option. Period.
-    const isZeroAvg = rawPos !== 'P' && avgPtsVal === 0; // ALL 0-avg hitters excluded, no salary exception
+    // 0 avgPts = player has never scored on DK this season = not playing / just called up
+    // EXCEPTION: catchers (C) — position is so thin we allow low-avg catchers
+    const isZeroAvg = rawPos !== 'P' && rawPos !== 'C' && avgPtsVal === 0;
     const isBenchPlayer = rawPos !== 'P' && (
-      (salary > 0 && salary < 3300) ||  // cheap = bench pricing
-      isZeroAvg                          // 0 avg = no track record
+      (salary > 0 && salary < 3300) ||
+      isZeroAvg
     );
     const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
     const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
@@ -3410,7 +3410,8 @@ function calcFirstPlaceScore(p) { return calcEdgeScore(p); }
 function calcEdgeScore(p) {
   if (p.isOut) return 0;
   // Hard block: hitters with 0 avgPts have no track record — not playing
-  if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P') return 0;
+  // EXCEPTION: catchers (C) — so few options that we allow low/zero avg catchers
+  if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P' && p.pos !== 'C') return 0;
 
   const ceiling = p._ceiling || calcPlayerCeiling(p);
   p._ceiling    = ceiling;
@@ -3743,13 +3744,13 @@ function optimize(all, sp) {
   // avgPts is the player's historical average — low avgPts = unreliable
   // A player who averages 10pts can't win you first place in NBA
   const minPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 10 : 6;  // hitters must project >= 6 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : p.pos === 'C' ? 4 : 6;
     if (sp === 'nba') return 18;
     if (sp === 'nfl') return 10;
     return 15;
   };
   const minAvgPts = (p) => {
-    if (sp === 'mlb') return p.pos === 'P' ? 10 : 6;  // hitters must avg >= 6 DK pts
+    if (sp === 'mlb') return p.pos === 'P' ? 10 : p.pos === 'C' ? 4 : 6;
     if (sp === 'nba') return 20;
     if (sp === 'nfl') return 10;
     return 10;
@@ -4310,8 +4311,9 @@ async function buildAndRender() {
     }
 
     // 2. Hard block: players with 0 avgPts (no track record — not playing)
+    // EXCEPTION: catchers — position too thin to apply this rule
     const zeroAvgInLineup = lineup.filter(l =>
-      l.player && l.player.pos !== 'P' && (l.player.avgPts || 0) === 0
+      l.player && l.player.pos !== 'P' && l.player.pos !== 'C' && (l.player.avgPts || 0) === 0
     );
     if (zeroAvgInLineup.length > 0) {
       const names = zeroAvgInLineup.map(l => l.player.name).join(', ');
