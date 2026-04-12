@@ -3651,12 +3651,12 @@ function optimize(all, sp) {
         const bringBackCandidate = bringBackCandidates[0] || null;
 
         const usedPitchers = new Set([p1.name, p2.name]);
-        // HARD RULE: Never use hitters from any pitcher's game.
-        // - Pitcher's own team: correlated with pitcher's failure (low-scoring game)
-        // - Pitcher's opponent: facing your pitcher — if pitcher dominates, they score 0
-        // blockedFromStack already contains both pitcher teams + both opponent teams.
+        // Block hitters from pitcher games — EXCEPT catchers.
+        // C is so scarce (1-2 viable per slate) that blocking them leaves C empty.
+        // A catcher on a pitcher's team doesn't meaningfully correlate with pitcher success.
         const availHitters = hitters.filter(h =>
-          !usedPitchers.has(h.name) && !blockedFromStack.has(h.team)
+          !usedPitchers.has(h.name) &&
+          (h.pos === 'C' || !blockedFromStack.has(h.team))
         );
 
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
@@ -3770,8 +3770,11 @@ function optimize(all, sp) {
   const viablePool = eligible.filter(p =>
     p.salary >= minSalaryFloor(p) &&
     hasValidHistory(p) &&
-    Math.max(p.avgPts || 0, p.projPts || 0) >= minPts(p) &&
-    (p.avgPts || 0) >= minAvgPts(p)
+    // Catchers: accept any with salary floor — position too thin for strict pts filter
+    (p.pos === 'C' || (
+      Math.max(p.avgPts || 0, p.projPts || 0) >= minPts(p) &&
+      (p.avgPts || 0) >= minAvgPts(p)
+    ))
   );
   let searchPool = viablePool;
   const needed = slots.length + 2;
@@ -4093,13 +4096,15 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
 
     // Best available fallback — minimum projection floor enforced using avgPts as ground truth
     if (!pick) {
+      const isC = positions.includes('C') && positions.length === 1;
+      const minAvg = isC ? 0 : 6; // catchers: take anything available; others: 6pt floor
       pick = sorted.find(p =>
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
-        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 6)
+        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= minAvg)
       ) || sorted.find(p =>
-        // Last resort: 5.5pt minimum — never pick bench/garbage players
+        // Last resort for non-C: 5.5pt minimum
         !used.has(p.name) && p.salary <= maxBudget && positions.includes(p.pos) &&
-        (slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 5.5)
+        (isC || slot === 'P' || Math.max(p.avgPts || 0, p.projPts || 0) >= 5.5)
       );
     }
 
