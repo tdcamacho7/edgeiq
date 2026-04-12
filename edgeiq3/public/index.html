@@ -1197,9 +1197,9 @@ function parseCsv(text){
     // 2. avgPts = 0 = never played this season = not in lineup
     // 3. Injury in name "(IL)", "(O)" already caught above
     const avgPtsVal = parseFloat(v[ai]) || 0;
-    // avgPts = 0 means: never played this season = not in lineup / just called up / non-roster
-    // DK prices these players but they are NOT playable — exclude them at parse time
-    const isZeroAvg = avgPtsVal === 0 && salary < 5000; // exclude cheap 0-avg players always
+    // 0 avgPts = player has never scored on DK this season = not playing / just called up / wrong position
+    // This is the DK historical average — if it's 0, the player is NOT a valid DFS option. Period.
+    const isZeroAvg = rawPos !== 'P' && avgPtsVal === 0; // ALL 0-avg hitters excluded, no salary exception
     const isBenchPlayer = rawPos !== 'P' && (
       (salary > 0 && salary < 3300) ||  // cheap = bench pricing
       isZeroAvg                          // 0 avg = no track record
@@ -3411,6 +3411,7 @@ function calcFirstPlaceScore(p) { return calcEdgeScore(p); }
 
 function calcEdgeScore(p) {
   if (p.isOut) return 0;
+  if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P') return 0; // hard block 0-avg hitters
 
   const ceiling = p._ceiling || calcPlayerCeiling(p);
   p._ceiling    = ceiling;
@@ -3419,44 +3420,32 @@ function calcEdgeScore(p) {
   const avgPts = p.avgPts  || p.projPts || 15;
   const pos    = p.pos || 'FLEX';
 
-  // posMax: 30% slate best + 70% absolute historical max
-  // WHY: 70% slate was making scarce positions (e.g. only 1 viable C)
-  // inflate edge for bad players just because they're the "best at C".
-  // 70% historical anchors to realistic maximums regardless of slate scarcity.
+  // posMax: 50% slate best + 50% absolute historical max
+  // Balanced: gives slate context without over-rewarding scarce positions
   const posMaxMap      = POS_CEIL_MAX[sport] || POS_CEIL_MAX.nba;
   const absolutePosMax = posMaxMap[pos] || posMaxMap['FLEX'] || 65;
   const slatePosMax    = slatePosCeilMax[pos] || 0;
   const posMax = slatePosMax > 5
-    ? slatePosMax * 0.30 + absolutePosMax * 0.70
+    ? slatePosMax * 0.50 + absolutePosMax * 0.50
     : absolutePosMax;
 
-  // Reliability-adjusted ceiling — shrinks low-sample players toward position average
-  // FIX: shrink toward posAvg, NOT posAvg*1.4 — the 1.4x was artificially inflating weak players
+  // Reliability-adjusted ceiling
   const posAvgMap = POS_AVG_MAP[sport] || POS_AVG_MAP.nba;
   const posAvg    = posAvgMap[pos] || 20;
   const rel       = ceilingReliability(avgPts, posAvg);
-  const adjCeil   = ceiling * rel + posAvg * (1 - rel); // shrink to posAvg, not posAvg*1.4
+  const adjCeil   = ceiling * rel + posAvg * (1 - rel);
 
-  // Ceiling fraction: how close to tonight's best is this player?
+  // Ceiling fraction
   const ceilPct = Math.min(1.0, adjCeil / posMax);
-
-  // PROJECTION QUALITY MULTIPLIER
-  // Uses sqrt() so it's proportional but not brutally harsh on below-average players.
-  // A 7pt hitter at pos avg 11 gets sqrt(7/11)=0.80 (20% reduction, not 36%)
-  // A 4pt catcher at pos avg 10 gets sqrt(4/10)=0.63 (still significant penalty)
-  // Capped at 1.15 so elite producers get a moderate bonus, not unbounded
-  const baseAvgPts = Math.max(avgPts, p.projPts || 0);
-  const projQuality = Math.min(1.15, Math.max(0.45,
-    Math.sqrt(baseAvgPts / Math.max(posAvg, 1))
-  ));
 
   // Nash-adjusted ownership
   const nashOwn = (nashData?.ownership?.[p.name]) || null;
   const effectiveOwn = nashOwn != null ? (own * 0.4 + nashOwn * 0.6) : own;
   const effectiveOMult = ownershipMult(effectiveOwn);
 
-  // Core edge = ceiling quality × ownership uniqueness × projection quality
-  const rawScore = ceilPct * effectiveOMult * projQuality * 99;
+  // Core edge = ceiling quality × ownership uniqueness
+  // NO projQuality multiplier — it was killing scores for all normal players
+  const rawScore = ceilPct * effectiveOMult * 99;
 
   const mcBoost = Math.min(3, (p._mcFirstPlaceProb || 0) * 15);
 
@@ -3489,22 +3478,17 @@ function calcEdgeScore(p) {
   }
 
   // DvP matchup bonuses and penalties
-  // Elite matchup = facing a bottom-5 defense at this position → real scoring edge
-  // Good matchup = facing a bottom-10 defense → moderate boost
   if (p.dvpLabel?.badge === 'elite matchup')      score = Math.min(99, score + 12);
   else if (p.dvpLabel?.badge === 'good matchup')  score = Math.min(99, score + 6);
   else if (p.dvpLabel?.badge === 'bad matchup')   score = Math.max(10, score - 12);
   else if (p.dvpLabel?.badge === 'tough matchup') score = Math.max(10, score - 5);
 
-  // PROJECTION FLOOR: low-projection players cannot win you GPPs
-  // CRITICAL: use avgPts (DK historical) NOT projPts — projPts is already
-  // penalized by signals and can be artificially crushed to 4pt from a real 7pt hitter.
-  // avgPts is the ground truth: what this player actually scores on average.
+  // PROJECTION FLOOR: only hard-block players with truly no production history
+  // Do NOT cap normal MLB hitters (7-10pt avg) — that was killing scores
   if (pos !== 'P') {
-    const baseCheck = Math.max(p.avgPts || 0, p.projPts || 0); // highest of raw or adjusted
-    if (baseCheck < 3)  score = Math.min(score, 20); // never played = dead play
-    if (baseCheck < 5)  score = Math.min(score, 45); // truly very low avg
-    // Removed the < 7 cap — normal MLB hitters avg 6-10pts and shouldn't be capped at 65
+    const baseCheck = Math.max(p.avgPts || 0, p.projPts || 0);
+    if (baseCheck === 0) return 0;         // zero history = never plays = exclude
+    if (baseCheck < 3)  score = Math.min(score, 20); // near-zero = dead play
   }
 
   // Terrible pitcher (negative FPPG avg) — hard cap, never pick
