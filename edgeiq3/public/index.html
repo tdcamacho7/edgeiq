@@ -3574,7 +3574,8 @@ function optimize(all, sp) {
         const p1 = topPitchers[i], p2 = topPitchers[j];
         const remainingBudget = CAP - p1.salary - p2.salary;
         // Need enough for 8 hitter slots at $3,500 avg minimum (realistic quality floor)
-        if (remainingBudget < hitterSlots.length * 3500) continue;
+        // Need enough for 8 hitter slots — $3,000 avg minimum (catchers can be $3,000-4,000)
+        if (remainingBudget < hitterSlots.length * 3000) continue;
 
         // Blocked teams: pitcher's OWN team + pitcher's OPPONENT team
         // Own team: stacking your own pitcher's teammates suppresses their ceiling
@@ -3676,8 +3677,7 @@ function optimize(all, sp) {
         }
 
         const hitterLineup = greedyFillSlots(availHitters, hitterSlots, remainingBudget, sp, stackTeam, bringBackCandidate);
-        // Accept lineup even if C is empty — catcher insurance fills it later
-        if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length - 1) continue;
+        if (!hitterLineup || hitterLineup.filter(l=>l.player).length < hitterSlots.length) continue;
 
         // ── 2-OPT SWAP OPTIMIZATION ───────────────────────────────────
         // After greedy fill, try swapping each player with a better alternative.
@@ -4018,6 +4018,11 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   let salLeft  = budget;
   const lineup = [];
   const MIN    = 2500;
+  // For MLB: reserve $3000 for C slot if pool has no catchers yet
+  // This prevents other slots from consuming all budget before C is filled
+  const needsCReserve = sp === 'mlb' && !pool.some(p => p.pos === 'C');
+  const C_RESERVE = needsCReserve && typeof rawCatchers !== 'undefined' && rawCatchers.length > 0
+    ? Math.min(...rawCatchers.map(c => c.salary)) : 0;
 
   // ── IDENTIFY STACK TEAM ───────────────────────────────────────────
   // Best team = highest avg edge score among top-4 hitters at 3+ positions
@@ -4044,7 +4049,10 @@ function greedyFillSlots(pool, slots, budget, sp, presetStackTeam = null, bringB
   // We track how many slots remain to FORCE the stack when necessary.
   for (const slot of slots) {
     const remaining   = slots.length - lineup.length - 1;
-    const maxBudget   = salLeft - (remaining * MIN);
+    // Reserve minimum for C if no catcher in pool and C slot not yet filled
+    const cAlreadyFilled = lineup.some(l => l.slot === 'C' && l.player);
+    const activeReserve = (needsCReserve && !cAlreadyFilled && slot !== 'C') ? C_RESERVE : 0;
+    const maxBudget   = salLeft - (remaining * MIN) - activeReserve;
     const stackCount  = lineup.filter(l => l.player?.team === stackTeam && l.slot !== 'P').length;
     const stackSlots  = slots.slice(lineup.length + 1).filter(s => s !== 'P').length;
     const needMore    = Math.max(0, 4 - stackCount);
