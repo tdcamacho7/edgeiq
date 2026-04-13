@@ -2690,19 +2690,17 @@ function enrich(raw) {
 
   return raw.map((p, i) => {
     // ── HARD BLOCK: OUT/IL players ──────────────────────────────────
-    // Permanently zero them — they NEVER re-enter via relaxation
+    // Permanently excluded — keep avgPts so relaxation can restore projPts if needed
     const finalIsOut = p.isOut || isManuallyOut(p.name) ||
       (p.status && ['out','ir','il','inactive','suspended','not on active roster',
         'not in starting lineup','ppd'].some(s => (p.status||'').toLowerCase().includes(s)));
     if (finalIsOut) {
-      return { ...p, isOut: true, edgeScore: 0, projPts: 0, _ceiling: 0,
+      return { ...p, isOut: true, edgeScore: 0, projPts: p.avgPts || 0, _ceiling: 0,
         projOwn: p.fpOwnership != null ? Math.round(p.fpOwnership) : estimateOwnership(p, sport) };
     }
 
-    // ── ZERO avgPts = no track record = exclude ──────────────────────
-    // These players have never accumulated DK points — they are not in the lineups
-    // DK assigns 0 avgPts to: newly called up, IL, non-rostered, position-ineligible
-    if ((p.avgPts || 0) === 0 && !p.realProjection) {
+    // ── ZERO avgPts = no track record = exclude (catchers exempted) ──────────────────────
+    if ((p.avgPts || 0) === 0 && !p.realProjection && p.pos !== 'P' && p.pos !== 'C') {
       return { ...p, isOut: true, edgeScore: 0, projPts: 0, _ceiling: 0,
         projOwn: p.fpOwnership != null ? Math.round(p.fpOwnership) : estimateOwnership(p, sport) };
     }
@@ -3602,7 +3600,7 @@ function optimize(all, sp) {
             );
             const viablePositions = new Set(viablePlayers.map(p => p.pos));
             // Need 4 viable players at 3+ positions — guarantees a real 4-man stack exists
-            return viablePlayers.length >= 4 && viablePositions.size >= 3;
+            return viablePlayers.length >= 3 && viablePositions.size >= 3;
           })
           .map(([team, t]) => {
             const viablePlayers = t.players
@@ -4339,7 +4337,9 @@ async function buildAndRender() {
           const base = Math.max(p.avgPts || 0, p.projPts || 0);
           if (base === 0) return p;
           if (base >= relaxThreshold && p.salary >= 3300 && p.pos !== 'P') {
-            const restored = { ...p, isOut: false };
+            // Restore projPts from avgPts — the hard-exit zeroed it
+            const restoredProjPts = Math.max(p.avgPts || 0, p.projPts || 0, base);
+            const restored = { ...p, isOut: false, projPts: restoredProjPts };
             return { ...restored, edgeScore: calcEdgeScore(restored) };
           }
           return p;
@@ -4385,17 +4385,25 @@ async function buildAndRender() {
     }
 
     // 3. Hard block: players projecting 0.0 pts (exempting catchers — scarce position)
+    // FIX: if avgPts > 0, restore projPts instead of excluding — relaxation may have zeroed it
     const zeroProj = lineup.filter(l =>
       l.player && (l.player.projPts || 0) <= 0.1 &&
       l.player.pos !== 'P' && l.player.pos !== 'C'
     );
     if (zeroProj.length > 0) {
       const names = zeroProj.map(l => l.player.name).join(', ');
-      console.error(`🚨 Zero-projection players in lineup: ${names}`);
-      players = players.map(p =>
-        zeroProj.some(l => l.player.name === p.name)
-          ? { ...p, isOut: true, edgeScore: 0 } : p
-      );
+      console.error(`🚨 Zero-projection players: ${names} — restoring from avgPts or excluding`);
+      players = players.map(p => {
+        if (!zeroProj.some(l => l.player.name === p.name)) return p;
+        const avgBase = Math.max(p.avgPts || 0, 0);
+        if (avgBase > 3) {
+          // Restore projPts from avgPts — relaxation zeroed it incorrectly
+          const fixed = { ...p, projPts: avgBase, isOut: false };
+          return { ...fixed, edgeScore: calcEdgeScore(fixed) };
+        }
+        // Truly zero avg — hard exclude
+        return { ...p, isOut: true, edgeScore: 0 };
+      });
       lineup = optimize(players, sport) || lineup;
     }
 
