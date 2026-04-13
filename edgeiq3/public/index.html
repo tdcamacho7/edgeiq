@@ -1197,23 +1197,27 @@ function parseCsv(text){
     // DK prices confirmed non-starters at $2,000-2,700 minimum
     // We use $2,800 as the cutoff to be safe
     // Normalize DK MLB position strings
-    let rawPos = (v[pi]||'').split('/')[0].toUpperCase().trim();
+    const rosterPos = (v[pi]||'').toUpperCase().trim(); // keep original for RP check
+    let rawPos = rosterPos.split('/')[0];
     if (['SP','RP','P'].includes(rawPos)) rawPos = 'P';
     if (['CF','LF','RF'].includes(rawPos)) rawPos = 'OF';
     const pos = rawPos || 'FLEX';
-    // Three signals for non-starters:
-    // 1. Very low salary ($3,300- for hitters) = bench/non-starter pricing
-    // 2. avgPts = 0 = never played this season = not in lineup
-    // 3. Injury in name "(IL)", "(O)" already caught above
+
     const avgPtsVal = parseFloat(v[ai]) || 0;
-    // 0 avgPts = player has never scored on DK this season = not playing / just called up
+
+    // Relief pitchers (RP) have much lower ceilings than starters (SP).
+    // DK includes both SP and RP in the P pool. Mark RPs as terrible pitchers
+    // so they get hard-capped at edge 30 and won't be selected.
+    const isReliefer = rosterPos === 'RP';
+
+    // 0 avgPts = player has never scored on DK = not playing / just called up
     // EXCEPTION: catchers (C) — position is so thin we allow low-avg catchers
     const isZeroAvg = rawPos !== 'P' && rawPos !== 'C' && avgPtsVal === 0;
     const isBenchPlayer = rawPos !== 'P' && (
       (salary > 0 && salary < 3300) ||
       isZeroAvg
     );
-    const isTerriblyBadPitcher = rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0;
+    const isTerriblyBadPitcher = isReliefer || (rawPos === 'P' && avgPtsVal < 2 && avgPtsVal !== 0);
     const finalIsOut = isOut || isBenchPlayer || isManuallyOut(name);
     const terriblePitcher = isTerriblyBadPitcher || false;
     // Flag rain/PPD games — DK sometimes includes PPD in game info
@@ -3570,9 +3574,14 @@ function optimize(all, sp) {
     for (let i = 0; i < topPitchers.length; i++) {
       for (let j = i + 1; j < topPitchers.length; j++) {
         const p1 = topPitchers[i], p2 = topPitchers[j];
+
+        // HARD RULE: Two pitchers cannot be from the same team — only one starts per game
+        if (p1.team === p2.team) continue;
+
+        // HARD RULE: Two pitchers cannot pitch in the same game — same gameInfo means same game
+        if (p1.gameInfo && p2.gameInfo && p1.gameInfo === p2.gameInfo) continue;
+
         const remainingBudget = CAP - p1.salary - p2.salary;
-        // Need enough for 8 hitter slots at $3,500 avg minimum (realistic quality floor)
-        // Need enough for 8 hitter slots — $3,000 avg minimum (catchers can be $3,000-4,000)
         if (remainingBudget < hitterSlots.length * 3000) continue;
 
         // Blocked teams: pitcher's OWN team + pitcher's OPPONENT team
@@ -4349,6 +4358,27 @@ async function buildAndRender() {
     }
 
     // ══ PRE-RENDER LINEUP AUDIT ══════════════════════════════════════
+
+    // 0. Same-team pitcher check — two pitchers from same team is impossible
+    // One of them is a reliever or scratch — remove the lower-avgPts one
+    if (sport === 'mlb') {
+      const pitchersInLineup = lineup.filter(l => l.player && l.player.pos === 'P');
+      if (pitchersInLineup.length >= 2) {
+        for (let a = 0; a < pitchersInLineup.length; a++) {
+          for (let b = a + 1; b < pitchersInLineup.length; b++) {
+            const pa = pitchersInLineup[a].player, pb = pitchersInLineup[b].player;
+            if (pa.team === pb.team || (pa.gameInfo && pa.gameInfo === pb.gameInfo)) {
+              // Remove the worse pitcher and rebuild
+              const worse = (pa.avgPts || 0) >= (pb.avgPts || 0) ? pb : pa;
+              console.error(`🚨 Same-team/game pitchers: ${pa.name} + ${pb.name} — removing ${worse.name}`);
+              players = players.map(p => p.name === worse.name ? { ...p, isOut: true, edgeScore: 0 } : p);
+              lineup = optimize(players, sport) || lineup;
+              break;
+            }
+          }
+        }
+      }
+    }
     // Comprehensive validation before showing any lineup to the user.
     // Any failure triggers a rebuild attempt, then a clear error if still failing.
     if (!lineup || !lineup.length) {
