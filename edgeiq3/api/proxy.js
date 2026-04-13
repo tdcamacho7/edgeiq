@@ -1,754 +1,1078 @@
-export const config = { maxDuration: 60 }; // Vercel Pro: 60s, Free: 10s
+"""
+MacroIQ Engine - v2
+Scrapes BLS and Fed calendars for accurate economic release data.
+No yfinance, no FRED calendar API, no wrong events.
+Groq writes the AI context for each event.
+"""
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
+import os
+import json
+import asyncio
+import logging
+import datetime
+import urllib.request
+from zoneinfo import ZoneInfo
 
-  const { dgId, sport, action } = req.query;
-  const scraperKey = process.env.SCRAPER_API_KEY;
-  const oddsKey   = process.env.ODDS_API_KEY;
+from groq import AsyncGroq
 
-  // ── FETCH HELPERS ────────────────────────────────────────────────
-  async function fetchDirect(url, timeout = 8000) {
-    return fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/html, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.google.com/',
-      },
-      signal: AbortSignal.timeout(timeout),
-    });
-  }
+log = logging.getLogger("MacroEngine")
 
-  async function fetchScraper(url, render = false, timeout = 20000) {
-    if (!scraperKey) return fetchDirect(url, timeout);
-    const credits = render ? '&render=true' : '';
-    const proxyUrl = `http://api.scraperapi.com?api_key=${scraperKey}&url=${encodeURIComponent(url)}${credits}`;
-    return fetch(proxyUrl, { signal: AbortSignal.timeout(Math.min(timeout, 12000)) });
-  }
+ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")
 
-  // ── OWNERSHIP ACTION ─────────────────────────────────────────────
-  if (action === 'ownership') {
-    const sp = sport || 'nba';
-    const ownershipMap = await fetchAllOwnership(sp);
-    return res.status(200).json({
-      ownership: ownershipMap,
-      sourcesHit: Object.keys(ownershipMap).length,
-    });
-  }
 
-  // ── FETCH OWNERSHIP FROM ALL FREE SOURCES ────────────────────────
-  // Rotowire: free JSON endpoint, no ScraperAPI needed
-  async function fetchRotowireOwnership(sp) {
-    const path = sp === 'mlb' ? 'mlb' : sp === 'nba' ? 'nba' : 'nfl';
-    try {
-      const r = await fetch(
-        `https://www.rotowire.com/daily/tables/optimizer-${path}.php`,
-        { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' } }
-      );
-      if (!r.ok) return {};
-      const data = await r.json();
-      const map = {};
-      (Array.isArray(data) ? data : data.players || Object.values(data) || []).forEach(p => {
-        const name = (p.player_name || p.name || p.playerName || '').toLowerCase().trim();
-        const own  = parseFloat(p.owned || p.ownership || p.own_pct || p.percentDrafted || 0);
-        if (name && own > 0) {
-          map[name] = own;
-          const last = name.split(' ').pop();
-          if (last.length > 3) map[last] = own;
+# ── Impact scoring ─────────────────────────────────────────────────────────────
+EVENT_PROFILES = {
+    "FOMC":                      {"hist_vol": 98, "surprise_sens": 95, "contagion": 99, "iv_buildup": 92, "regime_fit": 90},
+    "Federal Funds Rate":        {"hist_vol": 98, "surprise_sens": 95, "contagion": 99, "iv_buildup": 92, "regime_fit": 90},
+    "FOMC Rate Decision":        {"hist_vol": 98, "surprise_sens": 95, "contagion": 99, "iv_buildup": 92, "regime_fit": 90},
+    "Jerome Powell Press Conference": {"hist_vol": 90, "surprise_sens": 92, "contagion": 95, "iv_buildup": 85, "regime_fit": 88},
+    "Consumer Price Index":   {"hist_vol": 84, "surprise_sens": 90, "contagion": 86, "iv_buildup": 72, "regime_fit": 88},
+    "CPI":                    {"hist_vol": 84, "surprise_sens": 90, "contagion": 86, "iv_buildup": 72, "regime_fit": 88},
+    "Core CPI":               {"hist_vol": 84, "surprise_sens": 90, "contagion": 86, "iv_buildup": 72, "regime_fit": 88},
+    "PCE":                    {"hist_vol": 78, "surprise_sens": 82, "contagion": 76, "iv_buildup": 65, "regime_fit": 80},
+    "Core PCE":               {"hist_vol": 78, "surprise_sens": 82, "contagion": 76, "iv_buildup": 65, "regime_fit": 80},
+    "Nonfarm Payrolls":       {"hist_vol": 72, "surprise_sens": 78, "contagion": 75, "iv_buildup": 60, "regime_fit": 70},
+    "Employment Situation":   {"hist_vol": 72, "surprise_sens": 78, "contagion": 75, "iv_buildup": 60, "regime_fit": 70},
+    "Unemployment Rate":      {"hist_vol": 55, "surprise_sens": 60, "contagion": 65, "iv_buildup": 40, "regime_fit": 62},
+    "GDP":                    {"hist_vol": 60, "surprise_sens": 65, "contagion": 68, "iv_buildup": 48, "regime_fit": 60},
+    "Gross Domestic Product": {"hist_vol": 60, "surprise_sens": 65, "contagion": 68, "iv_buildup": 48, "regime_fit": 60},
+    "Retail Sales":           {"hist_vol": 52, "surprise_sens": 55, "contagion": 50, "iv_buildup": 38, "regime_fit": 55},
+    "Producer Price Index":   {"hist_vol": 68, "surprise_sens": 72, "contagion": 65, "iv_buildup": 60, "regime_fit": 70},
+    "PPI":                    {"hist_vol": 68, "surprise_sens": 72, "contagion": 65, "iv_buildup": 60, "regime_fit": 70},
+    "Consumer Sentiment":     {"hist_vol": 18, "surprise_sens": 22, "contagion": 15, "iv_buildup": 10, "regime_fit": 28},
+    "Consumer Confidence":    {"hist_vol": 20, "surprise_sens": 24, "contagion": 18, "iv_buildup": 12, "regime_fit": 30},
+    "Durable Goods":          {"hist_vol": 38, "surprise_sens": 40, "contagion": 35, "iv_buildup": 25, "regime_fit": 40},
+    "ISM Manufacturing":      {"hist_vol": 45, "surprise_sens": 48, "contagion": 42, "iv_buildup": 32, "regime_fit": 45},
+    "ISM Services":           {"hist_vol": 48, "surprise_sens": 50, "contagion": 44, "iv_buildup": 34, "regime_fit": 48},
+    "Housing Starts":         {"hist_vol": 30, "surprise_sens": 32, "contagion": 28, "iv_buildup": 18, "regime_fit": 32},
+    "Existing Home Sales":    {"hist_vol": 28, "surprise_sens": 30, "contagion": 25, "iv_buildup": 15, "regime_fit": 30},
+    "Initial Jobless Claims": {"hist_vol": 45, "surprise_sens": 48, "contagion": 42, "iv_buildup": 35, "regime_fit": 50},
+    "Jobless Claims":         {"hist_vol": 45, "surprise_sens": 48, "contagion": 42, "iv_buildup": 35, "regime_fit": 50},
+    "Trade Balance":          {"hist_vol": 25, "surprise_sens": 28, "contagion": 22, "iv_buildup": 14, "regime_fit": 28},
+    "Factory Orders":         {"hist_vol": 30, "surprise_sens": 32, "contagion": 28, "iv_buildup": 18, "regime_fit": 32},
+    "Job Openings":           {"hist_vol": 48, "surprise_sens": 50, "contagion": 45, "iv_buildup": 35, "regime_fit": 52},
+    "JOLTS":                  {"hist_vol": 48, "surprise_sens": 50, "contagion": 45, "iv_buildup": 35, "regime_fit": 52},
+    "Monthly OPEX":           {"hist_vol": 55, "surprise_sens": 30, "contagion": 60, "iv_buildup": 90, "regime_fit": 70},
+    "Quarterly MOPEX":        {"hist_vol": 70, "surprise_sens": 35, "contagion": 75, "iv_buildup": 95, "regime_fit": 80},
+}
+
+# FRED release name → trader-friendly display name + default time
+# Keys are lowercase substrings of the exact FRED release_name field
+FRED_RELEASE_MAP = {
+    "consumer price index":                      ("Consumer Price Index (CPI)",          "8:30 AM"),
+    "producer price index":                      ("Producer Price Index (PPI)",          "8:30 AM"),
+    "employment situation":                      ("Nonfarm Payrolls",                    "8:30 AM"),
+    "unemployment insurance weekly claims":      ("Initial Jobless Claims",              "8:30 AM"),
+    "job openings and labor turnover":           ("Job Openings (JOLTS)",                "10:00 AM"),
+    "advance monthly sales for retail":          ("Retail Sales",                        "8:30 AM"),
+    "personal income and outlays":               ("PCE / Personal Income & Spending",    "8:30 AM"),
+    "gross domestic product":                    ("GDP",                                 "8:30 AM"),
+    "durable goods":                             ("Durable Goods Orders",                "8:30 AM"),
+    "manufacturers' shipments":                  ("Durable Goods Orders",                "8:30 AM"),
+    "employment cost index":                     ("Employment Cost Index",               "8:30 AM"),
+    "u.s. international trade":                  ("Trade Balance",                       "8:30 AM"),
+    "new residential construction":              ("Housing Starts",                      "8:30 AM"),
+    "existing home sales":                       ("Existing Home Sales",                 "10:00 AM"),
+    "university of michigan":                    ("Consumer Sentiment (UMich)",          "10:00 AM"),
+    "survey of consumers":                       ("Consumer Sentiment (UMich)",          "10:00 AM"),
+    "consumer confidence":                       ("Consumer Confidence",                 "10:00 AM"),
+    "productivity and costs":                    ("Productivity & Unit Labor Costs",     "8:30 AM"),
+    "g.17 industrial production":                ("Industrial Production",               "9:15 AM"),
+    "factory orders":                            ("Factory Orders",                      "10:00 AM"),
+    "new residential sales":                     ("New Home Sales",                      "10:00 AM"),
+    "construction spending":                     ("Construction Spending",               "10:00 AM"),
+    "gdp advance":                               ("GDP (Advance Estimate)",              "8:30 AM"),
+    "national income":                           ("GDP",                                 "8:30 AM"),
+}
+
+
+def score_event(event_name: str) -> tuple[int, str]:
+    """Returns (composite_score, tier) for an event."""
+    name_lower = event_name.lower()
+    profile = None
+    for key, val in EVENT_PROFILES.items():
+        if key.lower() in name_lower:
+            profile = val
+            break
+    if not profile:
+        return 20, "LOW"
+    composite = round(sum(profile.values()) / len(profile))
+    if composite >= 88:
+        tier = "EXTREME"
+    elif composite >= 65:
+        tier = "HIGH"
+    elif composite >= 40:
+        tier = "MEDIUM"
+    else:
+        tier = "LOW"
+    return composite, tier
+
+
+# ── FRED release IDs for historical date lookups ───────────────────────────────
+# Maps friendly event name keywords → FRED release_id
+# Used to fetch the last N release dates for historical ETF performance
+FRED_RELEASE_IDS = {
+    "consumer price index": 10,
+    "producer price index": 46,
+    "nonfarm payrolls":     50,
+    "employment situation": 50,
+    "initial jobless claims": 180,
+    "jobless claims":       180,
+    "retail sales":         9,
+    "pce":                  54,
+    "personal income":      54,
+    "gdp":                  53,
+    "job openings":         251,
+    "jolts":                251,
+    "ism manufacturing":    None,  # ISM not on FRED
+    "ism services":         None,
+    "fomc":                 101,
+}
+
+def get_fred_release_id(event_name: str) -> int | None:
+    """Returns FRED release_id for a given event name, or None if not found."""
+    lower = event_name.lower()
+    for key, rid in FRED_RELEASE_IDS.items():
+        if key in lower:
+            return rid
+    return None
+
+
+def scrape_bls_release_dates(report_slug: str, n: int = 3) -> list[str]:
+    """
+    Scrapes BLS schedule pages to get actual headline announcement dates.
+    report_slug examples: 'ppi', 'cpi', 'empsit' (NFP), 'jolts', 'retail'
+    These are official BLS announcement dates — not FRED ingestion dates.
+    """
+    try:
+        today_str = datetime.date.today().isoformat()
+        url = f"https://www.bls.gov/schedule/news_release/{report_slug}.htm"
+        req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+
+        # BLS schedule pages list dates in format: "Month DD, YYYY"
+        # e.g. "January 14, 2026" or "February 27, 2026"
+        import re
+        pattern = r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(20\d{2})'
+        matches = re.findall(pattern, content)
+
+        months = {
+            "January": 1, "February": 2, "March": 3, "April": 4,
+            "May": 5, "June": 6, "July": 7, "August": 8,
+            "September": 9, "October": 10, "November": 11, "December": 12
         }
-      });
-      return map;
-    } catch(e) { return {}; }
-  }
 
-  async function fetchAllOwnership(sp) {
-    // Try Rotowire first — free, no ScraperAPI credits
-    const rotowire = await fetchRotowireOwnership(sp).catch(() => ({}));
-    if (Object.keys(rotowire).length > 15) return rotowire;
+        dates = []
+        for month_name, day, year in matches:
+            try:
+                d = datetime.date(int(year), months[month_name], int(day))
+                date_str = d.isoformat()
+                if date_str < today_str and date_str not in dates:
+                    dates.append(date_str)
+            except ValueError:
+                continue
 
-    // Fall back to ScraperAPI sources
-    const sources = await Promise.allSettled([
-      fetchFantasyProsOwnership(sp),
-      fetchRotogrindersOwnership(sp),
-      fetchNumberFireOwnership(sp),
-      fetchDailyFantasyFuelOwnership(sp),
-    ]);
+        # Sort descending, take n most recent
+        dates.sort(reverse=True)
+        log.info(f"BLS schedule scrape for {report_slug}: {dates[:n]}")
+        return dates[:n]
 
-    // Aggregate all sources — average ownership % across sources
-    const combined = {};
-    const counts   = {};
+    except Exception as e:
+        log.warning(f"BLS schedule scrape failed for {report_slug}: {e}")
+        return []
 
-    for (const result of sources) {
-      if (result.status !== 'fulfilled') continue;
-      const data = result.value || {};
-      for (const [name, pct] of Object.entries(data)) {
-        if (!name || typeof pct !== 'number') continue;
-        combined[name] = (combined[name] || 0) + pct;
-        counts[name]   = (counts[name]   || 0) + 1;
-      }
-    }
 
-    // Average across sources
-    const averaged = {};
-    for (const name of Object.keys(combined)) {
-      averaged[name] = Math.round(combined[name] / counts[name]);
-    }
-    return averaged;
-  }
+# Map event names to BLS schedule page slugs
+BLS_SCHEDULE_SLUGS = {
+    "consumer price index": "cpi",
+    "producer price index": "ppi",
+    "nonfarm payrolls":     "empsit",
+    "employment situation": "empsit",
+    "initial jobless claims": "unemploy",
+    "jobless claims":       "unemploy",
+    "retail sales":         "retail",
+    "job openings":         "jolts",
+    "jolts":                "jolts",
+    "pce":                  None,  # BEA not BLS
+    "personal income":      None,
+    "gdp":                  None,
+}
 
-  // ── SOURCE 1: FANTASYPROS DFS ────────────────────────────────────
-  async function fetchFantasyProsOwnership(sp) {
-    const urls = {
-      nba: 'https://www.fantasypros.com/nba/dfs/draftkings-player-ownership-projections.php',
-      nfl: 'https://www.fantasypros.com/nfl/dfs/draftkings-player-ownership-projections.php',
-      mlb: 'https://www.fantasypros.com/mlb/dfs/draftkings-player-ownership-projections.php',
-    };
-    try {
-      const r = await fetchScraper(urls[sp] || urls.nba, false, 15000);
-      if (!r.ok) return {};
-      const html = await r.text();
-      return parseOwnershipHTML(html, 'fantasypros');
-    } catch(e) { return {}; }
-  }
+def get_historical_release_dates(event_name: str, n: int = 3) -> list[str]:
+    """
+    Returns last N confirmed release dates for a given event.
+    Uses FMP economic calendar as primary source — actual BLS announcement dates.
+    Falls back to FRED release dates API if FMP fails.
+    """
+    name_lower = event_name.lower()
+    today = datetime.date.today()
+    from_date = (today - datetime.timedelta(days=180)).isoformat()
+    to_date   = today.isoformat()
+    api_key   = os.getenv("FMP_API_KEY", "")
 
-  // ── SOURCE 2: ROTOGRINDERS ───────────────────────────────────────
-  async function fetchRotogrindersOwnership(sp) {
-    const urls = {
-      nba: 'https://rotogrinders.com/projected-ownership/nba?site=draftkings',
-      nfl: 'https://rotogrinders.com/projected-ownership/nfl?site=draftkings',
-      mlb: 'https://rotogrinders.com/projected-ownership/mlb?site=draftkings',
-    };
-    try {
-      // Needs JavaScript rendering
-      const r = await fetchScraper(urls[sp] || urls.nba, true, 25000);
-      if (!r.ok) return {};
-      const html = await r.text();
-      return parseOwnershipHTML(html, 'rotogrinders');
-    } catch(e) { return {}; }
-  }
+    if api_key:
+        try:
+            url = (
+                f"https://financialmodelingprep.com/stable/economic-calendar"
+                f"?from={from_date}&to={to_date}&apikey={api_key}"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
 
-  // ── SOURCE 3: NUMBERFIRE ─────────────────────────────────────────
-  async function fetchNumberFireOwnership(sp) {
-    const urls = {
-      nba: 'https://www.numberfire.com/nba/daily-fantasy/daily-basketball-projections',
-      nfl: 'https://www.numberfire.com/nfl/daily-fantasy/daily-football-projections',
-      mlb: 'https://www.numberfire.com/mlb/daily-fantasy/daily-baseball-projections',
-    };
-    try {
-      const r = await fetchScraper(urls[sp] || urls.nba, false, 15000);
-      if (!r.ok) return {};
-      const html = await r.text();
-      return parseOwnershipHTML(html, 'numberfire');
-    } catch(e) { return {}; }
-  }
+            # Match events by name — use keyword matching
+            matched = []
+            name_keywords = [w for w in name_lower.split() if len(w) > 3]
+            for e in data:
+                ename = e.get("event", "").lower()
+                # Match if any significant keyword from our event name appears in FMP event name
+                if any(k in ename for k in name_keywords) or name_lower in ename:
+                    d = e.get("date", "")[:10]  # YYYY-MM-DD
+                    if d and d < to_date and d not in matched:
+                        matched.append(d)
 
-  // ── SOURCE 4: DAILYFANTASYFUEL ───────────────────────────────────
-  async function fetchDailyFantasyFuelOwnership(sp) {
-    const urls = {
-      nba: 'https://www.dailyfantasyfuel.com/nba',
-      nfl: 'https://www.dailyfantasyfuel.com/nfl',
-      mlb: 'https://www.dailyfantasyfuel.com/mlb',
-    };
-    try {
-      const r = await fetchScraper(urls[sp] || urls.nba, false, 15000);
-      if (!r.ok) return {};
-      const html = await r.text();
-      return parseOwnershipHTML(html, 'dff');
-    } catch(e) { return {}; }
-  }
+            matched.sort(reverse=True)
+            if matched:
+                log.info(f"FMP release dates for {event_name}: {matched[:n]}")
+                return matched[:n]
 
-  // ── UNIVERSAL OWNERSHIP HTML PARSER ──────────────────────────────
-  function parseOwnershipHTML(html, source) {
-    const ownership = {};
+        except Exception as e:
+            log.warning(f"FMP economic calendar failed for {event_name}: {e}")
 
-    // Method 1: Extract from embedded JSON in script tags
-    const scriptPatterns = [
-      /window\.__data\s*=\s*({.+?});?\s*<\/script>/s,
-      /window\.__NUXT__\s*=\s*({.+?});?\s*<\/script>/s,
-      /var\s+(?:ecrData|playerData|projData|dfsData)\s*=\s*({.+?});?\s*(?:var|<\/script>)/s,
-      /"players"\s*:\s*(\[.+?\])\s*[,}]/s,
-      /ownership.*?(\[[\s\S]+?\])/,
-    ];
-
-    for (const pattern of scriptPatterns) {
-      try {
-        const match = html.match(pattern);
-        if (!match) continue;
-        const parsed = JSON.parse(match[1]);
-        const players = parsed?.players || parsed?.data?.players || parsed;
-        if (!Array.isArray(players)) continue;
-
-        for (const p of players) {
-          const name = p.player_name || p.name || p.playerName || p.displayName || '';
-          const own  = parseFloat(p.ownership || p.projected_ownership || p.own || p.pOwn || 0);
-          if (name && own > 0) ownership[name.toLowerCase()] = own;
-        }
-        if (Object.keys(ownership).length > 5) return ownership;
-      } catch(e) { continue; }
-    }
-
-    // Method 2: Parse HTML tables — look for name + percentage pairs
-    const rowPattern = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-    const rows = [...html.matchAll(rowPattern)];
-
-    for (const row of rows) {
-      const rowHtml = row[1];
-      // Extract all text content from cells
-      const cells = [...rowHtml.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
-        .map(c => c[1].replace(/<[^>]+>/g, '').trim());
-
-      // Look for pattern: name cell followed by percentage cell
-      for (let i = 0; i < cells.length - 1; i++) {
-        const name = cells[i];
-        const pctStr = cells[i + 1] || cells[i + 2] || '';
-        const pct = parseFloat(pctStr.replace('%', ''));
-
-        if (name.length > 3 && name.length < 40 && pct > 0 && pct < 100) {
-          // Looks like a valid player name + ownership pair
-          if (/^[A-Z][a-z]+ [A-Z]/.test(name) || /^[A-Z]\. [A-Z]/.test(name)) {
-            ownership[name.toLowerCase()] = pct;
-          }
-        }
-      }
-    }
-
-    // Method 3: Look for inline JSON arrays with ownership data
-    const inlinePattern = /\{[^{}]*(?:"name"|"player")[^{}]*(?:"own"|"ownership")[^{}]*\}/g;
-    const inlineMatches = html.match(inlinePattern) || [];
-    for (const match of inlineMatches.slice(0, 200)) {
-      try {
-        const obj = JSON.parse(match);
-        const name = obj.name || obj.player || obj.playerName || '';
-        const own  = parseFloat(obj.own || obj.ownership || 0);
-        if (name && own > 0) ownership[name.toLowerCase()] = own;
-      } catch(e) { continue; }
-    }
-
-    return ownership;
-  }
-
-  // ── SLEEPER PROJECTIONS (free, no key) ───────────────────────────
-  async function fetchSleeperProjections(sp) {
-    try {
-      const sleeperSport = { nfl:'nfl', nba:'nba', mlb:'mlb' }[sp] || 'nba';
-      const season = '2025';
-      const now = new Date();
-      const weekNum = sp === 'nfl'
-        ? Math.ceil((now - new Date('2025-09-04')) / (7*24*60*60*1000))
-        : Math.ceil((now - new Date('2025-10-22')) / (7*24*60*60*1000));
-      const week = Math.max(1, Math.min(weekNum, 30));
-
-      const positions = sp === 'nba'
-        ? 'PG,SG,SF,PF,C'
-        : sp === 'nfl'
-        ? 'QB,RB,WR,TE,K,DEF'
-        : 'SP,RP,C,1B,2B,3B,SS,OF';
-
-      const posParams = positions.split(',').map(p => `position[]=${p}`).join('&');
-      const url = `https://api.sleeper.app/v1/projections/${sleeperSport}/${season}/${week}?season_type=regular&${posParams}&order_by=pts_half_ppr`;
-
-      const r = await fetchDirect(url, 8000);
-      if (!r.ok) return {};
-      const data = await r.json();
-
-      const projMap = {};
-      for (const [, proj] of Object.entries(data || {})) {
-        if (!proj?.player?.full_name) continue;
-        const name = proj.player.full_name.toLowerCase();
-        const pts  = proj.stats?.pts_half_ppr || proj.stats?.pts_ppr ||
-                     proj.stats?.fpts || proj.stats?.pts || 0;
-        if (pts > 0) projMap[name] = { pts, stats: proj.stats };
-      }
-      return projMap;
-    } catch(e) { return {}; }
-  }
-
-  // ── VEGAS ODDS ────────────────────────────────────────────────────
-  // ── RECENT FORM — REAL LAST 5 GAME SCORES ────────────────────────
-  async function fetchRecentFormData(sp) {
-    const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
-    try {
-      // ESPN athletes stats endpoint — returns recent game logs
-      const r = await fetchDirect(
-        `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard?limit=10`,
-        8000
-      );
-      if (!r.ok) return {};
-      const data = await r.json();
-      const formMap = {};
-
-      // Extract player stats from completed games
-      const events = data?.events || [];
-      for (const event of events) {
-        if (event.status?.type?.state !== 'post') continue;
-        const competitors = event.competitions?.[0]?.competitors || [];
-        for (const team of competitors) {
-          const roster = team.roster || team.athletes || [];
-          for (const athlete of roster) {
-            const name = (athlete.athlete?.displayName || athlete.displayName || '').toLowerCase();
-            if (!name) continue;
-            const stats = athlete.statistics || athlete.stats || [];
-
-            let pts = 0;
-            if (sp === 'nba') {
-              pts = parseFloat(stats.find?.(s => s.name === 'points')?.displayValue || 0);
-            } else if (sp === 'nfl') {
-              const passTD = parseFloat(stats.find?.(s => s.name === 'passingTouchdowns')?.displayValue || 0);
-              const passYd = parseFloat(stats.find?.(s => s.name === 'passingYards')?.displayValue || 0);
-              const rushTD = parseFloat(stats.find?.(s => s.name === 'rushingTouchdowns')?.displayValue || 0);
-              const rushYd = parseFloat(stats.find?.(s => s.name === 'rushingYards')?.displayValue || 0);
-              const recTD  = parseFloat(stats.find?.(s => s.name === 'receivingTouchdowns')?.displayValue || 0);
-              const recYd  = parseFloat(stats.find?.(s => s.name === 'receivingYards')?.displayValue || 0);
-              const rec    = parseFloat(stats.find?.(s => s.name === 'receptions')?.displayValue || 0);
-              pts = passTD*4 + passYd*0.04 + rushTD*6 + rushYd*0.1 + recTD*6 + recYd*0.1 + rec*1;
-            } else if (sp === 'mlb') {
-              const hits = parseFloat(stats.find?.(s => s.name === 'hits')?.displayValue || 0);
-              const hr   = parseFloat(stats.find?.(s => s.name === 'homeRuns')?.displayValue || 0);
-              const rbi  = parseFloat(stats.find?.(s => s.name === 'rbi')?.displayValue || 0);
-              const runs = parseFloat(stats.find?.(s => s.name === 'runs')?.displayValue || 0);
-              const sb   = parseFloat(stats.find?.(s => s.name === 'stolenBases')?.displayValue || 0);
-              pts = hits*3 + hr*10 + rbi*2 + runs*2 + sb*6;
-            }
-
-            if (name && pts > 0) {
-              if (!formMap[name]) formMap[name] = [];
-              formMap[name].push(pts);
-            }
-          }
-        }
-      }
-
-      // Calculate weighted recent form for each player
-      const WEIGHTS = [0.35, 0.25, 0.20, 0.12, 0.08];
-      const formScores = {};
-      for (const [name, games] of Object.entries(formMap)) {
-        const last5 = games.slice(-5).reverse(); // most recent first
-        const weighted = last5.reduce((s, pts, i) => s + pts * (WEIGHTS[i] || 0.05), 0);
-        const avg = last5.reduce((s,p) => s+p, 0) / last5.length;
-        const trend = last5.length >= 2 && last5[0] > avg * 1.15 ? 'hot'
-                    : last5.length >= 2 && last5[0] < avg * 0.75 ? 'cold'
-                    : 'neutral';
-        formScores[name] = { weightedAvg: Math.round(weighted*10)/10, trend, last5 };
-      }
-      return formScores;
-    } catch(e) { return {}; }
-  }
-
-  async function fetchPlayerProps(sp) {
-    if (!oddsKey) return {};
-    try {
-      const sportKeys = {
-        nfl: 'americanfootball_nfl', nba: 'basketball_nba',
-        mlb: 'baseball_mlb', nhl: 'icehockey_nhl',
-      };
-      const markets = sp === 'nba'
-        ? 'player_points,player_rebounds,player_assists'
-        : sp === 'nfl'
-        ? 'player_pass_tds,player_rush_yds,player_reception_yds'
-        : 'pitcher_strikeouts,batter_home_runs,batter_hits';
-      const url = `https://api.the-odds-api.com/v4/sports/${sportKeys[sp]||'basketball_nba'}/events?apiKey=${oddsKey}`;
-      const eventsRes = await fetchDirect(url, 6000);
-      if (!eventsRes.ok) return {};
-      const events = await eventsRes.json();
-      if (!events?.length) return {};
-
-      // Fetch props for first 4 games (free tier limit)
-      const propsMap = {};
-      const eventSlice = events.slice(0, 4);
-      await Promise.all(eventSlice.map(async event => {
-        try {
-          const propUrl = `https://api.the-odds-api.com/v4/sports/${sportKeys[sp]}/events/${event.id}/odds?apiKey=${oddsKey}&regions=us&markets=${markets}&oddsFormat=american`;
-          const r = await fetchDirect(propUrl, 6000);
-          if (!r.ok) return;
-          const data = await r.json();
-          const bookmakers = data?.bookmakers || [];
-          const book = bookmakers[0];
-          if (!book) return;
-          for (const market of (book.markets || [])) {
-            for (const outcome of (market.outcomes || [])) {
-              const name = outcome.description?.toLowerCase() || '';
-              if (!name) continue;
-              if (!propsMap[name]) propsMap[name] = {};
-              const statKey = market.key.replace('player_','').replace('pitcher_','').replace('batter_','');
-              if (outcome.name === 'Over') {
-                propsMap[name][statKey] = { line: outcome.point, type: 'over' };
-              }
-            }
-          }
-        } catch(e) {}
-      }));
-      return propsMap;
-    } catch(e) { return {}; }
-  }
-
-  async function fetchESPNNews(sp) {
-    const sportPath = { nba:'basketball/nba', nfl:'football/nfl', mlb:'baseball/mlb' }[sp] || 'basketball/nba';
-    try {
-      const r = await fetchDirect(`https://site.api.espn.com/apis/site/v2/sports/${sportPath}/news?limit=20`, 5000);
-      if (!r.ok) return [];
-      const data = await r.json();
-      const articles = data?.articles || [];
-      return articles.map(a => ({
-        headline: a.headline || '',
-        published: a.published || '',
-        description: a.description || '',
-        players: (a.keywords || []).filter(k => k.type === 'athlete').map(k => k.displayName?.toLowerCase()),
-      })).filter(a => a.players.length > 0);
-    } catch(e) { return []; }
-  }
-
-  async function fetchVegasOdds(sp) {
-    if (!oddsKey) return {};
-    try {
-      const sportKeys = {
-        nfl: 'americanfootball_nfl',
-        nba: 'basketball_nba',
-        mlb: 'baseball_mlb',
-        nhl: 'icehockey_nhl',
-      };
-      const url = `https://api.the-odds-api.com/v4/sports/${sportKeys[sp]||'basketball_nba'}/odds/?apiKey=${oddsKey}&regions=us&markets=totals,h2h&oddsFormat=american`;
-      const r = await fetchDirect(url, 8000);
-      if (!r.ok) return {};
-      const games = await r.json();
-      const teamTotals = {};
-      for (const game of games) {
-        const total = game.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes?.[0]?.point;
-        if (total) {
-          teamTotals[game.home_team] = total / 2;
-          teamTotals[game.away_team] = total / 2;
-          teamTotals[`${game.home_team}_total`] = total;
-          teamTotals[`${game.away_team}_total`] = total;
-        }
-      }
-      return teamTotals;
-    } catch(e) { return {}; }
-  }
-
-  // ── FUZZY NAME MATCH ─────────────────────────────────────────────
-  function fuzzyMatch(dkName, dataMap) {
-    if (!dkName || !dataMap) return null;
-    const clean = n => n.toLowerCase().replace(/[^a-z ]/g,'').trim();
-    const dk = clean(dkName);
-    if (dataMap[dk] !== undefined) return dataMap[dk];
-    // Try last name only
-    const last = dk.split(' ').pop();
-    if (last.length > 3) {
-      const key = Object.keys(dataMap).find(k => k.endsWith(last));
-      if (key) return dataMap[key];
-    }
-    // Try first + last initial
-    const parts = dk.split(' ');
-    if (parts.length >= 2) {
-      const abbr = `${parts[0][0]}. ${parts[parts.length-1]}`;
-      if (dataMap[abbr] !== undefined) return dataMap[abbr];
-    }
-    return null;
-  }
-
-  // ── RESOLVE CONTEST ID → DRAFT GROUP ID ──────────────────────────
-  // ── INJURY STATUS CHECK ACTION ──────────────────────────────────────
-  // Fetches from multiple sources and returns definitive OUT/IL player list
-  if (action === 'injury_check') {
-    const sp = req.query.sp || 'mlb';
-    const outPlayers = {};
-
-    // Every status that means "definitely not playing"
-    const HARD_OUT = ['out','ir','il','injured reserve','injured list',
-      'inactive','suspended','60-day il','10-day il','15-day il',
-      'paternity list','bereavement list','restricted list','non-roster',
-      'minors','disabled list'];
-
-    function addOut(name, status, source) {
-      if (!name || !status) return;
-      const key = name.toLowerCase().trim();
-      // Only add — never remove an existing OUT entry
-      if (!outPlayers[key]) {
-        outPlayers[key] = { status, source };
-        const parts = key.split(' ');
-        if (parts.length >= 2) {
-          outPlayers[parts[parts.length - 1]] = { status, source };
-          outPlayers[`${parts[0]} ${parts[parts.length - 1]}`] = { status, source };
-        }
-      }
-    }
-
-    const sportPath = sp === 'mlb' ? 'baseball/mlb' : sp === 'nba' ? 'basketball/nba' : 'football/nfl';
-    const today = new Date();
-    const weekAgo = new Date(today - 7 * 24 * 60 * 60 * 1000);
-    const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
-
-    // ── SOURCE 1: ESPN Injuries ──────────────────────────────────────
-    const espnProm = fetch(
-      `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/injuries`,
-      { signal: AbortSignal.timeout(5000) }
-    ).catch(() => null);
-
-    // ── SOURCE 2: MLB Transactions (last 7 days) ─────────────────────
-    const txProm = sp === 'mlb' ? fetch(
-      `https://statsapi.mlb.com/api/v1/transactions?sportId=1&startDate=${fmt(weekAgo)}&endDate=${fmt(today)}&limit=500`,
-      { signal: AbortSignal.timeout(5000) }
-    ).catch(() => null) : Promise.resolve(null);
-
-    // ── SOURCE 3: MLB Active Roster cross-reference (MOST AUTHORITATIVE) ──
-    // Fetch 26-man active rosters for ALL 30 teams → anyone NOT on active = IL
-    // This catches IL players that ESPN and transactions miss
-    const MLB_TEAM_IDS = {
-      NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
-      MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
-      STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
-      TOR:141,LAD:119,CWS:145
-    };
-    const season = today.getFullYear();
-    let activeRosterNames = new Set(); // all players currently on 26-man active roster
-    let rostersFetched = 0;
-
-    if (sp === 'mlb') {
-      const teamIds = Object.values(MLB_TEAM_IDS);
-      // Fetch all 30 teams in parallel — each is fast (cached by MLB Stats API)
-      const rosterResults = await Promise.allSettled(
-        teamIds.map(id =>
-          fetch(`https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
-            { signal: AbortSignal.timeout(5000) })
-            .then(r => r.ok ? r.json() : null)
-            .catch(() => null)
+    # Fall back to FRED (may return sub-component dates but better than nothing)
+    release_id = get_fred_release_id(event_name)
+    if not release_id:
+        return []
+    try:
+        today_str = today.isoformat()
+        cutoff    = (today - datetime.timedelta(days=185)).isoformat()
+        url = (
+            f"https://api.stlouisfed.org/fred/release/dates"
+            f"?release_id={release_id}"
+            f"&api_key={os.getenv('FRED_API_KEY', '')}"
+            f"&sort_order=desc"
+            f"&realtime_end={today_str}"
+            f"&file_type=json"
         )
-      );
-      for (const res of rosterResults) {
-        if (res.status !== 'fulfilled' || !res.value) continue;
-        rostersFetched++;
-        for (const p of (res.value.roster || [])) {
-          const name = (p.person?.fullName || '').toLowerCase().trim();
-          if (name) activeRosterNames.add(name);
+        req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        all_dates = [r["date"] for r in data.get("release_dates", [])]
+        past = sorted([d for d in all_dates if cutoff <= d < today_str], reverse=True)
+        seen, filtered = set(), []
+        for d in past:
+            mk = (datetime.date.fromisoformat(d).year, datetime.date.fromisoformat(d).month)
+            if mk not in seen:
+                seen.add(mk)
+                filtered.append(d)
+            if len(filtered) >= n:
+                break
+        log.info(f"FRED fallback dates for {event_name}: {filtered}")
+        return filtered
+    except Exception as e:
+        log.warning(f"FRED fallback failed for {event_name}: {e}")
+        return []
+
+
+
+# ── ETF historical performance on release dates ────────────────────────────────
+def map_fred_release(release_name: str):
+    lower = release_name.lower()
+    for key, (friendly, time) in FRED_RELEASE_MAP.items():
+        if key in lower:
+            return friendly, time
+    return None
+
+
+# ── FRED Calendar ──────────────────────────────────────────────────────────────
+def get_fred_calendar(target_date) -> list:
+    """
+    Pulls scheduled releases from FRED API for a given date.
+    Maps to trader-friendly names - filters out anything not in our watchlist.
+    """
+    api_key  = os.getenv("FRED_API_KEY", "")
+    date_str = target_date.isoformat()
+    try:
+        url = (
+            f"https://api.stlouisfed.org/fred/releases/dates"
+            f"?api_key={api_key}"
+            f"&realtime_start={date_str}&realtime_end={date_str}"
+            f"&include_release_dates_with_no_data=true"
+            f"&file_type=json"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        releases = data.get("release_dates", [])
+        events, seen = [], set()
+        for r in releases:
+            raw_name = r.get("release_name", "")
+            mapped   = map_fred_release(raw_name)
+            if mapped is None:
+                continue
+            friendly, time = mapped
+
+            # Jobless Claims always release on Thursday - skip if not Thursday
+            if "jobless claims" in friendly.lower() and target_date.weekday() != 3:
+                continue
+
+            if friendly in seen:
+                continue
+            seen.add(friendly)
+            events.append({"name": friendly, "time": time, "prev": "N/A", "est": "N/A"})
+
+        log.info(f"FRED: {len(events)} watchlist events for {target_date} (of {len(releases)} total)")
+        return events
+
+    except Exception as e:
+        log.warning(f"FRED calendar failed: {e}")
+        return []
+
+
+
+# ── BEA Calendar Scraper (PCE + GDP) ──────────────────────────────────────────
+def scrape_fomc_calendar(target_date: datetime.date) -> list[dict]:
+    """
+    Checks if target_date is an FOMC meeting day by scraping the Fed calendar.
+    The page format is: month header followed by "DD-DD" date range on next line.
+    Returns FOMC event if found, empty list otherwise.
+    """
+    try:
+        import re
+        url = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+        req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+
+        target_month = target_date.strftime("%B")
+        year         = target_date.year
+
+        # The page has month names as headers followed by date ranges like "28-29"
+        # Pattern: find the month name then look for date ranges nearby
+        # Also handles cross-month ranges like "Apr/May" with "30-1"
+
+        # Find all date range patterns near our target month
+        # Look for month followed within ~500 chars by a number range
+        month_idx = 0
+        search_start = 0
+        while True:
+            idx = content.find(target_month, search_start)
+            if idx == -1:
+                break
+
+            # Look for a date range (DD-DD) within the next 200 characters
+            nearby = content[idx:idx+200]
+            range_match = re.search(r'\b(\d{1,2})-(\d{1,2})\b', nearby)
+            if range_match:
+                start_day = int(range_match.group(1))
+                end_day   = int(range_match.group(2))
+                if start_day <= target_date.day <= end_day:
+                    is_last_day = target_date.day == end_day
+                    if is_last_day:
+                        log.info(f"FOMC decision day found for {target_date}")
+                        return [
+                            {"name": "FOMC Rate Decision",          "time": "2:00 PM", "prev": "N/A", "est": "N/A"},
+                            {"name": "Jerome Powell Press Conference", "time": "2:30 PM", "prev": "N/A", "est": "N/A"},
+                        ]
+                    else:
+                        log.info(f"FOMC meeting day 1 found for {target_date}")
+                        return [{"name": "FOMC Meeting Day 1", "time": "All Day", "prev": "N/A", "est": "N/A"}]
+
+            search_start = idx + 1
+
+        log.info(f"No FOMC meeting found for {target_date}")
+        return []
+    except Exception as e:
+        log.warning(f"FOMC scraper failed: {e}")
+        return []
+
+
+def scrape_bea_calendar(target_date: datetime.date) -> list[dict]:
+    """
+    Scrapes BEA release schedule for PCE and GDP on the target date.
+    BEA publishes a plain HTML schedule at bea.gov/news/schedule
+    """
+    try:
+        import re, html
+        url = "https://www.bea.gov/news/schedule"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "MacroIQ/1.0 (economic calendar bot; contact: admin@example.com)"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+
+        events = []
+        # BEA schedule lists dates in format "April 10, 2026" or "Apr. 10"
+        target_patterns = [
+            target_date.strftime("%B %-d, %Y"),   # April 10, 2026
+            target_date.strftime("%B %-d,"),       # April 10,
+            target_date.strftime("%b. %-d,"),      # Apr. 10,
+        ]
+
+        # Strip to plain text rows
+        rows = re.split(r'\n|<tr|<TR', content)
+        for row in rows:
+            row_text = re.sub(r'<[^>]+>', ' ', row)
+            row_text = html.unescape(row_text)
+            row_text = ' '.join(row_text.split())
+
+            if not any(p.lower() in row_text.lower() for p in target_patterns):
+                continue
+
+            row_lower = row_text.lower()
+
+            # PCE / Personal Income
+            if any(k in row_lower for k in ["personal income", "pce", "personal consumption"]):
+                events.append({
+                    "name": "PCE / Personal Income & Spending",
+                    "time": "8:30 AM",
+                    "prev": "N/A",
+                    "est":  "N/A",
+                })
+
+            # GDP
+            if "gross domestic product" in row_lower or " gdp" in row_lower:
+                # Identify advance/second/third estimate
+                label = "GDP (Advance Estimate)"
+                if "second" in row_lower:
+                    label = "GDP (Second Estimate)"
+                elif "third" in row_lower:
+                    label = "GDP (Third Estimate)"
+                events.append({
+                    "name": label,
+                    "time": "8:30 AM",
+                    "prev": "N/A",
+                    "est":  "N/A",
+                })
+
+        log.info(f"BEA scraper found {len(events)} events for {target_date}")
+        return events
+
+    except Exception as e:
+        log.warning(f"BEA scraper failed: {e}")
+        return []
+
+
+# ── OPEX / MOPEX Date Calculator ──────────────────────────────────────────────
+def get_opex_event(target_date: datetime.date) -> list[dict]:
+    """
+    Monthly OPEX  - 3rd Friday of every month
+    Quarterly MOPEX - 3rd Friday of Mar, Jun, Sep, Dec (triple witching)
+    Pure date math, no API needed.
+    """
+    year  = target_date.year
+    month = target_date.month
+
+    # Find 3rd Friday of the month
+    first_day = datetime.date(year, month, 1)
+    # weekday() 4 = Friday
+    days_to_first_friday = (4 - first_day.weekday()) % 7
+    first_friday = first_day + datetime.timedelta(days=days_to_first_friday)
+    third_friday = first_friday + datetime.timedelta(weeks=2)
+
+    if target_date != third_friday:
+        return []
+
+    # MOPEX months: March, June, September, December
+    if month in (3, 6, 9, 12):
+        return [{
+            "name": "Quarterly MOPEX (Triple Witching)",
+            "time": "All Day",
+            "prev": "N/A",
+            "est":  "N/A",
+        }]
+    else:
+        return [{
+            "name": "Monthly OPEX",
+            "time": "All Day",
+            "prev": "N/A",
+            "est":  "N/A",
+        }]
+
+
+def get_last_opex_dates(n: int = 3) -> list[str]:
+    """Returns the last N monthly OPEX dates (3rd Friday of each month)."""
+    today = datetime.date.today()
+    dates = []
+    year, month = today.year, today.month
+
+    while len(dates) < n:
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+        first_day = datetime.date(year, month, 1)
+        days_to_first_friday = (4 - first_day.weekday()) % 7
+        first_friday = first_day + datetime.timedelta(days=days_to_first_friday)
+        third_friday = first_friday + datetime.timedelta(weeks=2)
+        if third_friday < today:
+            dates.append(third_friday.isoformat())
+
+    return dates
+
+
+# ── ISM Date Calculator ────────────────────────────────────────────────────────
+def get_ism_events(target_date: datetime.date) -> list[dict]:
+    """
+    ISM Manufacturing - first business day of the month at 10:00 AM ET
+    ISM Services      - third business day of the month at 10:00 AM ET
+    NFP               - first Friday of the month at 8:30 AM ET
+    All fully predictable - no scraping needed.
+    """
+    events = []
+    year  = target_date.year
+    month = target_date.month
+
+    def nth_business_day(year: int, month: int, n: int) -> datetime.date:
+        day   = datetime.date(year, month, 1)
+        count = 0
+        while True:
+            if day.weekday() < 5:
+                count += 1
+                if count == n:
+                    return day
+            day += datetime.timedelta(days=1)
+
+    def first_friday(year: int, month: int) -> datetime.date:
+        day = datetime.date(year, month, 1)
+        while day.weekday() != 4:  # 4 = Friday
+            day += datetime.timedelta(days=1)
+        return day
+
+    ism_mfg  = nth_business_day(year, month, 1)
+    ism_svc  = nth_business_day(year, month, 3)
+    nfp_date = first_friday(year, month)
+
+    if target_date == nfp_date:
+        events.append({
+            "name": "Nonfarm Payrolls",
+            "time": "8:30 AM",
+            "prev": "N/A",
+            "est":  "N/A",
+        })
+        log.info(f"NFP day: {target_date}")
+
+    if target_date == ism_mfg:
+        events.append({
+            "name": "ISM Manufacturing PMI",
+            "time": "10:00 AM",
+            "prev": "N/A",
+            "est":  "N/A",
+        })
+        log.info(f"ISM Manufacturing day: {target_date}")
+
+    if target_date == ism_svc:
+        events.append({
+            "name": "ISM Services PMI",
+            "time": "10:00 AM",
+            "prev": "N/A",
+            "est":  "N/A",
+        })
+        log.info(f"ISM Services day: {target_date}")
+
+    return events
+
+
+# ── Combined Calendar ──────────────────────────────────────────────────────────
+def get_economic_calendar_for_date(target: datetime.date) -> list[dict]:
+    """Same as get_economic_calendar but accepts a date object directly."""
+    if target.weekday() >= 5:
+        return []
+    fred_events = get_fred_calendar(target)
+    fomc_events = scrape_fomc_calendar(target)
+    ism_events  = get_ism_events(target)
+    opex_events = get_opex_event(target)
+    all_events  = fomc_events + opex_events + ism_events + fred_events
+    seen, deduped = set(), []
+    for e in all_events:
+        if e["name"] not in seen:
+            seen.add(e["name"])
+            deduped.append(e)
+    return deduped
+
+
+def get_economic_calendar(day: str = "today") -> list[dict]:
+    """
+    Gets economic releases for target day from all four sources:
+    - BLS   (CPI, PPI, NFP, Jobless Claims, Retail Sales)
+    - Fed   (FOMC)
+    - BEA   (PCE, GDP)
+    - ISM   (Manufacturing PMI, Services PMI - date math, no scraping)
+    """
+    today  = datetime.date.today()
+    target = today if day == "today" else today + datetime.timedelta(days=1)
+
+    # Skip weekends - no releases
+    if target.weekday() >= 5:
+        log.info(f"{target} is a weekend - no releases")
+        return []
+
+    fred_events = get_fred_calendar(target)
+    fomc_events = scrape_fomc_calendar(target)
+    ism_events  = get_ism_events(target)
+    opex_events = get_opex_event(target)
+
+    all_events = fomc_events + opex_events + ism_events + fred_events
+
+    # Deduplicate by name
+    seen    = set()
+    deduped = []
+    for e in all_events:
+        if e["name"] not in seen:
+            seen.add(e["name"])
+            deduped.append(e)
+
+    log.info(f"Total events for {target}: {len(deduped)} "
+             f"(FOMC:{len(fomc_events)} ISM:{len(ism_events)} FRED:{len(fred_events)})")
+    return deduped
+
+
+# ── Groq Prompts ───────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are MacroIQ — a sharp macro analyst texting a group chat of traders, investors, and market followers.
+
+Your voice:
+- Talk like a knowledgeable friend who trades, not a financial journalist
+- Casual but precise — short sentences, real insight, no filler
+- Explain what things MEAN in plain English — your audience includes people who don't know what CPI is
+- Never repeat what you said in a previous sentence or section
+- Never say "traders await" "markets brace" "all eyes on" or other clichés
+- Never give buy/sell advice or price targets
+- Never be vague — every sentence should say something specific
+- Keep it fresh — each brief should feel written this morning, not recycled
+
+You must respond ONLY with valid JSON. No markdown, no explanation outside the JSON."""
+
+
+async def fetch_current_macro_context(groq_client, events: list) -> str:
+    """
+    Uses Groq compound-beta (web search) to fetch current macro context.
+    One call per brief — grounds all subsequent prompts in real current data.
+    Falls back to empty string silently if unavailable.
+    """
+    today = datetime.date.today().strftime("%B %d, %Y")
+    event_names = ", ".join([e["name"] for e in events])
+
+    search_prompt = (
+        f"Today is {today}. Give me current macro context for a trading brief covering: {event_names}. "
+        f"In 4-6 bullet points summarize: current Fed funds rate and recent stance, "
+        f"recent trend for the most relevant indicator today, "
+        f"what markets are pricing for future Fed moves, "
+        f"any relevant recent Fed speaker comments. Be specific with numbers."
+    )
+
+    try:
+        resp = await groq_client.chat.completions.create(
+            model="compound-beta",
+            messages=[{"role": "user", "content": search_prompt}],
+            temperature=0.3,
+            max_tokens=400,
+        )
+        context = resp.choices[0].message.content.strip()
+        log.info(f"compound-beta context fetched successfully ({len(context)} chars)")
+        return context
+    except Exception as e:
+        log.warning(f"compound-beta fetch failed (falling back to no context): {e}")
+        return ""
+
+
+def build_event_prompt(event: dict, day: str, macro_context: str = "") -> str:
+    today     = datetime.date.today().strftime("%B %d, %Y")
+    is_opex   = "opex" in event["name"].lower() or "mopex" in event["name"].lower()
+    is_fomc   = "fomc" in event["name"].lower() or "rate decision" in event["name"].lower()
+    is_powell = "powell" in event["name"].lower()
+
+    context_block = f"\nCurrent macro context (use this to ground your response):\n{macro_context}\n" if macro_context else ""
+
+    if is_opex:
+        return f"""Today is {today}. Write a MacroIQ brief about {event['name']}.
+{context_block}
+OPEX day — not a data release. Write 3 punchy sentences on:
+- What actually happens to price action on OPEX (pinning, gamma hedging, vol crush)
+- What specifically to watch heading into close today
+
+Respond with JSON: {{"context": "3 sentences, plain English, specific to today"}}
+Keep context under 380 characters."""
+
+    if is_powell:
+        return f"""Today is {today}. Write a MacroIQ brief about Jerome Powell's press conference at 2:30 PM ET.
+{context_block}
+Write 3 punchy sentences explaining:
+- What Powell's press conference is and why it moves markets (explain for people who don't know)
+- What traders will be listening for specifically today given current Fed stance
+- What a hawkish vs dovish tone means in plain English for stocks and bonds today
+
+Rules: No jargon without explanation. Sound like a sharp friend. Never say "all eyes on".
+
+Respond with JSON: {{"context": "3 sentences, plain English, fresh and specific"}}
+Keep context under 420 characters."""
+
+    if is_fomc:
+        return f"""Today is {today}. Write a MacroIQ brief about the FOMC Rate Decision at 2:00 PM ET.
+{context_block}
+Write 3 punchy sentences explaining:
+- What the FOMC rate decision is and why it's the most important event in markets (plain English)
+- What the Fed is expected to do today and what's at stake given current conditions
+- What a surprise hike, cut, or hawkish/dovish shift means specifically for markets today
+
+Rules: Explain for someone who doesn't know what the Fed does. Sound like a sharp friend.
+
+Respond with JSON: {{"context": "3 sentences, plain English, grounded in current macro"}}
+Keep context under 420 characters."""
+
+    return f"""Today is {today}. Write a MacroIQ morning brief for this economic report.
+{context_block}
+Report: {event['name']}
+Release time: {event['time']} ET
+Previous reading: {event.get('prev', 'N/A')}
+Consensus estimate: {event.get('est', 'N/A')}
+
+Write 3 punchy sentences:
+1. What this report actually measures and why it matters RIGHT NOW — explain it for someone who doesn't know what {event['name']} is
+2. What the recent trend has been and how markets have been reacting
+3. What a beat vs miss means specifically for stocks, bonds, and the Fed today
+
+Rules:
+- Plain English — no unexplained jargon
+- Specific to current macro conditions, not generic
+- Never say "markets await" or "all eyes on"
+- Each sentence must add new information — no repetition
+
+Respond with JSON: {{"context": "3 sentences, plain English, specific and grounded"}}
+Keep context under 420 characters."""
+
+
+def build_market_context_prompt(events: list, macro_context: str = "") -> str:
+    today       = datetime.date.today().strftime("%B %d, %Y")
+    times       = ", ".join([f"{e['name']} at {e.get('time','TBD')} ET" for e in events])
+    context_block = f"\nCurrent macro context (ground your response in this):\n{macro_context}\n" if macro_context else ""
+
+    return f"""Today is {today}. Write a MacroIQ morning market overview.
+{context_block}
+Events today: {times}
+
+Write exactly 3 sentences:
+1. The current macro backdrop — where the Fed stands, what's driving markets right now (be specific)
+2. Why today's specific reports matter given that backdrop
+3. What a surprise in either direction could mean for markets today — in plain English
+
+Rules:
+- Sound like a knowledgeable friend briefing you before the open
+- Explain things for someone who follows markets casually — no unexplained jargon
+- Be specific — reference actual current conditions, not generic macro language
+- Never say "traders await" "all eyes on" "brace for" or similar clichés
+- Each sentence must say something different and specific
+
+Respond with JSON: {{"context": "3 sentences, ~300 characters, fresh and grounded"}}"""
+
+
+# ── Main Engine ────────────────────────────────────────────────────────────────
+class MacroEngine:
+    def __init__(self):
+        self.groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+
+    async def _ask_groq(self, prompt: str) -> dict | None:
+        """Single Groq API call with retry."""
+        for attempt in range(3):
+            try:
+                resp = await self.groq.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=400,
+                    response_format={"type": "json_object"},
+                )
+                return json.loads(resp.choices[0].message.content)
+            except Exception as e:
+                log.warning(f"Groq attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2)
+        return None
+
+    async def _fetch_etf_performance(self, event_name: str, dates: list[str]) -> dict:
+        """
+        Fetches real SPY/QQQ/DIA open-to-close % change on specific dates
+        using Twelve Data's historical time series API.
+        Falls back to empty strings if fetch fails.
+        """
+        if not dates:
+            return {"spy": "", "qqq": "", "dia": "", "reaction_note": ""}
+
+        api_key = os.getenv("TWELVE_DATA_API_KEY", "")
+        if not api_key:
+            log.warning("TWELVE_DATA_API_KEY not set — skipping ETF fetch")
+            return {"spy": "", "qqq": "", "dia": "", "reaction_note": ""}
+
+        tickers = ["SPY", "QQQ", "DIA"]
+        # Store results: {ticker: {date: pct_str}}
+        results = {t: {} for t in tickers}
+
+        for ticker in tickers:
+            for date_str in dates:
+                try:
+                    # Fetch 5-day window — single-date queries often return 400
+                    dt    = datetime.date.fromisoformat(date_str)
+                    start = (dt - datetime.timedelta(days=3)).isoformat()
+                    end   = (dt + datetime.timedelta(days=1)).isoformat()
+                    url = (
+                        f"https://api.twelvedata.com/time_series"
+                        f"?symbol={ticker}"
+                        f"&interval=1day"
+                        f"&start_date={start}"
+                        f"&end_date={end}"
+                        f"&apikey={api_key}"
+                    )
+                    req = urllib.request.Request(url, headers={"User-Agent": "MacroIQ/1.0"})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read())
+
+                    if data.get("code") == 429:
+                        log.warning(f"Twelve Data rate limit — waiting 65s")
+                        await asyncio.sleep(65)
+                        with urllib.request.urlopen(req, timeout=15) as resp2:
+                            data = json.loads(resp2.read())
+
+                    values = data.get("values", [])
+                    # Find entry matching target date
+                    match = next((v for v in values if v.get("datetime", "").startswith(date_str)), None)
+                    if not match and values:
+                        match = values[0]  # fallback to closest
+
+                    if match:
+                        log.info(f"Twelve Data fields for {ticker} {date_str}: open={match.get('open')} high={match.get('high')} low={match.get('low')} close={match.get('close')}")
+                        o = float(match["open"])
+                        c = float(match["close"])
+                        pct = (c - o) / o * 100
+                        sign = "+" if pct >= 0 else ""
+                        results[ticker][date_str] = f"{sign}{pct:.1f}%"
+                        log.info(f"Twelve Data {ticker} {date_str}: {sign}{pct:.1f}%")
+                    else:
+                        log.warning(f"Twelve Data no match {ticker} {date_str}: {json.dumps(data)[:150]}")
+                        results[ticker][date_str] = "N/A"
+
+                    await asyncio.sleep(8)
+
+                except Exception as e:
+                    log.warning(f"Twelve Data fetch failed {ticker} {date_str}: {type(e).__name__}: {e}")
+                    results[ticker][date_str] = "N/A"
+
+        # Build display strings in date order
+        spy_vals = [results["SPY"].get(d, "N/A") for d in dates]
+        qqq_vals = [results["QQQ"].get(d, "N/A") for d in dates]
+        dia_vals = [results["DIA"].get(d, "N/A") for d in dates]
+
+        # Only skip if we got no data at all (API key missing etc)
+        if not any(results[t] for t in tickers):
+            log.warning(f"No Twelve Data results at all for {event_name}")
+            return {"spy": "", "qqq": "", "dia": "", "reaction_note": ""}
+
+        # Ask Groq for a reaction note based on the real data
+        reaction_note = await self._get_reaction_note(event_name, dates, spy_vals, qqq_vals, dia_vals)
+
+        log.info(f"ETF performance for {event_name}: SPY={spy_vals} QQQ={qqq_vals} DIA={dia_vals}")
+        return {
+            "spy":           " / ".join(spy_vals),
+            "qqq":           " / ".join(qqq_vals),
+            "dia":           " / ".join(dia_vals),
+            "reaction_note": reaction_note,
         }
-      }
-    }
 
-    // Process ESPN + Transactions in parallel
-    const [espnRes, txRes] = await Promise.allSettled([espnProm, txProm]);
+    async def _get_reaction_note(self, event_name: str, dates: list[str], spy: list, qqq: list, dia: list) -> str:
+        """Asks Groq to write a one-line reaction note based on real ETF data."""
+        dates_fmt = [datetime.date.fromisoformat(d).strftime("%b %d") for d in dates]
+        prompt = (
+            f"Given these real SPY/QQQ/DIA open-to-close moves on the last 3 {event_name} release days:\n"
+            f"Dates: {', '.join(dates_fmt)}\n"
+            f"SPY: {', '.join(spy)}\n"
+            f"QQQ: {', '.join(qqq)}\n"
+            f"DIA: {', '.join(dia)}\n"
+            f"Write ONE short phrase (under 60 chars) describing the pattern. "
+            f"Example: 'Hot prints slam QQQ hardest' or 'Muted moves, market already priced in'. "
+            f"Respond with JSON: {{\"note\": \"your phrase here\"}}"
+        )
+        try:
+            resp = await self.groq.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=60,
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(resp.choices[0].message.content)
+            return data.get("note", "")
+        except Exception as e:
+            log.warning(f"Reaction note generation failed: {e}")
+            return ""
 
-    // Process ESPN
-    if (espnRes.status === 'fulfilled' && espnRes.value?.ok) {
-      try {
-        const data = await espnRes.value.json();
-        for (const team of (data?.injuries || [])) {
-          for (const inj of (team.injuries || [])) {
-            const name = inj?.athlete?.displayName || '';
-            const status = (inj?.status || inj?.type?.description || '').toLowerCase();
-            if (HARD_OUT.some(s => status.includes(s))) {
-              addOut(name, inj.status || 'OUT', 'ESPN');
-            }
-          }
-        }
-      } catch(e) {}
-    }
+    async def build_weekly_brief(self, next_week: bool = False) -> dict | None:
+        """Builds a weekly calendar overview - all significant events for the week."""
+        today = datetime.date.today()
 
-    // Process MLB Transactions — find IL placements not yet reversed
-    if (sp === 'mlb' && txRes.status === 'fulfilled' && txRes.value?.ok) {
-      try {
-        const data = await txRes.value.json();
-        const activatedNames = new Set();
-        for (const tx of (data?.transactions || [])) {
-          const desc = (tx?.description || '').toLowerCase();
-          if (desc.includes('activated') || desc.includes('reinstated')) {
-            activatedNames.add((tx?.player?.fullName || '').toLowerCase());
-          }
-        }
-        for (const tx of (data?.transactions || [])) {
-          const desc = (tx?.description || '').toLowerCase();
-          const name = tx?.player?.fullName || '';
-          const isILPlacement = desc.includes('placed') && (
-            desc.includes('injured list') || desc.includes(' il') ||
-            desc.includes('10-day') || desc.includes('60-day') ||
-            desc.includes('15-day') || desc.includes('paternity') ||
-            desc.includes('bereavement') || desc.includes('restricted')
-          );
-          if (isILPlacement && !activatedNames.has(name.toLowerCase())) {
-            addOut(name, 'IL', 'MLB Transactions');
-          }
-        }
-      } catch(e) {}
-    }
+        # weekday(): Mon=0, Tue=1, ..., Sat=5, Sun=6
+        # Sunday (6) should be treated as "start of next week" not "end of this week"
+        weekday = today.weekday()
 
-    // Build final count
-    const injurySourceCount = Object.keys(outPlayers).length;
-    const sources = ['ESPN'];
-    if (sp === 'mlb') sources.push('MLB Transactions', 'Active Roster');
+        if weekday == 6:
+            # Sunday - "this week" means the coming Mon-Fri
+            days_to_monday = 1
+        else:
+            days_to_monday = weekday  # 0=Mon already, 1=Tue back 1, etc.
 
-    return res.json({
-      success: true,
-      outPlayers,
-      activeRosterNames: sp === 'mlb' ? [...activeRosterNames] : [],
-      rostersFetched,
-      count: injurySourceCount,
-      sources,
-    });
-  }
+        this_monday = today - datetime.timedelta(days=days_to_monday)
+        if weekday == 6:
+            this_monday = today + datetime.timedelta(days=1)
 
-  // ── MLB ACTIVE ROSTERS ACTION ──────────────────────────────────────
-  if (action === 'mlb_rosters') {
-    const teams = (req.query.teams || '').split(',').filter(Boolean);
-    const MLB_TEAM_IDS = {
-      NYY:147,BOS:111,MIA:146,TEX:140,CIN:113,PHI:143,COL:115,SEA:136,LAA:108,
-      MIN:142,ATL:144,ARI:109,CHC:112,CLE:114,NYM:121,SF:137,TB:139,HOU:117,
-      STL:138,MIL:158,SD:135,DET:116,BAL:110,PIT:134,OAK:133,WSH:120,KC:118,
-      TOR:141,LAD:119,CWS:145
-    };
-    const season = new Date().getFullYear();
-    const activeNames = [];
-    await Promise.all(teams.map(async abbr => {
-      const id = MLB_TEAM_IDS[abbr]; if (!id) return;
-      try {
-        const r = await fetch(`https://statsapi.mlb.com/api/v1/teams/${id}/roster/active?season=${season}`,
-          { signal: AbortSignal.timeout(4000) });
-        if (!r.ok) return;
-        const data = await r.json();
-        for (const p of (data.roster || [])) {
-          const name = (p.person?.fullName || '').toLowerCase();
-          if (name) activeNames.push(name);
-        }
-      } catch(e) {}
-    }));
-    return res.json({ success: true, activeNames, teamCount: teams.length });
-  }
+        monday = this_monday + datetime.timedelta(days=7) if next_week else this_monday
 
-  if (!dgId) return res.status(400).json({ error: 'No ID provided' });
+        week_events = []  # list of (date, event) tuples
 
-  let draftGroupId = dgId;
-  try {
-    // Try contest API first (for contest URLs like /draft/contest/12345)
-    const r = await fetchScraper(`https://api.draftkings.com/contests/v1/contests/${dgId}?format=json`);
-    if (r.ok) {
-      const data = await r.json();
-      const resolved = data?.contest?.draftGroupId || data?.data?.contest?.draftGroupId;
-      if (resolved) { draftGroupId = String(resolved); }
-    } else {
-      // Fall back to lineups API (for entry URLs like /draft/entry/12345)
-      const r2 = await fetchScraper(`https://api.draftkings.com/lineups/v1/lineups/${dgId}?include_draft_group=true`);
-      if (r2.ok) {
-        const data2 = await r2.json();
-        const dg = data2?.draftGroup?.draftGroupId || data2?.lineup?.draftGroupId
-          || data2?.payload?.draftGroup?.draftGroupId;
-        if (dg) { draftGroupId = String(dg); }
-      }
-    }
-  } catch(e) {}
+        for i in range(5):  # Mon–Fri
+            day_date = monday + datetime.timedelta(days=i)
 
-  const sp = sport || 'nba';
+            # Get all events for this day
+            releases = get_economic_calendar_for_date(day_date)
+            for release in releases:
+                score, tier = score_event(release["name"])
+                if tier in ("EXTREME", "HIGH", "MEDIUM"):
+                    week_events.append({
+                        **release,
+                        "date":   day_date.strftime("%A, %b %d"),
+                        "impact": tier,
+                        "score":  score,
+                    })
 
-  // ── FETCH ALL DATA IN PARALLEL ────────────────────────────────────
-  const [oddsRes, sleeperRes, ownershipRes, recentFormRes, propsRes] = await Promise.allSettled([
-    fetchVegasOdds(sp),
-    fetchSleeperProjections(sp),
-    fetchAllOwnership(sp),
-    fetchRecentFormData(sp),
-    fetchPlayerProps(sp),
-  ]);
+        if not week_events:
+            return None
 
-  const odds        = oddsRes.status       === 'fulfilled' ? oddsRes.value       : {};
-  const projections = sleeperRes.status    === 'fulfilled' ? sleeperRes.value    : {};
-  const ownership   = ownershipRes.status  === 'fulfilled' ? ownershipRes.value  : {};
-  const recentForm  = recentFormRes.status === 'fulfilled' ? recentFormRes.value : {};
-  const playerProps = propsRes.status      === 'fulfilled' ? propsRes.value      : {};
-
-  // ── FETCH DRAFTKINGS PLAYERS ──────────────────────────────────────
-  const endpoints = [
-    `https://www.draftkings.com/lineup/getavailableplayers?draftGroupId=${draftGroupId}`,
-    `https://api.draftkings.com/lineups/v1/getavailableplayers?draftGroupId=${draftGroupId}`,
-    `https://api.draftkings.com/draftgroups/v1/draftgroups/${draftGroupId}/draftables?format=json`,
-  ];
-
-  for (const url of endpoints) {
-    try {
-      const r = await fetchScraper(url);
-      if (!r.ok) continue;
-      const data = await r.json();
-      const players = data?.playerList || data?.draftables || data?.data?.draftables || data?.players;
-      if (!players?.length) continue;
-
-      // ── ATTACH ALL DATA TO EACH PLAYER ───────────────────────────
-      const enriched = players.map(p => {
-        const name = p.displayName || p.playerName || '';
-        const team = p.teamAbbreviation || p.teamAbbrev || p.team || '';
-
-        // Vegas
-        const teamOdds = Object.entries(odds).find(([k]) =>
-          k.toLowerCase().includes(team.toLowerCase()) ||
-          team.toLowerCase().includes(k.toLowerCase().split(' ').pop())
-        );
-        const vegasImplied = teamOdds ? teamOdds[1] : null;
-        const gameTotal    = teamOdds ? odds[`${teamOdds[0]}_total`] : null;
-
-        // Real projections from Sleeper
-        const sleeperProj  = fuzzyMatch(name, Object.fromEntries(
-          Object.entries(projections).map(([k,v]) => [k, v.pts])
-        ));
-
-        // Real ownership from scraped sources
-        const fpOwnership  = fuzzyMatch(name, ownership);
-
-        // Player props from Odds API — sharper than game total projections
-        const propData = playerProps[name.toLowerCase()] ||
-          playerProps[Object.keys(playerProps).find(k =>
-            k.includes(name.toLowerCase().split(' ').pop()) ||
-            name.toLowerCase().includes(k.split(' ').pop())
-          )] || null;
-
-        // Real recent form from ESPN game logs
-        const nameLower = name.toLowerCase();
-        const formKey = Object.keys(recentForm).find(k =>
-          k === nameLower ||
-          k.includes(nameLower.split(' ').pop()) ||
-          nameLower.includes(k.split(' ').pop())
-        );
-        const recentFormData = formKey ? recentForm[formKey] : null;
-
-        // Injury status
-        const status = p.status || p.playerGameAttribute?.injuryStatus || '';
-        const isOut  = ['out','ir','o','injured reserve'].includes(status.toLowerCase());
+        week_label = "Next Week" if next_week else "This Week"
+        monday_str = monday.strftime("%B %d")
+        friday_str = (monday + datetime.timedelta(days=4)).strftime("%B %d")
 
         return {
-          ...p,
-          vegasImplied,
-          gameTotal,
-          realProjection: sleeperProj,
-          fpOwnership,
-          recentFormData,
-          propData,       // player prop lines from Odds API
-          status,
-          isOut,
-        };
-      });
+            "label":      week_label,
+            "date_range": f"{monday_str} – {friday_str}",
+            "events":     week_events,
+        }
 
-      const ownHits  = enriched.filter(p => p.fpOwnership != null).length;
-      const projHits = enriched.filter(p => p.realProjection != null).length;
-      const vegasHit = Object.keys(odds).length > 0;
+    async def build_daily_brief_for_date(self, target: datetime.date) -> dict | None:
+        """Builds a full daily brief for a specific date - used for testing."""
+        releases = get_economic_calendar_for_date(target)
 
-      return res.status(200).json({
-        success: true,
-        players: enriched,
-        contestId: dgId,
-        draftGroupId,
-        dataSources: {
-          vegas:              vegasHit,
-          sleeperProjections: projHits > 0,
-          ownership:          ownHits > 0,
-          gamesWithOdds:      Math.floor(Object.keys(odds).filter(k=>!k.includes('_total')).length/2),
-          playersWithProj:    projHits,
-          playersWithOwn:     ownHits,
-          ownershipSources:   Object.keys(ownership).length > 0 ? 'rotogrinders+fantasypros+numberfire+dff' : 'estimated',
-        },
-      });
+        significant_events = []
+        for release in releases:
+            score, tier = score_event(release["name"])
+            if tier in ("EXTREME", "HIGH", "MEDIUM"):
+                significant_events.append({
+                    **release,
+                    "impact": tier,
+                    "score":  score,
+                })
 
-    } catch(e) { continue; }
-  }
+        significant_events.sort(key=lambda x: x["score"], reverse=True)
+        significant_events = significant_events[:5]
 
-  return res.status(502).json({
-    error: scraperKey
-      ? 'Contest not open yet — try again closer to game time.'
-      : 'SCRAPER_API_KEY missing from Vercel environment variables.',
-    hasKey: !!scraperKey,
-    hasOddsKey: !!oddsKey,
-  });
-}
+        if not significant_events:
+            return None
+
+        # Fetch current macro context once via compound-beta web search
+        macro_context = await fetch_current_macro_context(self.groq, significant_events)
+
+        for event in significant_events:
+            is_opex = "opex" in event["name"].lower() or "mopex" in event["name"].lower()
+            if is_opex:
+                past_dates = get_last_opex_dates(n=3)
+            else:
+                past_dates = get_historical_release_dates(event["name"], n=3)
+            event["verified_dates"] = "  ".join(
+                datetime.date.fromisoformat(d).strftime("%b %d") for d in past_dates
+            ) if past_dates else ""
+
+            prompt  = build_event_prompt(event, "today", macro_context=macro_context)
+            ai_data = await self._ask_groq(prompt)
+            if ai_data:
+                event["context"] = ai_data.get("context", "Context unavailable.")
+            else:
+                event["context"] = f"{event['name']} is on the calendar. Watch for market reaction."
+
+            etf = await self._fetch_etf_performance(event["name"], past_dates)
+            event["spy"]           = etf.get("spy", "")
+            event["qqq"]           = etf.get("qqq", "")
+            event["dia"]           = etf.get("dia", "")
+            event["reaction_note"] = etf.get("reaction_note", "")
+
+        ctx_data   = await self._ask_groq(build_market_context_prompt(significant_events, macro_context=macro_context))
+        market_ctx = ctx_data.get("context", "Key macro events on deck - stay sharp.") if ctx_data else "Key macro events on deck - stay sharp."
+
+        return {
+            "date":           target.strftime("%A, %B %d %Y"),
+            "market_context": market_ctx,
+            "events":         significant_events,
+        }
+
+    async def build_daily_brief(self, day: str = "today") -> dict | None:
+        """Builds the full daily macro brief."""
+        today  = datetime.date.today()
+        target = today if day == "today" else today + datetime.timedelta(days=1)
+
+        # Get economic releases from BLS + Fed
+        releases = get_economic_calendar(day)
+
+        # Score and filter - only EXTREME, HIGH, MEDIUM
+        significant_events = []
+        for release in releases:
+            score, tier = score_event(release["name"])
+            if tier in ("EXTREME", "HIGH", "MEDIUM"):
+                significant_events.append({
+                    **release,
+                    "impact": tier,
+                    "score":  score,
+                })
+
+        # Sort by impact score, cap at 5
+        significant_events.sort(key=lambda x: x["score"], reverse=True)
+        significant_events = significant_events[:5]
+
+        if not significant_events:
+            log.info(f"No significant events for {day} - quiet day")
+            return None
+
+        # Fetch current macro context once via compound-beta web search
+        macro_context = await fetch_current_macro_context(self.groq, significant_events)
+
+        # Generate AI context + historical market reaction for each event
+        for event in significant_events:
+            is_opex = "opex" in event["name"].lower() or "mopex" in event["name"].lower()
+            if is_opex:
+                past_dates = get_last_opex_dates(n=3)
+            else:
+                past_dates = get_historical_release_dates(event["name"], n=3)
+            event["verified_dates"] = "  ".join(
+                datetime.date.fromisoformat(d).strftime("%b %d") for d in past_dates
+            ) if past_dates else ""
+
+            prompt  = build_event_prompt(event, day, macro_context=macro_context)
+            ai_data = await self._ask_groq(prompt)
+            if ai_data:
+                event["context"] = ai_data.get("context", "Context unavailable.")
+            else:
+                event["context"] = f"{event['name']} is on the calendar today. Watch for market reaction."
+
+            etf = await self._fetch_etf_performance(event["name"], past_dates)
+            event["spy"]           = etf.get("spy", "")
+            event["qqq"]           = etf.get("qqq", "")
+            event["dia"]           = etf.get("dia", "")
+            event["reaction_note"] = etf.get("reaction_note", "")
+
+        # Generate overall market context
+        ctx_data   = await self._ask_groq(build_market_context_prompt(significant_events, macro_context=macro_context))
+        market_ctx = ctx_data.get("context", "Key macro events on deck today - stay sharp.") if ctx_data else "Key macro events on deck today - stay sharp."
+
+        return {
+            "date":           target.strftime("%A, %B %d %Y"),
+            "market_context": market_ctx,
+            "events":         significant_events,
+        }
