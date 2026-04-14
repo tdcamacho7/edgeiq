@@ -5063,7 +5063,7 @@ async function runAIAnalysis() {
 
     const lineupSummary = valid.map(l => {
       const p = l.player;
-      return l.slot+' '+p.name+' ('+p.team+', '+p.projOwn+'% own, '+p.projPts.toFixed(1)+' proj, edge '+p.edgeScore+', '+(p.dvpLabel?.badge||'neutral')+')';
+      return l.slot+' '+p.name+' ('+p.team+', $'+(p.salary/1000).toFixed(1)+'K, '+p.projOwn+'% own, '+p.projPts.toFixed(1)+' proj, edge '+p.edgeScore+', '+(p.dvpLabel?.badge||'neutral')+')';
     }).join('\n');
 
     const prompt = 'You are an expert MLB DFS analyst helping win first place in DraftKings GPP tournaments.\n\n'+
@@ -5071,25 +5071,28 @@ async function runAIAnalysis() {
       'Stats: Edge score '+avgEdge+'/99, '+avgOwn+'% avg ownership, $'+(salary/1000).toFixed(1)+'K salary, '+totalPts+' proj pts\n'+
       'Main stack: '+(topStack ? topStack[0]+' x'+topStack[1] : 'none')+'\n'+
       'Sport: '+sport.toUpperCase()+'\n\n'+
-      'Provide a concise analysis (4-6 sentences) covering:\n'+
-      '1. The biggest strength of this lineup for GPP\n'+
+      'Provide a sharp analysis (4-6 sentences) covering:\n'+
+      '1. The biggest GPP strength of this lineup\n'+
       '2. The biggest risk or weakness\n'+
       '3. One specific player to consider swapping and why\n'+
-      '4. Overall assessment: is this lineup ready to enter?\n\n'+
-      'Be direct and specific. No fluff.';
+      '4. Overall verdict: enter as-is, tweak, or rebuild?\n\n'+
+      'Be direct, specific, and actionable. No fluff.';
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    // Route through Vercel proxy — never expose API key in browser
+    const response = await fetch('/api/proxy?action=ai_analysis', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }]
-      })
+      body: JSON.stringify({ prompt }),
+      signal: AbortSignal.timeout(30000)
     });
 
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${response.status}`);
+    }
+
     const data = await response.json();
-    const text = data.content?.[0]?.text || 'No response received.';
+    const text = data.text || 'No response received.';
 
     document.getElementById('ai-analysis-output').innerHTML =
       text.split('\n').filter(Boolean).map(line =>
@@ -5097,8 +5100,11 @@ async function runAIAnalysis() {
       ).join('');
 
   } catch(err) {
+    const msg = err.message?.includes('GROQ_API_KEY')
+      ? 'Add GROQ_API_KEY to Vercel environment variables to enable AI analysis.'
+      : 'Analysis failed: ' + (err.message || 'check connection and try again.');
     document.getElementById('ai-analysis-output').innerHTML =
-      '<span style="color:var(--red)">Analysis failed — check connection and try again.</span>';
+      `<span style="color:var(--red)">${msg}</span>`;
   } finally {
     btn.textContent = 'Analyze';
     btn.disabled = false;
